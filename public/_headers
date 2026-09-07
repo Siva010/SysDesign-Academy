@@ -1,24 +1,34 @@
-# Cloudflare Pages reads this file from the build output root.
-# Rules are matched most-specific first; each block applies to paths matching its pattern.
+# Cloudflare reads this file from the assets directory.
+#
+# The rule that matters and is easy to get wrong: headers from *every* matching block are
+# appended, so a more specific block does not override a broader one. Setting Cache-Control in
+# a catch-all and again for assets produces one concatenated header with two contradictory
+# max-age values, and which one a cache honours is then a matter of implementation.
+#
+# So the catch-all below sets security headers only, and Cache-Control is set exactly once per
+# path by blocks that cannot overlap.
 
-# Build assets carry a content hash in the filename, so a changed asset is a different URL.
-# Nothing here can go stale, which is what makes a one-year immutable lifetime correct
-# rather than optimistic.
-/_next/static/*
-  Cache-Control: public, max-age=31536000, immutable
-
-# The search index is rebuilt on every deploy and is not content-hashed, so it needs a short
-# lifetime with revalidation. Five minutes keeps a deploy visible quickly without making the
-# first search on every page load a full download.
-/search-index.json
-  Cache-Control: public, max-age=300, must-revalidate
-
-# HTML is cheap to revalidate and must never be served stale after a deploy, because a stale
-# document can reference asset URLs that no longer exist.
 /*
-  Cache-Control: public, max-age=0, must-revalidate
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
   Permissions-Policy: geolocation=(), microphone=(), camera=(), interest-cohort=()
   Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+
+# Build assets carry a content hash in the filename, so a changed asset is a different URL and
+# nothing here can go stale. That is what makes an immutable year correct rather than optimistic.
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Rebuilt on every deploy and not content-hashed, so it needs a short life with revalidation.
+/search-index.json
+  Cache-Control: public, max-age=300, must-revalidate
+
+# trailingSlash means every page is a directory index, so a trailing slash matches HTML and
+# nothing else - the asset and index paths above both end in a file extension.
+/*/
+  Cache-Control: public, max-age=0, must-revalidate
+
+# The root, which the pattern above does not reach.
+/
+  Cache-Control: public, max-age=0, must-revalidate
