@@ -16,11 +16,46 @@ npm run dev          # http://localhost:3000
 Other commands:
 
 ```bash
-npm run build             # production build (static generation)
+npm run build             # static export to out/
+npm run preview           # serve out/ exactly as a static host will
 npm run typecheck         # tsc --noEmit
 npm run validate:content  # content invariants; fails the build on a broken reference
-npx tsx scripts/untaught.ts   # concepts with no lesson yet, grouped by level
+npm run untaught          # concepts with no lesson yet, grouped by level
 ```
+
+## Deploying
+
+The whole site is static. Every dynamic route has a `generateStaticParams`, the one route
+handler is `force-static`, and nothing reads cookies, headers or search params on the server, so
+`npm run build` writes plain files to `out/` and there is nothing to run in production.
+
+That is a deliberate property rather than a coincidence. It means the site is served from a CDN
+with no origin, no server runtime, no cold starts and nothing to patch — and the only stateful
+thing in the product, a learner's progress, lives in their own browser.
+
+**Cloudflare Pages** is the recommended host. Connect the repository and use:
+
+| Setting | Value |
+|---|---|
+| Framework preset | None |
+| Build command | `npm run validate:content && npm run build` |
+| Build output directory | `out` |
+| Node version | from `.nvmrc` |
+
+Putting the content validator in the build command is the point of having it: a broken concept
+reference or a missing lesson section fails the deploy rather than reaching production.
+
+`public/_headers` sets caching and security headers, and Cloudflare reads it from the build
+output. Hashed build assets get a one-year immutable lifetime; HTML revalidates every time, so a
+deploy is visible immediately and no stale document can reference an asset that no longer exists.
+
+The Content-Security-Policy allows `'unsafe-inline'` for scripts, which is worth being honest
+about: Next.js inlines its hydration payload and the no-flash theme script, and a static export
+cannot issue per-request nonces. The site renders no user input and loads nothing from a third
+party, so the practical exposure is small — but it is a real weakening, not a strong policy.
+
+Any other static host works the same way: GitHub Pages, Netlify, S3 with CloudFront. Only the
+headers file is Cloudflare-specific.
 
 `npm run validate:content` should be run before committing content. It catches dangling concept
 references, prerequisite cycles, missing lesson sections, unknown source citations, and the MDX
@@ -29,6 +64,7 @@ authoring hazards that otherwise only surface at build time.
 ## How it is organised
 
 ```
+public/             files copied verbatim into the build output (_headers)
 content/            MDX content, validated by frontmatter schema
   lessons/          the curriculum, by level
   patterns/         reusable architectural patterns
