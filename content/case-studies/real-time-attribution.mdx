@@ -1,0 +1,499 @@
+---
+id: real-time-attribution
+title: Real-Time Attribution
+ask: Design a system that decides which ad a purchase should be credited to, in near real time, and that the payouts can be reconciled against.
+difficulty: advanced
+minutes: 55
+signatures: [stream-join, exactly-once-effect]
+concepts: [stream-join, stream-processing, windowing, watermark, log-based-messaging, consumer-group, offset, replay, partition-key, partition-ordering, hot-partition, rebalancing, compaction, retention, ttl, at-least-once, effectively-once, duplicate-processing, idempotency, event-driven, backpressure, eventual-consistency, cqrs, audit-log, correctness, sampling, dead-letter-queue, backfill, versioning, expand-contract, immutability, clock-skew, cost]
+patterns: [transactional-outbox, idempotency-key, cqrs, expand-contract]
+prerequisites: [doing-it-later, delivery-and-duplicates]
+sources: [kafka-docs, kafka-paper, ddia, clickhouse-docs, stripe-eng, linkedin-eng]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a system that decides which ad a purchase should be credited to, in near real
+> time, and that the payouts can be reconciled against.&rdquo;
+
+Two unbounded streams, arriving at wildly different rates, correlated by a key, with a rule that
+says a purchase belongs to an ad interaction within some recent window. That is a **windowed join
+between two streams**, and money depends on getting it right.
+
+Everything difficult here comes from one fact: **the two sides of the join do not arrive
+together.** A click happens on a phone that then goes into a tunnel and uploads three days later.
+A purchase happens on a server and is recorded immediately. The join must decide how long to wait
+for something that may never come, and it must decide it while a dashboard is asking for an answer
+now and an auditor will ask for the same answer again next month.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| What is the attribution rule? | Last click within 7 days, view-through within 24 hours, and fractional multi-touch are three different systems. This question decides the size of the join state by a factor of a thousand. |
+| How fresh must attribution be? | Sixty seconds forces a streaming join. Daily is a batch job, and a much smaller system. |
+| How late can an event arrive? | Mobile clients buffer while offline. If the answer is days, no watermark can both be correct and be fast. |
+| May an attribution be revised? | If yes, every downstream aggregate must be recomputable. If no, you must wait for the window to close before emitting anything. |
+| Do payouts come from this system? | If money is computed here, reproducibility and auditability become hard requirements rather than nice properties. |
+| What is the identity key? | Device, cookie, or account. Identity resolution is its own large problem, and it silently changes the join key. |
+
+**Assumed answers:** last click within 7 days, with a 24-hour view-through fallback; attribution
+visible within 60 seconds for 99% of conversions; events up to 72 hours late; revisions allowed
+until the daily close and never after; payouts come from a separately reconciled batch;
+identity is a single stable device id, with cross-device identity resolution declared out of scope.
+
+## Requirements
+
+**Functional:** ingest ad events and conversion events; attribute each conversion to at most one
+ad event; emit an attribution record; aggregate per campaign; allow revision until the close.
+
+**Non-functional**
+
+- No conversion is attributed twice. A double attribution is a double payment.
+- No conversion is silently lost. A missing attribution is a publisher dispute.
+- Attribution visible within 60 seconds at p99.
+- Events arriving up to 72 hours late are handled by a stated policy, not by accident.
+- The daily close is **reproducible**: the same inputs and the same rule version produce the same
+  output, next month and next year.
+
+**Out of scope:** identity resolution across devices, fraud and invalid-traffic detection, the
+bidding and ad-serving path, invoicing.
+
+## Estimate
+
+- **Impressions: 1,000,000 per second** at peak.
+- **Clicks: about 1,000 per second** — roughly a tenth of a percent of impressions.
+- **Conversions: about 1,000 per second.**
+- Window: **7 days.**
+
+Now compute the join state, which is the number that decides everything:
+
+| Join against | Events in window | At 100 bytes each |
+|---|---|---|
+| Clicks | 7 × 86,400 × 1,000 ≈ **604 million** | about **60 GB** |
+| Impressions | 7 × 86,400 × 1,000,000 ≈ **604 billion** | about **60 TB** |
+
+<Claim label="inference">
+The attribution rule is not a product detail. It is the sizing input that decides whether this
+system can exist in the shape you are drawing. Last-click attribution holds 60 GB of join state,
+which fits across a modest cluster. Adding view-through attribution against raw impressions makes
+it 60 TB — a thousandfold increase produced by one sentence in a requirements document. This is
+the clearest case in the curriculum of a product decision that is really an infrastructure
+decision, and the estimate is the only thing that surfaces it before the build.
+</Claim>
+
+The way out is in the data model rather than in more hardware, and it is the first real design
+move: **do not keep impressions as events.** Keep a table of *(device, campaign) to last impression
+time*, which is bounded by the number of distinct device-campaign pairs rather than by the number
+of impressions. A device that sees the same campaign four thousand times contributes one row.
+
+<Estimator preset="storage" />
+
+Set writes per day to 86 billion — a day of impressions — and see what retaining raw impressions
+for a 90-day dispute window costs. Then set it to 86 million for clicks. The ratio is the argument
+for sampling impressions, and for making the dispute window a deliberate decision rather than a
+default.
+
+## Data model
+
+| Stream or table | Key | Notes |
+|---|---|---|
+| Impression events | device id | Enormous, and mostly discarded after updating the table below |
+| Impression state | device id and campaign | Compacted to the latest value. Bounded by distinct pairs. |
+| Click events | device id | Retained for the window, 7 days |
+| Click state | device id | The join state. Recent clicks, TTL 7 days, capped per device. |
+| Conversion events | device id | The probe side of the join |
+| Attribution | conversion id | The output. Keyed by conversion id, so writing it twice is a no-op. |
+| Campaign aggregate | campaign and hour | **Derived** from attributions, never incremented |
+
+**Everything joined must share a partition key.** The join key is the device id, so the click
+stream, the conversion stream and the impression table must all be partitioned by device id, and
+the decision has to be made at ingest. Partitioning clicks by campaign because a dashboard wanted
+it that way makes the join impossible without a repartition, and a repartition of a
+million-events-per-second stream is not a small thing to discover late.
+
+<Callout kind="info" title="Compaction is what turns a stream into a table">
+A retained log keeps every event for a retention period. A **compacted** log keeps only the latest
+value for each key, forever. That single difference converts an unbounded impression stream into a
+bounded lookup table, and it is the mechanism that makes view-through attribution affordable at
+all. It is worth recognising as a general move: when the join only needs the most recent value per
+key, the state you must hold is the number of keys, not the number of events.
+</Callout>
+
+## Design v1
+
+<Arch
+  caption="The log is the record. The streaming path is an estimate; the batch path is the answer."
+  columns={[
+    { title: 'Sources', nodes: [{ id: 'ads', label: 'Ad server' }, { id: 'shop', label: 'Checkout' }] },
+    { title: 'Logs', nodes: [{ id: 'clicklog', label: 'Click log', note: 'by device' }, { id: 'convlog', label: 'Conversion log', note: 'by device' }, { id: 'impstate', label: 'Impression table', note: 'compacted' }] },
+    { title: 'Join', nodes: [{ id: 'join', label: 'Join processor', note: '7-day state', tone: 'accent' }] },
+    { title: 'Output', nodes: [{ id: 'attr', label: 'Attribution log', note: 'keyed by conversion' }] },
+    { title: 'Serving', nodes: [{ id: 'agg', label: 'Aggregates', note: 'derived, revisable' }] },
+    { title: 'Close', nodes: [{ id: 'batch', label: 'Daily recompute', note: 'authoritative', tone: 'accent' }] },
+    { title: 'Consumers', nodes: [{ id: 'dash', label: 'Dashboards' }, { id: 'pay', label: 'Payouts' }] },
+  ]}
+  edges={[
+    { from: 'ads', to: 'clicklog' },
+    { from: 'ads', to: 'impstate' },
+    { from: 'shop', to: 'convlog' },
+    { from: 'clicklog', to: 'join' },
+    { from: 'convlog', to: 'join' },
+    { from: 'impstate', to: 'join' },
+    { from: 'join', to: 'attr' },
+    { from: 'attr', to: 'agg' },
+    { from: 'agg', to: 'dash' },
+    { from: 'clicklog', to: 'batch' },
+    { from: 'convlog', to: 'batch' },
+    { from: 'batch', to: 'pay' },
+  ]}
+  stages={[
+    {
+      label: 'Look it up',
+      show: ['ads', 'shop', 'clicklog', 'join', 'attr', 'dash'],
+      because:
+        'When a conversion arrives, query the click store for that device. At a thousand conversions per second this genuinely works, and understanding why the requirements still rule it out is more useful than being told it does not scale.',
+    },
+    {
+      label: 'Join the streams',
+      show: ['ads', 'shop', 'clicklog', 'convlog', 'impstate', 'join', 'attr', 'agg', 'dash'],
+      because:
+        'Both sides become logs, so late data can be reprocessed and every decision can be re-derived. The join holds seven days of click state and a compacted impression table, and emits one record per conversion.',
+    },
+    {
+      label: 'Separate the estimate from the answer',
+      show: ['ads', 'shop', 'clicklog', 'convlog', 'impstate', 'join', 'attr', 'agg', 'batch', 'dash', 'pay'],
+      because:
+        'Dashboards need speed and tolerate revision. Payouts need reproducibility and tolerate delay. One pipeline cannot be optimal for both, so the money comes from a deterministic recomputation over the retained logs.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Why not query the click table when a conversion arrives?&rdquo;
+
+Take the objection seriously, because at these numbers it works. A thousand point lookups per
+second against an indexed table of 600 million rows is an ordinary workload.
+
+It fails on requirements, not on scale, and the distinction matters:
+
+- **Late data has nowhere to go.** A click that arrives after the conversion it caused is never
+  considered, because the decision was made and there is no mechanism to revisit it.
+- **The decision is not reproducible.** The click table is mutable. Six weeks later, during a
+  dispute, there is no way to know what it contained at the moment of the decision, so
+  &ldquo;re-run it and see&rdquo; produces a different number.
+
+Both are fixed by the same move: **make the inputs immutable logs and the output a function of
+them.** That is the actual reason to build a streaming join here — auditability — and it is worth
+being clear-eyed about, because &ldquo;it would not scale&rdquo; would have been the wrong reason
+and would have led to a different design.
+
+### Round 2 — &ldquo;Your join state is sixty terabytes.&rdquo;
+
+Only if you join against impressions, which the estimate above already showed. Three moves, in
+descending order of value:
+
+1. **Join against clicks, not impressions.** Clicks are three orders of magnitude rarer and carry
+   almost all of the attribution signal.
+2. **Compact impressions into a table** keyed by device and campaign. State becomes proportional
+   to distinct pairs instead of to events.
+3. **Negotiate the window.** Thirty days of state is four times seven days of state, and the
+   marginal conversions attributed between day 7 and day 30 are usually few. This is a product
+   conversation that only happens if an engineer brings the number to it.
+
+### Round 3 — &ldquo;A click arrives after the conversion it caused.&rdquo;
+
+Normal, not exceptional. The two streams travel different paths, and one of them goes through a
+phone in a tunnel.
+
+A **watermark** decides when to stop waiting. But a watermark set at 72 hours means attribution is
+72 hours late, which fails the 60-second requirement outright. The two requirements are in direct
+conflict, and no watermark setting satisfies both.
+
+The resolution is to stop treating attribution as a single decision: **emit early, revise later.**
+
+- Emit a provisional attribution within seconds of the conversion.
+- If a better-matching click arrives before the close, emit a revision.
+- After the close, the attribution is final and late events are recorded but not applied.
+
+This forces a structural rule on everything downstream, and it is the most important sentence in
+this study:
+
+<Callout kind="warn" title="Counters must be derived, not incremented">
+An incremented counter cannot be corrected, because it has forgotten what it counted. Once
+attribution can be revised, every aggregate must be **computed from the attribution records**
+rather than bumped as they arrive.
+
+The cost is real — recomputing an aggregate is more work than adding one — and it buys something
+you cannot otherwise have at any price: the ability to be wrong for ninety seconds and then be
+right, without anyone reconciling anything by hand.
+</Callout>
+
+### Round 4 — &ldquo;The same conversion is processed twice.&rdquo;
+
+It will be. A consumer rebalance, a retry after a timeout, a replay after a bug — at-least-once
+processing is what a partitioned log with committed offsets gives you.
+
+The output is keyed by **conversion id**, so writing an attribution twice is an upsert of the same
+value. Aggregates derived from that keyed table are automatically correct regardless of how many
+times any record was written.
+
+Compare with the alternative: had aggregation been `counter += 1`, reprocessing would double-count
+silently, with no way to detect it after the fact and no way to repair it. Nothing about the
+processing changed — only the shape of the output — and that shape is the entire difference
+between a system that tolerates reprocessing and one that is corrupted by it.
+
+This is idempotency **by natural key** rather than by mechanism, and it is the cheapest form there
+is: no deduplication store, no keys to expire, no window during which a duplicate slips through.
+
+### Round 5 — &ldquo;A processor dies and loses sixty gigabytes of join state.&rdquo;
+
+Rebuilding it by replaying seven days of clicks would take far longer than anyone will tolerate,
+and would do it while conversions continue to arrive.
+
+- **Changelog the state.** Every state change is written to a compacted log, so recovery reads the
+  current state directly rather than deriving it from history.
+- **Snapshot periodically** so that the changelog replay is bounded.
+
+Then the observation that usually surprises people: **the number of partitions is chosen by
+recovery time, not by throughput.** State restores per partition, in parallel, so doubling the
+partition count halves recovery time. If 60 GB across 60 partitions restores in three minutes and
+that is acceptable, the partition count is settled — and it may be far more partitions than
+throughput alone would suggest. Work out the recovery target first and let it pick the number.
+
+### Round 6 — &ldquo;One device id has a million clicks.&rdquo;
+
+Bot traffic, a shared kiosk, or an SDK bug that reuses one identifier. One partition's state grows
+without bound, one processor falls behind, and the rest of the cluster is idle.
+
+The reflex answer to a hot key is to split it — and here **that answer is wrong**. You cannot split
+a join key. The entire purpose of the key is that every event carrying it meets in one place; a
+split key means a conversion and its click land on different processors and never join.
+
+What actually works:
+
+- **Cap per-key state.** Last-click attribution only needs the most recent click, so keeping the
+  latest few per device is not a compromise at all — it is the rule expressed correctly.
+- **Quarantine abnormal keys.** A device id with a million clicks in seven days is not a user.
+  Route it to a dead-letter path for investigation rather than letting it degrade a partition.
+
+Recognising that a standard technique does not apply is a large part of what separates judgment
+from pattern-matching. Key splitting solves read and write contention on independent operations. A
+join is not an independent operation.
+
+### Round 7 — &ldquo;The dashboard and the payout disagree.&rdquo;
+
+They will, and the disagreement is structural rather than a bug. The streaming path is optimised
+for latency and revises as it learns. The payout must be exact, reproducible and defensible.
+
+Run a **deterministic batch recomputation** over the retained logs for the daily close, and treat
+its output as authoritative. Then be honest about what that costs: **two implementations of the
+same business rule, which will drift.** Nothing prevents drift by itself, so:
+
+- Derive both paths from **one shared rule definition** rather than two implementations of a
+  written specification.
+- **Compare them continuously** and alert when divergence exceeds a threshold. The comparison is
+  the test that matters, and it must run every day rather than at release time.
+- **Say what the dashboard is** in the interface. A number labelled &ldquo;estimated, final at
+  close&rdquo; prevents an entire category of argument.
+
+And name the alternative you rejected: **one path, computed once after the watermark.** Simpler,
+cheaper, no drift, no revision machinery — and dashboards hours behind. It is rejected only
+because the requirement says 60 seconds. That requirement is now visibly expensive, which makes it
+worth going back and asking who needs it and what they do with it.
+
+### Round 8 — &ldquo;A publisher disputes last month's numbers.&rdquo;
+
+This is the requirement that shaped the architecture, so the answer should already exist:
+
+- **Raw event logs retained** for the dispute window, immutable.
+- **Attribution records retained** with the id of the rule version that produced each one.
+- **A deterministic recomputation** that, given the same logs and the same rule version, produces
+  the same output — including the tie-breaking order, which must not depend on processing order or
+  on which machine ran it.
+
+Determinism is easy to lose without noticing: a rule that says &ldquo;the most recent click&rdquo;
+must define what happens when two clicks share a timestamp, or the answer depends on arrival
+order. Pick a total order — timestamp, then event id — and the recomputation becomes reproducible
+rather than merely usually consistent.
+
+### Round 9 — &ldquo;The attribution rule changes on the fifteenth.&rdquo;
+
+A rule change is a schema change with money attached.
+
+- **Version the rule** and stamp the version on every attribution record.
+- **Never retroactively re-attribute a closed period.** Publishers have been paid on it.
+- **Shadow the new rule** against live traffic first, emitting its results to a separate stream, and
+  compare distributions before switching. A rule that shifts 4% of credit between publishers is
+  something you want to discover before the invoices, not after.
+
+This is expand-contract applied to a business rule instead of a database column: run both, compare,
+switch, retire — and the retirement step waits until no open period still references the old
+version.
+
+### Round 10 — &ldquo;Now make the decision synchronous.&rdquo;
+
+The fraud-detection variant of the same primitive: the conversion side is a request that is
+waiting for an answer rather than an event that has already happened.
+
+Everything about the join stays the same and every trade-off inverts:
+
+- The window state must be **queryable at low latency** from a shared store, not held as local
+  processor state, because the deciding process is whichever one received the request.
+- The budget is tens of milliseconds, so there is no waiting for late data at all. You answer with
+  what you have.
+- **There is no emit-early-revise-later.** A decision returned to a caller has already had its
+  effect.
+- You need a stated **fallback for when the state store is unavailable**: decide with no history
+  (fail open, accepting risk) or refuse (fail closed, rejecting legitimate traffic). Both cost
+  money in different directions, and it is a business decision that must be made before the
+  incident rather than during it.
+
+Same primitive, different constraint, almost none of the same answers. That is what the signature
+is for.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Join state explodes after a rule change',
+      symptom: 'Processors run out of memory days after a product change nobody flagged as technical.',
+      cause: 'View-through attribution was added, moving the join from clicks to impressions and multiplying state by a thousand.',
+      mitigation: 'Size the join state from the rule before agreeing to it, and hold high-volume sides as compacted tables rather than event windows.',
+    },
+    {
+      what: 'Double payment',
+      symptom: 'A publisher is paid twice for one conversion and the totals cannot be made to reconcile.',
+      cause: 'Aggregates were incremented on arrival, so at-least-once reprocessing counted the same conversion more than once.',
+      mitigation: 'Key output by conversion id and derive aggregates from it. Never increment a counter from an at-least-once stream.',
+    },
+    {
+      what: 'Late events silently dropped',
+      symptom: 'Attribution rates fall for one traffic source and no error is logged.',
+      cause: 'Events arriving past the watermark are discarded without being recorded.',
+      mitigation: 'Count and report late arrivals by source. A watermark decision is only defensible if you know what it is discarding.',
+    },
+    {
+      what: 'Recovery takes hours',
+      symptom: 'A single processor restart delays attribution across a whole partition for most of a morning.',
+      cause: 'State is rebuilt by replaying the source window rather than from a compacted changelog, and there are too few partitions to parallelise.',
+      mitigation: 'Changelog and snapshot the state, and choose the partition count from the recovery time target.',
+    },
+    {
+      what: 'Hot key stalls a partition',
+      symptom: 'One partition lags by hours while the rest are current.',
+      cause: 'A single device id accumulates unbounded state. Key splitting cannot be applied, because splitting a join key breaks the join.',
+      mitigation: 'Cap per-key state to what the rule actually needs, and quarantine keys whose volume is not human.',
+    },
+    {
+      what: 'Streaming and batch drift',
+      symptom: 'Dashboards and invoices disagree by a few percent, in a direction that changes weekly.',
+      cause: 'The rule is implemented twice, and one implementation was updated.',
+      mitigation: 'One shared rule definition, and a daily automated comparison that alerts on divergence.',
+    },
+    {
+      what: 'Recomputation is not deterministic',
+      symptom: 'Re-running the close on identical inputs produces a slightly different result.',
+      cause: 'A tie in the rule — two clicks with the same timestamp — is resolved by arrival order.',
+      mitigation: 'Define a total order for every tie-break in the rule, independent of processing order.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Immutable logs as inputs | Reproducibility and late-data handling | Storage for the dispute window | Nobody ever disputed a number |
+| Join against clicks, impressions compacted | 60 GB of state instead of 60 TB | View-through granularity beyond last impression | Impressions were rare |
+| Emit early, revise before close | Dashboards in seconds and correctness by close | Every downstream aggregate must be derivable | Hours-late attribution were acceptable |
+| Output keyed by conversion id | Reprocessing is free and safe | Aggregation is recomputation, not increment | Reprocessing never happened, which it does |
+| Separate batch path for payouts | Exact, reproducible money | Two implementations that can drift | Streaming results were defensible to an auditor |
+| Cap per-key state | One bad key cannot stall a partition | The rare legitimate high-volume device is truncated | Per-key volume were bounded naturally |
+| Rule versions stamped on records | Disputes and rule changes are tractable | A version to carry forever | Rules never changed |
+
+## Cost
+
+Unusually, the biggest cost is data nobody will ever query:
+
+1. **Raw impression retention.** A million events per second, kept for a dispute window, dwarfs
+   everything else combined. The honest question is whether raw impressions must be retained at all
+   or whether the compacted table plus a sample is sufficient evidence — a legal question with an
+   enormous engineering price tag, and one worth asking explicitly rather than defaulting to
+   keeping everything.
+2. **Join state**, replicated and changelogged, at tens of gigabytes per replica. Modest.
+3. **Two compute paths**, streaming and batch, over the same data. This is the direct price of the
+   60-second requirement.
+4. **Ingest throughput** for the impression stream, which is the largest steady load in the
+   system and exists almost entirely to update one table.
+
+A materially cheaper design drops the streaming path entirely and computes attribution hourly. It
+loses real-time dashboards and nothing else, and it removes the drift problem, the revision
+machinery and one whole implementation of the rule. Whether that is a good trade depends entirely
+on what people actually do with a number that is sixty seconds old.
+
+## What we did NOT build
+
+- **Identity resolution across devices.** Deciding that a phone and a laptop are the same person is
+  a large probabilistic system with its own error budget and its own privacy obligations. Fusing it
+  into the join would make attribution errors and identity errors indistinguishable.
+- **Fractional multi-touch attribution.** Splitting credit across every touchpoint means joining
+  against the full interaction history rather than one event, which changes the state model and the
+  cost by orders of magnitude. It is a different system, not a configuration option.
+- **Exactly-once delivery.** It does not exist. What exists here is at-least-once processing with
+  an output keyed so that duplicates are indistinguishable from the original.
+- **A general stream-processing platform.** This is one join with one rule. Building a framework
+  for hypothetical future joins is how a working pipeline becomes an unowned platform.
+- **Fraud and invalid-traffic detection.** It belongs upstream, filtering the click stream, and it
+  is at least as large as everything described here.
+
+## Evidence
+
+<Claim label="fact" source="kafka-docs">
+Log compaction retains at least the last known value for each message key, which allows a topic to
+be used as a durable changelog of state that can be replayed to restore that state without keeping
+every historical event.
+</Claim>
+
+<Claim label="fact" source="kafka-paper">
+A partitioned log provides ordering within a partition and consumer offsets that allow a consumer
+to resume from where it stopped. Ordering guarantees do not extend across partitions, which is why
+the join key must be the partition key.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Stream joins require state to be held for the duration of the window, and event time differs from
+processing time, so a system must decide explicitly when to stop waiting for late events and what
+to do when one arrives after that point.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Deriving views from an immutable event log allows a view to be rebuilt after a bug by reprocessing
+the log, which is not possible when state is updated in place.
+</Claim>
+
+<Claim label="convention" source="stripe-eng">
+Keying an operation by a client-supplied identifier so that a repeated request produces the
+original outcome rather than a second effect is established practice wherever retries can produce
+duplicates.
+</Claim>
+
+<Claim label="convention" source="linkedin-eng">
+Published engineering writing on log-centric data infrastructure argues for treating an ordered,
+retained log as the primary record from which derived views are built, precisely so that those
+views can be recomputed.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage is well suited to recomputing aggregates over large event tables, because
+a query reads only the columns it references rather than whole rows.
+</Claim>
+
+<Claim label="speculation">
+The event rates, window lengths, state sizes, retention periods and rule details here are
+pedagogical choices derived from the stated requirements. They describe no particular advertising
+platform.
+</Claim>

@@ -1,0 +1,389 @@
+---
+id: what-you-cannot-optimise-away
+title: What You Cannot Optimise Away
+level: 0
+module: l0-physics
+order: 1
+summary: Some limits are physics and some are choices. Confusing the two wastes months, so learn to tell them apart before you design anything.
+difficulty: intro
+minutes: 20
+prerequisites: [rtt, latency]
+concepts: [rtt, latency-budget, percentiles, throughput, latency]
+unlocks: [tail-latency, cdn, multi-region]
+sources: [hpbn, tail-at-scale, sre-book]
+status: reviewed
+---
+
+## The problem
+
+A team spends six weeks optimising an API endpoint. They cut server processing from 90
+milliseconds to 12. The p50 page load, measured from users in Australia against servers in
+Ireland, improves from 1.9 seconds to 1.8.
+
+The work was real. The impact was not, because server time was never the dominant term. About
+340 milliseconds of every request was the round trip to Ireland and back, repeated for each of
+four sequential dependencies, and no amount of application optimisation touches that.
+
+Before you optimise anything, you need to know which parts of the budget are negotiable.
+
+## Intuition
+
+There are three kinds of limit, and they respond to completely different actions.
+
+**Physics.** Distance divided by the speed of light in fibre. You cannot make this smaller.
+You can only make the distance shorter, by moving the data or the computation closer to the
+user, or make the number of trips smaller.
+
+**Architecture.** How many sequential round trips your design requires. This *is* negotiable,
+and it is usually where the win is: four sequential calls become one parallel batch, or one
+call to something nearby.
+
+**Implementation.** How long your code takes once the data is in front of it. Usually the
+smallest term for a networked request, and usually the first place people look.
+
+The discipline is to measure before choosing, because intuition consistently over-weights the
+third.
+
+## Concretely
+
+<Example title="Splitting a latency budget">
+
+A user in Sydney loads a dashboard served from Ireland. Round-trip time is roughly 250 ms in
+practice.
+
+| Component | Cost | Kind of limit |
+|---|---|---|
+| DNS (cached) | ~0 ms | — |
+| TCP handshake | 250 ms | physics × 1 trip |
+| TLS 1.3 handshake | 250 ms | physics × 1 trip |
+| Request and response | 250 ms | physics × 1 trip |
+| Server processing | 90 ms | implementation |
+| Three dependent API calls, sequential | 750 ms | **architecture** |
+| Rendering | 120 ms | implementation |
+
+Total, roughly 1.7 seconds. Server processing is 5% of it.
+
+The three sequential API calls are the largest single term, and they are architecture: if they
+can be made parallel, 750 ms becomes 250 ms. Terminating TLS at an edge location near Sydney
+turns two of the three handshake round trips into short ones. Between them, those two changes
+save around a second — an order of magnitude more than the six-week optimisation.
+
+<Claim label="inference">
+The numbers above are illustrative, derived from a 250 ms round trip and stated assumptions
+about the number of trips. The reasoning transfers even where your measurements differ; the
+point is the shape of the budget, not these particular figures.
+</Claim>
+
+</Example>
+
+## Formal explanation
+
+A <C id="latency-budget">latency budget</C> is a target for the whole user-visible operation,
+divided among the things that must happen in sequence. Building one is the single most useful
+half-hour in a performance investigation, because it converts an argument about opinions into
+arithmetic.
+
+Two properties matter:
+
+**Sequential costs add; parallel costs take the maximum.** Four 250 ms calls in sequence cost
+a second. The same four in parallel cost 250 ms — or slightly more, because with four calls
+you are now exposed to the slowest of four rather than the average, which is where
+<C id="tail-latency">tail latency</C> begins to matter.
+
+**Latency and bandwidth are different resources.** Bandwidth is how much data per second;
+latency is how long before the first byte arrives. Adding bandwidth does nothing for a small
+request, and this is why a fast connection does not make a chatty application feel fast.
+
+<Formula
+  expression="user-visible latency ≈ Σ(sequential steps) + max(parallel steps) + transfer size ÷ bandwidth"
+  where={[
+    { symbol: 'sequential', meaning: 'anything that must wait for the previous result' },
+    { symbol: 'parallel', meaning: 'anything that can be issued at the same time' },
+    { symbol: 'transfer', meaning: 'dominant only for large payloads: video, images, downloads' },
+  ]}
+/>
+
+<Callout kind="info" title="The number that matters is not the average">
+A mean latency describes nobody. If p50 is 100 ms and p99 is 4 s, then one request in a
+hundred takes four seconds — and a page making twenty requests has roughly an 18% chance of
+containing at least one of them. Percentiles are how you see this; averages hide it.
+</Callout>
+
+<Deeper title="Why the tail dominates as soon as anything fans out">
+
+Suppose a request depends on 100 parallel calls, each with a p99 of 1 second. The user waits
+for the slowest.
+
+The probability that *no* call exceeds its p99 is 0.99 raised to the power of 100, which is
+about 0.37. So roughly 63% of user requests contain at least one call in its own p99 tail.
+
+<Claim label="fact" source="tail-at-scale">
+Dean and Barroso describe this effect and its consequences for large-scale services, along
+with tail-tolerant techniques such as hedged requests, where a duplicate request is issued
+after a short delay and the first response wins.
+</Claim>
+
+The design lesson: rare events become common under fanout. A system with 100 dependencies must
+treat p99 as its normal case, not its edge case.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The same work, arranged two ways. Only one of them is fast."
+  columns={[
+    { title: 'User', nodes: [{ id: 'user', label: 'User', note: 'Sydney' }] },
+    { title: 'Edge', nodes: [{ id: 'edge', label: 'Edge POP', note: 'TLS terminated near', tone: 'accent' }] },
+    { title: 'Origin', nodes: [{ id: 'api', label: 'API', note: 'Ireland' }] },
+    { title: 'Dependencies', nodes: [{ id: 'd1', label: 'Service A' }, { id: 'd2', label: 'Service B' }, { id: 'd3', label: 'Service C' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'edge', label: 'short RTT', tone: 'accent' },
+    { from: 'edge', to: 'api', label: 'warm connection' },
+    { from: 'api', to: 'd1', label: 'parallel' },
+    { from: 'api', to: 'd2' },
+    { from: 'api', to: 'd3' },
+  ]}
+  stages={[
+    {
+      label: 'Naive',
+      show: ['user', 'api', 'd1'],
+      because:
+        'One long round trip to the origin, then dependencies called one after another. Every hop pays the full distance.',
+    },
+    {
+      label: 'Parallel dependencies',
+      show: ['user', 'api', 'd1', 'd2', 'd3'],
+      because:
+        'Issuing independent calls together turns a sum into a maximum. This is the largest architectural win available and costs nothing physical.',
+    },
+    {
+      label: 'Move the endpoint closer',
+      show: ['user', 'edge', 'api', 'd1', 'd2', 'd3'],
+      because:
+        'Terminating the connection near the user turns two long handshake round trips into short ones, and the edge holds a warm connection onward. Physics is unchanged; the number of long trips is reduced.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '1 dependency',
+      behaviour: 'User latency tracks that dependency closely. The p99 is a rare event.',
+      firstToBreak: 'Nothing. Intuition works at this scale, which is why it fails later.',
+    },
+    {
+      scale: '10 parallel dependencies',
+      behaviour:
+        'The user waits for the slowest of ten. Roughly one request in ten now contains a p99 call.',
+      firstToBreak: 'The p99 of the overall request, well before any individual service looks unhealthy.',
+    },
+    {
+      scale: '100 parallel dependencies',
+      behaviour:
+        'Most requests contain at least one tail event. The aggregate p99 is far worse than any component p99.',
+      firstToBreak:
+        'User experience, while every dependency dashboard shows green. This is the classic unexplainable-latency incident.',
+    },
+    {
+      scale: '100 sequential dependencies',
+      behaviour: 'Latencies add. The design is simply not viable regardless of tuning.',
+      firstToBreak:
+        'The design itself. At this point the answer is to change the shape of the request, not to optimise anything.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Optimising the wrong term',
+      symptom:
+        'Significant engineering effort produces a barely measurable change in user-visible latency.',
+      cause: 'No latency budget, so the biggest term was never identified.',
+      mitigation:
+        'Build the budget first. Measure from the client, not from inside the service, because the parts you cannot see from inside are often the largest.',
+    },
+    {
+      what: 'Accidental sequential dependencies',
+      symptom:
+        'Latency grows linearly with the number of items on a page rather than staying flat.',
+      cause:
+        'A loop issuing one request per item, each waiting for the previous. Frequently introduced by an ORM or a resolver rather than written deliberately.',
+      mitigation:
+        'Batch. One request for many items, or a parallel issue of independent requests. This is the N+1 problem wearing network clothes.',
+    },
+    {
+      what: 'Coordinated omission in load testing',
+      symptom:
+        'Load tests show excellent p99, production does not, and nobody can reconcile the two.',
+      cause:
+        'The load generator waits for a response before sending the next request, so during a stall it stops generating load. The worst latencies are never recorded because the requests that would have suffered were never sent.',
+      mitigation:
+        'Use a generator that maintains a fixed arrival rate independent of responses, and record the time from when a request *should* have been sent.',
+    },
+    {
+      what: 'Averaging percentiles across instances',
+      symptom:
+        'Dashboards look fine while users complain. Per-instance p99s are averaged into a number that describes nothing.',
+      cause: 'Percentiles are not additive; the mean of ten p99 values is not the p99 of the whole.',
+      mitigation:
+        'Aggregate histograms and compute percentiles from the merged distribution.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Issue independent dependency calls in parallel rather than sequentially"
+  options={[
+    'Sequential calls: simplest to write, easiest to reason about',
+    'Parallel calls with a shared deadline',
+    'Parallel calls plus hedging: duplicate the slow ones after a delay',
+  ]}
+  why="Sequential latencies add and parallel latencies take the maximum. When calls are genuinely independent, sequencing them is pure cost with no benefit."
+  gain="Latency drops from the sum to roughly the slowest single call. For four equal calls, a 4x improvement in that portion of the budget, achieved without touching any dependency."
+  sacrifice="You are now exposed to the tail of every dependency at once rather than one at a time, so the p99 of the combined operation is worse than any individual p99. Load on dependencies also becomes burstier."
+  failureModes={[
+    'One slow dependency now delays a request that previously would have failed fast at an earlier step',
+    'A shared deadline is needed, or one hung call holds the whole request',
+    'Concurrency amplifies: N parallel calls per request means N times the connections',
+  ]}
+  operationalBurden="Low in code, but it demands per-dependency timeouts and a request-level deadline. Without those, parallelism turns one slow dependency into a stuck request."
+  cost="No infrastructure cost. It does increase peak concurrency against dependencies, which may require pool sizing changes on both sides."
+  whenNot="When calls are genuinely dependent — the second needs the first's result — parallelism is not available, and pretending otherwise produces subtle bugs. It is also the wrong first move when one call dominates the total: parallelising around a 900 ms call and three 20 ms calls saves 60 ms and hides the real problem."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="tail-at-scale">
+Google's analysis of latency at scale documents that variability in individual components is
+amplified by fanout, so that a service depending on many others sees tail behaviour far worse
+than its components. Techniques described include hedged requests and tied requests.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Measuring user-visible latency at percentiles, and setting objectives against those
+percentiles rather than averages, is standard practice in reliability engineering. The
+distribution is the signal; the mean discards it.
+</Claim>
+
+<Claim label="recommendation">
+Build the latency budget before proposing any optimisation, and measure it from where the user
+is. Almost every large latency win comes from removing a sequential step or moving an endpoint
+closer, and almost every disappointing optimisation comes from improving a term that was
+already small.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you reason quantitatively about latency, and whether you know which limits are physical. Candidates who propose caching for every latency problem, without asking where the time goes, are showing the boundary of their model."
+  depth="Be able to build a rough budget out loud, identify the dominant term, and name what kind of limit it is. Percentile reasoning is expected at senior level; the fanout amplification argument is a strong differentiator."
+  followUps={[
+    'p50 is 80 ms and p99 is 3 s. What is your first hypothesis?',
+    'How does adding a tenth dependency change the p99 of the request?',
+    'Your load test shows a p99 that production does not reproduce. What might be wrong with the test?',
+    'When does adding bandwidth improve latency?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will add a cache to fix the latency.',
+      why: 'A cache helps when the cost is recomputation or a repeated lookup. It does nothing about distance, connection setup, or the number of sequential steps — and it adds staleness and a new failure mode to a system whose problem was elsewhere.',
+      instead:
+        'Identify the dominant term first. If it is distance, move something closer. If it is sequential steps, parallelise. If it is repeated expensive computation, then cache.',
+    },
+    {
+      mistake: 'Our average latency is 100 ms, so we are fast.',
+      why: 'The average is compatible with a great many users having an appalling experience. It also hides bimodal distributions, where the mean sits in a gap where no request actually lands.',
+      instead:
+        'Quote p50, p99 and the count. Then ask what a page composed of twenty such requests looks like.',
+    },
+    {
+      mistake: 'We need faster servers.',
+      why: 'For a networked request, server time is frequently the smallest term. Doubling server speed halves a small number and leaves the physics untouched.',
+      instead:
+        'Show the budget. If server time is 5% of the total, say so and redirect the effort.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<EstimateCheck
+  concepts={['rtt', 'latency-budget']}
+  prompt="A user is 15,000 km from your servers, along the path the fibre actually takes. Light travels about 200,000 km/s in fibre. What is the theoretical minimum round-trip time, in milliseconds?"
+  unit="ms"
+  answer={150}
+  tolerance={0.3}
+  derivation={[
+    'One way: 15,000 km ÷ 200,000 km/s = 0.075 s = 75 ms.',
+    'Round trip doubles it: about 150 ms.',
+    'Real measured RTT on such a path is typically higher, because fibre does not run straight and every router adds delay.',
+    'Design consequence: if your request needs three sequential round trips, that is 450 ms before any code runs.',
+  ]}
+  stronger="A stronger answer states the consequence rather than stopping at the number: at 150 ms per trip, the only meaningful levers are reducing the number of trips or reducing the distance. Nothing you do to the server matters at this scale."
+/>
+
+<Check
+  concepts={['tail-latency', 'fanout-latency-amplification']}
+  prompt="Your service calls 50 dependencies in parallel. Each has a p99 of 200 ms and a p50 of 10 ms. Roughly what should you expect your own p50 to look like?"
+  options={[
+    {
+      id: 'a',
+      text: 'Around 10 ms, since that is the typical dependency latency',
+      implies: 'You are taking the typical case of one dependency as the typical case of the whole.',
+      why: 'The request waits for the slowest of 50, not the typical one. The chance that all 50 come in under their p99 is 0.99 to the power of 50, about 61% — so roughly two requests in five contain at least one 200 ms call, which makes 200 ms a common outcome rather than a rare one.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Closer to 200 ms, because the slowest of 50 usually lands in the tail',
+      implies: 'You applied the fanout amplification argument to the median rather than only to the tail.',
+      why: 'With 50 parallel calls, tail events stop being rare from the request’s point of view. The median request contains something close to a tail call, so the aggregate p50 drifts toward the component p99. This is why every dependency dashboard can look healthy while user latency is poor.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Around 10 s, because the latencies add up',
+      implies: 'You are summing parallel work.',
+      why: 'Parallel calls take the maximum, not the sum. Summing would be right if they were sequential — which would indeed be catastrophic, and is a good reason to check that they really are parallel.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer proposes what to do about it: reduce the fanout, make some dependencies optional so a slow one can be dropped, set a request deadline shared across all 50 calls, or hedge the slowest by issuing a duplicate after a short delay. It also notes that improving a dependency's p99 helps far more here than improving its p50."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'The Tail at Scale: why fanout makes rare events common',
+      sourceId: 'tail-at-scale',
+      note: 'Short, and among the highest-value papers for anyone building request-response systems.',
+    },
+    { label: 'Latency versus bandwidth, and where each dominates', sourceId: 'hpbn' },
+    { label: 'Percentiles and service level indicators', sourceId: 'sre-book' },
+    {
+      label: 'Next: what a server is actually doing with the time you measured',
+      href: '/levels/1',
+    },
+  ]}
+/>

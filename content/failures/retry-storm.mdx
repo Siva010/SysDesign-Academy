@@ -1,0 +1,126 @@
+---
+id: retry-storm
+title: The Retry Storm
+symptom: A brief dependency failure becomes a sustained outage that continues after the original cause is fixed.
+category: overload
+concepts: [retry-amplification, retry-budget, exponential-backoff, thundering-herd, cascading-failure, circuit-breaker, load-shedding, throughput-vs-goodput]
+sources: [aws-jitter, aws-timeouts, sre-book, release-it]
+status: reviewed
+---
+
+## What you see
+
+**14:02** — The inventory service has a brief problem. A deploy restarts its instances; for about
+40 seconds, roughly 30% of calls fail.
+
+**14:03** — The deploy completes. Inventory is healthy. Error rates should return to normal.
+
+**14:04** — They do not. Inventory is now failing 100% of calls and its CPU is pinned.
+
+**14:20** — Inventory has been restarted twice. Each time it comes up, is immediately
+overwhelmed, and fails again within seconds.
+
+**14:45** — Someone blocks traffic at the load balancer. Inventory recovers in under a minute.
+Traffic is restored gradually and everything is fine.
+
+The original fault lasted 40 seconds. The outage lasted 43 minutes, and **the original fault was
+fixed 41 of those minutes ago.**
+
+## The mechanism
+
+Three layers retry, each independently:
+
+- The mobile client retries up to 3 times.
+- The API gateway retries up to 3 times.
+- The order service retries its call to inventory up to 3 times.
+
+Under normal conditions nothing fails, so nothing retries and the amplification is invisible.
+
+When inventory starts failing 30% of calls:
+
+1. The order service's retries roughly triple its load on inventory.
+2. Gateway retries triple that again.
+3. Client retries triple it once more.
+
+At the extreme, one user action becomes 27 requests at the bottom of the stack. Inventory, which
+was serving 30% failures, is now receiving many times its normal traffic — so it fails a much
+larger share, which triggers more retries.
+
+<Claim label="inference">
+This is a positive feedback loop. Beyond a threshold, the retry load alone is sufficient to keep
+the service down, which is why fixing the original cause changes nothing. The system is now being
+held down by its own response to a fault that no longer exists.
+</Claim>
+
+The second mechanism is synchronisation. All the clients failed at the same moment, so they all
+back off for the same interval and all retry at the same instant. Load arrives in waves rather
+than spread out, and each wave re-triggers the failure.
+
+## Why the obvious fixes make it worse
+
+**Restarting the service.** It comes up with cold caches, empty connection pools and no warmed
+runtime state — at its weakest — and immediately receives the full accumulated retry load. It
+fails faster than before.
+
+**Adding capacity.** New instances receive the same amplified load. If the bottleneck is a shared
+downstream resource, more instances push more concurrency at it. Frequently this extends the
+outage.
+
+**Increasing timeouts.** Requests now occupy workers for longer, so concurrency requirements rise
+and the queue grows. It converts fast failures into slow ones, which is worse.
+
+## What actually works
+
+**Reduce the load.** Block or shed traffic at the edge, let the service recover with no work to
+do, then restore traffic gradually. This feels drastic and is usually the fastest path out.
+
+The order that works:
+
+1. Shed aggressively — accept a small fraction of traffic.
+2. Confirm the service is healthy at that fraction.
+3. Increase admission in steps, watching goodput rather than throughput.
+4. Only then investigate the original fault.
+
+## How to prevent it
+
+**Retry at one layer only.** Pick the layer closest to the failure that has enough context to
+retry usefully, and make every other layer pass failures through. Multiplication across layers is
+the core of the problem.
+
+**Retry budgets rather than retry counts.** Cap retries as a fraction of total requests — for
+example, retries may be at most 10% of traffic. A per-request limit of 3 still triples load
+during a broad failure; a budget cannot, by construction.
+
+<Claim label="fact" source="aws-jitter">
+Randomised jitter added to exponential backoff spreads retry attempts over time rather than
+allowing clients to synchronise into waves, and measurably improves recovery under contention.
+</Claim>
+
+**Circuit breakers on optional dependencies.** Once failures are clearly correlated rather than
+transient, stop calling entirely. Retrying a broken dependency is not persistence, it is load.
+
+**Distinguish retryable from non-retryable failures.** A 400 is not going to succeed on the
+second attempt. Retrying deterministic failures is pure amplification.
+
+## How to detect it early
+
+- **Retry rate as a first-class metric**, separate from request rate. A rising ratio of retries
+  to requests is the leading indicator, and most services do not measure it.
+- **Goodput, not throughput.** A service completing 50,000 requests per second that all exceed
+  the client's timeout has zero goodput and a healthy-looking throughput graph.
+- **Amplification factor.** Compare requests received at the bottom of the stack against user
+  actions at the top. In normal operation this should be close to 1.
+
+## Related
+
+<Claim label="convention" source="sre-book">
+Cascading failure driven by the system's own response to overload — retries, failover and
+capacity reduction from health checking — is a documented pattern, and recovery frequently
+requires reducing load rather than adding capacity.
+</Claim>
+
+<Claim label="recommendation" source="aws-timeouts">
+Timeouts should be derived from the caller's latency budget rather than from the dependency's
+typical latency, and retries should be bounded as a proportion of traffic rather than per
+request.
+</Claim>

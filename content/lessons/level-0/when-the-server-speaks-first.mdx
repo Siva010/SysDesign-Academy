@@ -1,0 +1,399 @@
+---
+id: when-the-server-speaks-first
+title: When the Server Needs to Speak First
+level: 0
+module: l0-transport
+order: 2
+summary: HTTP only lets the client ask. Everything that feels live is built by working around that, and each way of working around it costs something different.
+difficulty: core
+minutes: 23
+prerequisites: [reliability-costs-round-trips]
+concepts: [websocket, push-vs-pull]
+unlocks: [connection-exhaustion, statelessness, thundering-herd, fanout-on-write, sticky-sessions]
+failures: [reconnect-storm]
+sources: [rfc6455, rfc9110, hpbn, mdn-http, discord-eng]
+status: reviewed
+---
+
+## The problem
+
+A message arrives for a user who is looking at their screen right now. Nothing happens.
+
+The interface has no way to know. It asked the server for messages four seconds ago and got
+nothing, and it will ask again in another four. The information exists, it is one hop away, and it
+sits there because the conversation only runs one way: the client asks, the server answers.
+
+So you make it ask more often. Every second, from every open tab. Now a service with 200,000 idle
+users is handling 200,000 requests per second to say &ldquo;nothing new&rdquo;, and the answer is
+still up to a second late.
+
+## Intuition
+
+There are exactly two ways to learn something someone else knows.
+
+**You ask them, repeatedly.** Cheap to arrange, and you pay for every question, including all the
+ones answered &ldquo;nothing&rdquo;. Your worst-case delay is the gap between questions.
+
+**They keep a line open and tell you.** No wasted questions, and news arrives immediately. But
+somebody has to hold the line open, and the cost of holding it is paid whether or not anything is
+ever said.
+
+Neither is free and neither is universally better. Polling converts *freshness* into *request
+volume*: the fresher you want to be, the more you ask. Pushing converts freshness into *connection
+count*: the cost no longer depends on how often anything happens, only on how many people are
+listening.
+
+That is the actual trade, and it means the right answer depends on a ratio you can compute — how
+often does something happen, per connected user? Rare events with many idle users favour polling.
+Frequent events favour pushing. A chat application and a stock ticker sit at opposite ends and
+should not use the same mechanism.
+
+## Concretely
+
+<Example title="Four ways to learn about a new message, with their real costs">
+
+Assume 200,000 connected users and, on average, one relevant event per user per five minutes.
+
+**Poll every 4 seconds.** 50,000 requests per second, of which about 99.7% return nothing. Each
+carries request headers, authentication and a connection. Worst-case staleness: 4 seconds.
+
+**Poll every 60 seconds.** 3,300 requests per second — sixteen times cheaper, and now the product
+feels broken for anything conversational. This is the dial, and it only has these two ends.
+
+**Long polling.** The client asks and the server *holds the request open* until there is something
+to say or a timeout expires. Delivery is immediate, wasted requests disappear, and the cost moves:
+the server is now holding 200,000 open requests. It has become a stateful service using an HTTP
+shape.
+
+**A persistent connection.** One connection per user, held open, with messages sent in either
+direction whenever either side has something to say. Delivery is immediate and per-message
+overhead is a few bytes rather than a full request.
+
+The last two cost nearly the same thing, and it is not bandwidth. It is 200,000 open sockets, and
+everything that follows from a tier that remembers who is attached to it.
+
+</Example>
+
+## Formal explanation
+
+HTTP is request-response: a client sends a request, a server sends a response
+(<Cite id="rfc9110" />). A server has no way to originate a message to a client that has not
+asked, because there is no channel to originate it on.
+
+Three mechanisms work around this, and they differ in what they cost rather than in what they
+achieve:
+
+- **Polling.** Repeated ordinary requests. Simple, stateless, works through every intermediary
+  ever built. Cost is proportional to *clients × poll rate*, independent of how much actually
+  happens.
+- **Long polling.** A request the server does not answer until it has something to say. Delivery
+  is immediate; the server holds an open request per client.
+- **A persistent connection**, such as a <C id="websocket" /> upgraded from an HTTP request
+  (<Cite id="rfc6455" />), or a one-directional server-sent event stream. Either side may send at
+  any time, with minimal per-message overhead.
+
+<C id="push-vs-pull" /> is the underlying choice, and the consequence that matters is not on the
+wire. It is this:
+
+**A pushing tier is stateful.** The server holding your connection is *the* server that must
+deliver your messages. That single fact undoes several properties you were relying on:
+
+- **Load balancing changes meaning.** Balancing connections is not balancing work. A machine with
+  an even share of connections may hold an uneven share of the active ones, and the imbalance
+  persists because connections do not move.
+- **Deploys become disruptive.** Restarting a machine drops every connection it holds. Those
+  clients all reconnect at once, to the machines that are still up, which are now carrying more
+  than their share.
+- **Delivery needs routing.** To send a message to a user, something must know which machine holds
+  that user's connection. That is a registry, and it is a new piece of infrastructure with its own
+  staleness and its own failure modes.
+- **Capacity is measured in connections.** Sockets, file descriptors and per-connection memory are
+  consumed by idle users. Your ceiling is now the number of people connected, not the amount of
+  work being done.
+
+None of these is a reason to avoid pushing. They are the bill, and it should be read before
+signing.
+
+## Architecture
+
+<Arch
+  caption="The cost of pushing is not the connection. It is everything the connection makes stateful."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'client', label: 'Clients', note: '200k idle' }] },
+    { title: 'Edge', nodes: [{ id: 'lb', label: 'Load balancer', note: 'connections, not requests' }] },
+    { title: 'Connection tier', nodes: [{ id: 'ws1', label: 'Gateway A', note: 'holds sockets', tone: 'accent' }, { id: 'ws2', label: 'Gateway B', note: 'holds sockets' }] },
+    { title: 'Routing', nodes: [{ id: 'reg', label: 'Session registry', note: 'user to gateway' }] },
+    { title: 'Producers', nodes: [{ id: 'app', label: 'Application' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'lb' },
+    { from: 'lb', to: 'ws1' },
+    { from: 'lb', to: 'ws2' },
+    { from: 'ws1', to: 'reg', label: 'register' },
+    { from: 'ws2', to: 'reg' },
+    { from: 'app', to: 'reg', label: 'where is user X' },
+    { from: 'reg', to: 'ws1', label: 'deliver' },
+  ]}
+  stages={[
+    {
+      label: 'Polling',
+      show: ['client', 'lb', 'app'],
+      because:
+        'Ordinary requests to a stateless tier. Any server can answer any client, deploys are invisible, and the entire mechanism is a timer in the client. You pay in requests that return nothing.',
+    },
+    {
+      label: 'Hold the connections',
+      show: ['client', 'lb', 'ws1', 'ws2', 'app'],
+      because:
+        'A dedicated tier holds the sockets so the application tier stays stateless. Delivery is immediate. The gateways are now the only machines that can reach a given user, which is a property nothing in the design has dealt with yet.',
+    },
+    {
+      label: 'Find the connection',
+      show: ['client', 'lb', 'ws1', 'ws2', 'reg', 'app'],
+      because:
+        'A registry maps each connected user to the gateway holding them, so a producer anywhere can deliver. It is the price of a stateful tier: a lookup that must stay correct as connections open, close and move during every deploy.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Hundreds of users',
+      behaviour: 'Poll every few seconds. Cost is invisible, staleness is acceptable, nothing is stateful.',
+      firstToBreak: 'Nothing. Reaching for WebSockets here buys complexity and no user-visible improvement.',
+    },
+    {
+      scale: 'Tens of thousands',
+      behaviour:
+        'Polling cost becomes a real fraction of total requests, and most of it returns nothing. Persistent connections start to pay for themselves.',
+      firstToBreak:
+        'Request volume from idle clients, and the latency floor set by the poll interval.',
+    },
+    {
+      scale: 'Hundreds of thousands connected',
+      behaviour:
+        'The connection tier is a distinct service sized by socket count. A registry routes messages to the right gateway.',
+      firstToBreak:
+        'Deploys. Every restart drops thousands of connections that reconnect simultaneously, and the reconnect burst is larger than any steady-state load.',
+    },
+    {
+      scale: 'Millions connected',
+      behaviour:
+        'Connection count is the primary capacity metric. Memory per connection and the reconnect storm dominate design decisions.',
+      firstToBreak:
+        'The reconnect path, and the registry behind it, at exactly the moment a network event disconnects a large fraction at once.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Reconnect storm',
+      symptom: 'A brief network blip becomes a long outage. The service is fine until everyone comes back at once.',
+      cause: 'Every disconnected client retried immediately, and on the same schedule, against a tier sized for steady state.',
+      mitigation: 'Randomised backoff on the client, plus a server-directed retry delay so the server retains control during the event. Reconnect capacity is a separate number from steady-state capacity.',
+    },
+    {
+      what: 'Connection exhaustion',
+      symptom: 'New connections are refused while CPU and memory look unremarkable.',
+      cause: 'File descriptor limits, ephemeral port ranges, or per-connection buffers were the real ceiling.',
+      mitigation: 'Measure the limit deliberately rather than discovering it. Connections are a capacity dimension with its own units.',
+    },
+    {
+      what: 'Silent half-open connection',
+      symptom: 'A client shows as connected and receives nothing. The server believes it delivered.',
+      cause: 'The path died without either endpoint being told. TCP does not notice an idle connection has failed.',
+      mitigation: 'Application-level heartbeats in both directions with a timeout, and treat a missed heartbeat as a disconnection rather than waiting for the operating system.',
+    },
+    {
+      what: 'Uneven connection load',
+      symptom: 'One gateway saturates while others idle, and the imbalance persists for hours.',
+      cause: 'Connections were balanced at establishment and never move. A gateway that came up after a deploy has fewer, and keeps fewer.',
+      mitigation: 'Balance on connection count rather than round-robin, and expire connections deliberately so the distribution can be corrected.',
+    },
+    {
+      what: 'An intermediary closes idle connections',
+      symptom: 'Connections drop after exactly 60 seconds of silence, only on some networks.',
+      cause: 'A proxy or NAT device between client and server reclaims idle state on a timer.',
+      mitigation: 'Periodic keepalive traffic below the shortest timeout you encounter. This is why heartbeats exist for two reasons rather than one.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Hold a persistent connection per user instead of polling"
+  options={[
+    'Poll on a timer: simple, stateless, costs requests',
+    'Long poll: immediate delivery over ordinary HTTP, still holds a request per client',
+    'Server-sent events: one-directional push, ordinary HTTP, automatic reconnection',
+    'WebSocket: bidirectional, low per-message overhead, a fully stateful tier',
+  ]}
+  why="When events are frequent enough that most polls would return something, or when delivery latency is the product, the wasted request volume and the latency floor of polling both stop being acceptable. Below that threshold, polling is genuinely the better engineering."
+  gain="Immediate delivery. Per-message overhead of a few bytes rather than a full request with headers and authentication. Request volume becomes proportional to events rather than to users times poll rate."
+  sacrifice="The connection tier becomes stateful. Deploys drop connections, delivery needs a registry, load balancing no longer balances work, and idle users consume capacity."
+  failureModes={[
+    'Reconnect storms after any network event or deploy',
+    'Connection exhaustion at limits nobody measured in advance',
+    'Half-open connections that appear healthy and deliver nothing',
+    'Connection imbalance that persists because connections do not move',
+  ]}
+  operationalBurden="High relative to polling. A new tier with its own scaling metric, a registry to keep correct, a deploy strategy that accounts for mass reconnection, and heartbeats that must be tuned against intermediaries you do not control."
+  cost="Memory and descriptors per idle connection, paid continuously. For many idle users and rare events this is strictly worse than polling, and the arithmetic is easy to do before committing."
+  whenNot="When events are rare relative to connected users — a notification a user receives twice a day does not justify holding their socket open all day. When the client is a mobile device, where a held connection costs battery and the platform push service does the job better. When one-directional push suffices, server-sent events cost far less than a WebSocket. And whenever the polling interval that satisfies the product is more than a few seconds, in which case polling is the simpler correct answer."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc6455">
+The WebSocket protocol establishes a full-duplex connection over a single TCP connection by
+upgrading from an HTTP request, so that either endpoint may send at any time with a small
+per-message framing overhead.
+</Claim>
+
+<Claim label="fact" source="rfc9110">
+HTTP is a stateless request-response protocol in which a server responds to requests it receives.
+There is no mechanism for a server to originate a message to a client that has not made a request.
+</Claim>
+
+<Claim label="fact" source="mdn-http">
+Server-sent events provide a one-directional stream from server to client over ordinary HTTP, with
+automatic reconnection and event identifiers for resuming, and are simpler to operate than a
+bidirectional connection where the client does not need to send.
+</Claim>
+
+<Claim label="convention" source="hpbn">
+Long-lived connections consume server resources whether or not data flows, so connection count
+becomes an independent capacity dimension alongside request rate and bandwidth.
+</Claim>
+
+<Claim label="convention" source="discord-eng">
+Published engineering writing on large real-time messaging systems describes a dedicated
+connection-handling tier separate from application logic, together with explicit handling of mass
+reconnection, as a primary architectural concern rather than a tuning detail.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you notice that pushing makes a tier stateful, and whether you reach for the mechanism proportionate to the requirement. Proposing WebSockets for a notification badge is a common over-reach."
+  depth="Know the three mechanisms and what each costs. Be able to say what breaks on deploy, and how a message finds the machine holding a user connection. Naming the reconnect storm before being asked is a strong signal."
+  followUps={[
+    'A user is connected to gateway 7. How does a message produced elsewhere reach them?',
+    'What happens to a million connections when you deploy?',
+    'When is polling the better answer, and how would you decide?',
+    'How do you know a connection is still alive?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Using WebSockets because the feature is described as real-time.',
+      why: '"Real-time" in a product conversation usually means "within a few seconds", which polling satisfies at a fraction of the operational cost. The word describes a feeling, not a latency budget.',
+      instead:
+        'Ask for the acceptable staleness in seconds and the event rate per user. Those two numbers decide it, and they usually decide it against the persistent connection.',
+    },
+    {
+      mistake: 'Treating the connection tier as stateless because the application behind it is.',
+      why: 'The connection is state, held on one specific machine. Deploys, autoscaling and load balancing all behave differently once that is true, and the design has to say how messages are routed.',
+      instead:
+        'Draw the registry that maps users to gateways, and say what happens to it during a deploy. If you cannot, the design is incomplete rather than simple.',
+    },
+    {
+      mistake: 'Assuming a connection is alive because it has not reported an error.',
+      why: 'A path can fail silently. TCP will not detect a dead idle connection for a very long time, and an intermediary may have discarded its state without telling either end.',
+      instead:
+        'Heartbeat in both directions with an explicit timeout, and treat missed heartbeats as disconnection. This also keeps intermediaries from reclaiming an idle connection.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['push-vs-pull']}
+  prompt="A notification feature must show a badge within about 30 seconds. There are 500,000 signed-in users, and an average user receives 3 notifications a day. What should you build?"
+  options={[
+    {
+      id: 'a',
+      text: 'Poll every 30 seconds',
+      implies: 'You compared the event rate against the connection cost.',
+      why: 'Three events per user per day against a 30-second tolerance means essentially every poll returns nothing — but the poll is cheap, entirely stateless, survives deploys invisibly, and needs no registry, no heartbeats and no reconnect strategy. About 16,000 requests per second of trivial work is a far smaller bill than 500,000 permanently held sockets.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'WebSocket connections for all signed-in users',
+      implies: 'You are optimising the delivery path for events that almost never happen.',
+      why: 'You would hold half a million sockets continuously to deliver about 1.5 million messages a day, and inherit a stateful tier, a routing registry, reconnect storms and deploy disruption. The connection cost is paid per user per day; the benefit is paid per event, and there are almost no events.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Long polling with a 30-second timeout',
+      implies: 'You are looking for immediate delivery without a new protocol.',
+      why: 'It works and delivers faster than the requirement asks for. But it holds an open request per user, which is nearly the same server-side cost as a WebSocket, while the requirement explicitly tolerates 30 seconds. You are paying the expensive half of the trade for a property nobody asked for.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the crossover rather than the answer: push wins when the event rate per connected user is high enough that most polls would return something, or when the latency requirement is below a couple of seconds. It also notes that on mobile the platform push service beats both, because it lets the device sleep — the connection is held by the operating system for all applications at once rather than by yours alone."
+/>
+
+<Check
+  concepts={['websocket']}
+  prompt="You run 20 gateways holding 1,000,000 WebSocket connections. You deploy a routine change with a rolling restart. What is the risk you must design for?"
+  options={[
+    {
+      id: 'a',
+      text: 'Messages in flight during the restart are lost',
+      implies: 'You are thinking about delivery guarantees, which is a real and separate concern.',
+      why: 'True and worth handling with acknowledgements and a replay buffer. But it is not what takes the service down: it affects a small number of messages, while the restart affects every connection on the machine.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Each restart drops 50,000 connections that reconnect immediately onto the gateways still running',
+      implies: 'You are reasoning about the reconnect burst and where it lands.',
+      why: 'The connections do not fail gently: they all reconnect at once, onto fewer machines, each doing an authentication and a registry write. The reconnect path is the highest-load path in the system and it runs during every deploy, so it must be sized for a burst rather than for steady state — jittered backoff, server-directed retry delays, and draining a gateway before stopping it.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The load balancer will not rebalance the remaining connections',
+      implies: 'You noticed that connections do not move once established.',
+      why: 'Correct, and it is why the imbalance after a deploy persists rather than settling. But it describes the aftermath. The acute risk is the simultaneous reconnection, which can prevent the tier from coming back at all.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates the two effects and treats them differently: the burst is an availability risk handled by draining, jitter and server-directed retry; the persistent imbalance is an efficiency problem handled by balancing on connection count and expiring connections deliberately. It also observes that the reconnect path is exercised on every deploy, which makes it one of the few disaster paths you can be confident is tested."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'The WebSocket protocol and its HTTP upgrade', sourceId: 'rfc6455' },
+    { label: 'Server-sent events, and when one direction is enough', sourceId: 'mdn-http' },
+    { label: 'Connection cost, keepalives and why connections are a capacity dimension', sourceId: 'hpbn' },
+    {
+      label: 'Real-time messaging tiers and mass reconnection',
+      sourceId: 'discord-eng',
+      note: 'Read for the shape of the problem rather than for specific numbers.',
+    },
+    { label: 'Next: what one machine can actually do', href: '/levels/1' },
+  ]}
+/>

@@ -1,0 +1,417 @@
+---
+id: losing-something-large
+title: Losing Something Large
+level: 5
+module: l5-losing-big
+order: 1
+summary: Multi-region protects against a rare failure and adds a common one. Most outages come from change, and change replicates to every region instantly.
+difficulty: advanced
+minutes: 27
+prerequisites: [stopping-the-spread, copies-and-what-they-cost]
+concepts: [multi-az, multi-region, active-active, active-passive, rpo, rto, disaster-recovery, backup, blast-radius, fault-domain, cell-architecture, chaos-testing]
+unlocks: [data-residency, control-plane-vs-data-plane]
+patterns: [cell-based-architecture]
+sources: [sre-book, aws-well-architected, gcp-arch, spanner]
+status: reviewed
+---
+
+## The problem
+
+An executive asks: &ldquo;are we multi-region?&rdquo;
+
+It sounds like a question about seriousness. It is actually four questions with different
+answers and very different costs:
+
+- Can we survive one machine failing? (Yes, trivially.)
+- Can we survive one data centre failing? (Usually yes, and cheaply.)
+- Can we survive an entire region failing? (Expensive, and it protects against something rare.)
+- Can we survive **ourselves** — a bad deploy, a bad migration, a mistaken deletion? (This is the
+  common case, and multi-region does not help at all.)
+
+The fourth is the one that actually happens, and it is the one the question never means.
+
+## Intuition
+
+Redundancy only works across **independent** failures. Two machines in one rack share a power
+supply and a top-of-rack switch, so they fail together. Two availability zones share a region's
+network fabric and control plane. Two regions share your deployment pipeline, your
+configuration, and your code.
+
+That last one matters more than it sounds:
+
+**A bad deploy replicates to every region in seconds.** So does a bad configuration change, a
+poisoned cache entry, a schema migration that corrupts data, and an accidental deletion. These
+are the most common causes of serious outages, and geographic redundancy is completely
+transparent to all of them.
+
+So the honest framing of multi-region is:
+
+- It protects against a **rare** class: an entire region becoming unavailable.
+- It provides no protection against the **common** class: change.
+- It **adds** failure modes: cross-region consistency, replication lag, split brain, and a
+  failover path that is exercised rarely and therefore usually broken.
+
+That does not make it wrong. It makes it a specific purchase, and the question is whether the
+budget would buy more availability spent on progressive rollout, fast rollback, and tested
+backups.
+
+## Concretely
+
+<Example title="Four failure scales, four different answers">
+
+| Failure | Protection | Cost |
+|---|---|---|
+| One instance | Run several behind a load balancer | Trivial |
+| One availability zone | Spread instances and replicas across zones in the region | Small; a few ms of latency and some cross-zone data transfer |
+| One region | A second region, warm or active, with data replicated | Roughly double infrastructure, plus cross-region consistency design |
+| A bad deploy or deletion | Progressive rollout, fast rollback, tested backups, retention | Engineering discipline; almost no infrastructure |
+
+The pattern almost everyone should follow: **exhaust multi-AZ and change safety before
+considering multi-region.** Multi-AZ is cheap and protects against a genuine and reasonably
+frequent failure. Change safety protects against the most common cause of outages. Multi-region
+is the expensive option that protects against the rarest one.
+
+<Claim label="recommendation">
+If your reliability budget is limited, spend it in this order: multi-AZ redundancy, progressive
+rollout with fast rollback, tested restores, then multi-region. The first three are cheaper and
+address more of the outage distribution.
+</Claim>
+
+</Example>
+
+## Formal explanation
+
+Two numbers define a disaster recovery plan, and both are business decisions:
+
+- **<C id="rpo" />** — how much data you accept losing, measured in time. Synchronous
+  replication gives zero; asynchronous gives whatever the lag was at the moment of failure.
+- **<C id="rto" />** — how long you accept being down, measured in time. Determined by
+  detection, decision, and the failover mechanism.
+
+Both must be stated before choosing an architecture, because they determine it. An RPO of zero
+across regions requires synchronous cross-region replication, which puts a cross-region round
+trip on every commit — a decision with a visible latency cost every day.
+
+Two multi-region shapes:
+
+**<C id="active-passive" />.** One region serves; another is warm. Simpler consistency — there
+is one writer — and the failover path is rarely exercised, so it is usually the part that fails.
+RTO is minutes to hours.
+
+**<C id="active-active" />.** Both regions serve. Best latency and utilisation, near-zero RTO,
+and now two regions accept writes concurrently, so conflict resolution is a product decision
+rather than a technical detail.
+
+<C id="cell-architecture">Cell-based architecture</C> is the underrated middle. Instead of two
+large regions, run many independent cells, each serving a subset of users, each a complete
+stack. A failure — including a bad deploy, if deployment is per-cell — affects one cell.
+
+<Callout kind="warn" title="Replication is not backup, and backup is not restore">
+Replication copies your DELETE faithfully to every region. Backups protect against logical
+corruption, which replication accelerates. And a backup you have never restored is a belief:
+you do not know how long it takes, whether it is complete, or whether the procedure works.
+</Callout>
+
+<Deeper title="Blast radius is the more useful frame">
+
+&ldquo;Multi-region?&rdquo; is a binary question about geography.
+&ldquo;<C id="blast-radius">What is our blast radius?</C>&rdquo; is a question about how much a
+single failure — of any kind — can take with it.
+
+Reframed that way, the useful moves are broader:
+
+- **Deploy progressively.** One cell, then one zone, then one region, with automated checks
+  between. Blast radius of a bad deploy becomes one cell rather than everything.
+- **Partition the fleet into cells.** Each cell serves a subset of users with its own full
+  stack. A poisoned cache, a hot tenant or a bad config affects one cell.
+- **Isolate the control plane from the data plane.** The data plane must keep serving when the
+  control plane is unavailable, because control planes are where configuration errors land.
+- **Shuffle-shard tenant assignment.** Assign each tenant to a random subset of cells so that no
+  two tenants share exactly the same set. One abusive tenant then degrades a small, overlapping
+  fraction rather than a fixed group.
+
+Every one of these reduces the size of a failure without requiring a second region, and each
+also helps against the change-related failures that multi-region does not touch.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Redundancy across failure domains, and where change bypasses all of it."
+  columns={[
+    { title: 'Change', nodes: [{ id: 'deploy', label: 'Deploy pipeline', note: 'reaches everything', tone: 'accent' }] },
+    { title: 'Routing', nodes: [{ id: 'dns', label: 'Global routing' }] },
+    { title: 'Region A', nodes: [{ id: 'az1', label: 'Zone 1' }, { id: 'az2', label: 'Zone 2' }] },
+    { title: 'Region B', nodes: [{ id: 'az3', label: 'Zone 3' }, { id: 'passive', label: 'Standby', tone: 'muted' }] },
+    { title: 'Elsewhere', nodes: [{ id: 'backup', label: 'Backups', note: 'not synchronised' }] },
+  ]}
+  edges={[
+    { from: 'deploy', to: 'az1', tone: 'danger' },
+    { from: 'deploy', to: 'az3', label: 'same bug, everywhere', tone: 'danger' },
+    { from: 'dns', to: 'az1' },
+    { from: 'dns', to: 'az3', dashed: true },
+    { from: 'az1', to: 'az2', label: 'sync replica' },
+    { from: 'az1', to: 'passive', label: 'async', dashed: true },
+    { from: 'az1', to: 'backup', label: 'periodic' },
+  ]}
+  stages={[
+    {
+      label: 'Multi-AZ',
+      show: ['dns', 'az1', 'az2', 'backup'],
+      because:
+        'Cheap, effective, and protects against the most common infrastructure failure. Zones are milliseconds apart, so synchronous replication costs almost nothing.',
+    },
+    {
+      label: 'Add a second region',
+      show: ['dns', 'az1', 'az2', 'az3', 'passive', 'backup'],
+      because:
+        'Survives losing a whole region. Costs roughly double infrastructure, asynchronous replication with a real RPO, and a failover path that is rarely exercised.',
+    },
+    {
+      label: 'The path that ignores all of it',
+      show: ['deploy', 'dns', 'az1', 'az2', 'az3', 'passive', 'backup'],
+      because:
+        'A bad deploy or configuration change reaches every region in seconds. Geographic redundancy provides no protection here, which is why progressive rollout is the higher-leverage investment.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Single zone',
+      behaviour: 'A zone failure is a total outage. Cheap and fine for many products.',
+      firstToBreak: 'Everything, when the zone has a problem.',
+    },
+    {
+      scale: 'Multi-AZ',
+      behaviour:
+        'Survives a zone failure with seconds of disruption. Synchronous replication is affordable at millisecond distances.',
+      firstToBreak: 'A regional control plane event, which affects all zones together.',
+    },
+    {
+      scale: 'Multi-region active-passive',
+      behaviour:
+        'Survives a region failure with an RTO of minutes to hours and a non-zero RPO.',
+      firstToBreak:
+        'The failover procedure, because it is rehearsed rarely and the standby has never taken real traffic.',
+    },
+    {
+      scale: 'Multi-region active-active',
+      behaviour:
+        'Near-zero RTO, local latency everywhere, and concurrent writes in two places.',
+      firstToBreak:
+        'Consistency. Conflicts are now a normal occurrence requiring a product decision, not an exception.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Failover path never exercised',
+      symptom:
+        'The region fails, failover is attempted, and it does not work: stale configuration, missing capacity, expired credentials, a dependency that only exists in the primary region.',
+      cause:
+        'The standby has never taken real traffic, so nothing has ever verified it can.',
+      mitigation:
+        'Fail over on a schedule, in production, during business hours. If that sounds too risky, that is the finding — the plan does not work and you have not discovered it yet.',
+    },
+    {
+      what: 'Bad deploy reaching every region',
+      symptom:
+        'A global outage minutes after a release. Every region affected identically.',
+      cause:
+        'The deployment pipeline is a shared failure domain that spans all geographic redundancy.',
+      mitigation:
+        'Progressive rollout with automated checks between stages, and per-cell or per-region deployment with a bake period. This is where most of the availability actually comes from.',
+    },
+    {
+      what: 'Cross-region write conflicts',
+      symptom:
+        'Data silently diverges. Users see different values depending on where they are routed.',
+      cause:
+        'Active-active accepts concurrent writes to the same data in two places, and the conflict resolution rule was never chosen deliberately.',
+      mitigation:
+        'Route writes for a given entity to one region, or use data types whose merge is defined, or accept and surface conflicts explicitly. Do not let last-write-wins be the accidental default.',
+    },
+    {
+      what: 'Untested backups',
+      symptom:
+        'A restore is needed and takes far longer than assumed, or the backup is incomplete, or the procedure references systems that no longer exist.',
+      cause:
+        'Backups were configured and never restored.',
+      mitigation:
+        'Restore on a schedule and time it. The measured restore duration is your real RTO for data loss scenarios, and it is usually much longer than the plan claims.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Stay single-region multi-AZ and invest the difference in change safety and cell isolation"
+  options={[
+    'Single region, multi-AZ',
+    'Multi-region active-passive',
+    'Multi-region active-active',
+    'Cell-based architecture within one or more regions',
+  ]}
+  why="Most outages come from change, not from infrastructure. Multi-region protects against the rarest failure class while adding consistency complexity and a failover path that is rarely exercised. Progressive rollout, fast rollback and cell isolation address the common class at a fraction of the cost."
+  gain="One consistency model, one place to debug, no cross-region replication lag or conflicts. The budget goes to deployment safety, blast radius reduction and tested restores, which cover more of the actual outage distribution."
+  sacrifice="A genuine regional outage is a genuine outage. If that is contractually or existentially unacceptable, this is not available to you."
+  failureModes={[
+    'A regional event takes you fully down while competitors stay up',
+    'A compliance requirement for geographic redundancy arrives later and forces a costly retrofit',
+    'Users far from your region experience permanently higher latency',
+  ]}
+  operationalBurden="Much lower. No cross-region consistency design, no failover rehearsals, no conflict resolution. One environment to reason about."
+  cost="Roughly half the infrastructure of a two-region deployment, and considerably less engineering time. Cross-region data transfer costs are avoided entirely."
+  whenNot="When a regional outage is contractually unacceptable, when regulation requires data or serving presence in specific jurisdictions, or when users are globally distributed and latency is a product requirement rather than a preference. In those cases multi-region is required, and the honest plan includes rehearsed failovers and an explicit conflict-resolution design."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="sre-book">
+Reliability practice emphasises that changes to production are a leading cause of incidents, and
+that progressive rollout with automated verification between stages is among the highest-leverage
+reliability investments available.
+</Claim>
+
+<Claim label="convention" source="aws-well-architected">
+Architecture review frameworks treat recovery objectives as design inputs: the RPO and RTO
+determine whether multi-AZ, warm standby or active-active is appropriate, and they emphasise
+regularly testing the recovery procedure rather than documenting it.
+</Claim>
+
+<Claim label="fact" source="spanner">
+Providing strongly consistent transactions across geographically distributed replicas requires
+bounded clock uncertainty and commit wait, which imposes latency proportional to that
+uncertainty on every commit. Global strong consistency has an inherent, ongoing cost.
+</Claim>
+
+<Claim label="recommendation" source="gcp-arch">
+Rehearse failover on a schedule rather than relying on documentation. A recovery procedure that
+has not been executed recently should be assumed not to work.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can justify geographic redundancy from a requirement rather than treating it as a mark of seriousness, and whether you know that change is the dominant outage cause."
+  depth="Know RPO and RTO and that both are business decisions. Know the difference between active-active and active-passive and what each costs. Naming the deploy pipeline as a shared failure domain is a strong signal."
+  followUps={[
+    'What is your RPO and RTO, and who decided them?',
+    'A bad config change goes out. Does multi-region help?',
+    'When did you last test the failover?',
+    'Users write in both regions to the same record. What happens?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We are multi-region, so we are highly available.',
+      why: 'It addresses one failure class. Deploys, configuration changes, data corruption and dependency failures all propagate across regions, and those account for most serious incidents.',
+      instead:
+        'State which failure class each investment covers. Multi-region covers regional loss; progressive rollout covers change; tested backups cover corruption. They are not substitutes.',
+    },
+    {
+      mistake: 'We have backups.',
+      why: 'Having backups and being able to restore are different claims. Untested restores commonly turn out to be incomplete, far slower than assumed, or dependent on a procedure that no longer works.',
+      instead:
+        'Restore on a schedule and record how long it took. That measured number is your real RTO for data loss.',
+    },
+    {
+      mistake: 'Active-active gives us zero downtime.',
+      why: 'It gives near-zero RTO for a regional failure and introduces concurrent writes to the same data in two places. Conflicts become normal, and if the resolution rule was not chosen deliberately, data is being silently discarded.',
+      instead:
+        'Say how writes are routed and how conflicts are resolved. If the answer is last-write-wins by timestamp, say what that costs, because it is silent data loss.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['multi-region', 'blast-radius']}
+  prompt="A configuration change disables a feature flag incorrectly and takes the product down globally. You run active-active in three regions. What did the redundancy buy you here?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing — configuration propagates to all regions, so the failure is global regardless',
+      implies: 'You recognise that geographic redundancy does not span the change pipeline.',
+      why: 'Regions are independent failure domains for infrastructure, and they share your deployment and configuration systems entirely. A bad change reaches all of them in seconds, which is why change safety is a separate and usually higher-leverage investment.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'It limits the impact because each region has its own configuration store',
+      implies: 'You are assuming per-region configuration isolation.',
+      why: 'Only true if configuration is deployed progressively per region with a bake period and automated checks between. Most deployments push configuration everywhere at once, precisely because it feels safer to be consistent.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Recovery is faster because you can fail over to an unaffected region',
+      implies: 'You are treating this as a regional failure.',
+      why: 'There is no unaffected region. Every region received the same configuration and every region is broken in the same way, so there is nowhere to fail over to.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer proposes the fix and prices it: deploy configuration the way you deploy code — one cell, then one zone, then one region, with automated checks and a bake period between stages. That is far cheaper than a third region and it addresses the failure class that actually caused this outage."
+/>
+
+<Check
+  concepts={['rpo', 'rto', 'disaster-recovery']}
+  prompt="Your plan says RPO 5 minutes and RTO 30 minutes. What must be true for those numbers to be real?"
+  options={[
+    {
+      id: 'a',
+      text: 'Replication is configured and backups run nightly',
+      implies: 'You are checking that the mechanisms exist.',
+      why: 'Nightly backups alone imply an RPO of up to 24 hours, not 5 minutes. And configuration existing says nothing about whether replication lag actually stays under 5 minutes during the peak load when failures cluster.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Replication lag stays under 5 minutes even at peak, and a rehearsed failover completes in under 30 minutes including detection and decision',
+      implies: 'You treat the numbers as measured properties rather than as configured intentions.',
+      why: 'RPO is bounded by actual lag at the moment of failure, which is largest under load. RTO includes detection time, the human decision to fail over, and the mechanism itself — and only a rehearsal tells you what that total actually is.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The team knows the runbook',
+      implies: 'You are relying on documentation and familiarity.',
+      why: 'Necessary and nowhere near sufficient. Runbooks reference systems that change, assume access that expires, and omit steps that were obvious to whoever wrote them. Only execution reveals that.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer notes that RTO usually underestimates detection and decision time, which are human and often the largest components. It also proposes monitoring replication lag against the RPO as a continuous check, so a breach is discovered on a Tuesday afternoon rather than during the incident."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Reliability practice and the role of change in outages', sourceId: 'sre-book' },
+    { label: 'Recovery objectives as design inputs', sourceId: 'aws-well-architected' },
+    { label: 'The inherent cost of global strong consistency', sourceId: 'spanner' },
+    {
+      label: 'Next: changing a system that cannot stop',
+      href: '/levels/6',
+    },
+  ]}
+/>

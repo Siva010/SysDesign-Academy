@@ -1,0 +1,451 @@
+---
+id: splitting-the-data
+title: Splitting the Data
+level: 3
+module: l3-partitioning
+order: 1
+summary: The partition key is the least reversible decision in the system. It fixes what is cheap, what is expensive, and what becomes impossible.
+difficulty: advanced
+minutes: 30
+prerequisites: [copies-and-what-they-cost, when-load-is-not-even]
+concepts: [sharding, partitioning, partition-key, cross-shard-query, consistent-hashing, virtual-nodes, resharding, rebalancing, secondary-index]
+unlocks: [distributed-transaction, cell-architecture]
+sources: [ddia, dynamo, bigtable, cockroach-docs, cassandra-docs]
+status: reviewed
+---
+
+## The problem
+
+The dataset no longer fits on one machine, or the write rate exceeds what one leader sustains.
+Replicas do not help — each applies every write. Vertical scaling has run out.
+
+So you split the data across machines, and everything you took for granted stops being free:
+
+- A join across two tables now spans two machines.
+- A transaction touching two rows may need a coordinator.
+- A query that does not include the partition key must ask every machine.
+- One popular tenant lands entirely on one machine.
+- Changing your mind about how you split is a migration measured in quarters.
+
+Sharding is the point at which a database stops being a thing you use and becomes a thing you
+design.
+
+## Intuition
+
+Partitioning is filing your records into separate cabinets, and the partition key is the label
+on the drawer.
+
+If you file customer records by customer ID, then &ldquo;fetch customer 4,721&rdquo; goes to
+exactly one cabinet. Fast. But &ldquo;list every customer in France&rdquo; means opening every
+cabinet, because country was not the label.
+
+If instead you file by country, the France question is trivial and any question about a
+specific customer means searching. And your largest country's drawer is now enormous while the
+smallest is nearly empty.
+
+Two facts follow, and they are the whole lesson:
+
+1. **The key decides which questions are cheap.** Everything else becomes a search across all
+   partitions — a scatter-gather — with the tail latency that implies.
+2. **The key decides how evenly load spreads.** A key correlated with popularity produces hot
+   partitions no amount of hardware fixes.
+
+Choose it from your access patterns, before you write the schema. Changing it later means
+rewriting the dataset while it is being used.
+
+## Concretely
+
+<Example title="One dataset, three keys, three different systems">
+
+A messaging application storing messages, needing: fetch a conversation's recent messages;
+fetch a user's unread count; search a user's message history.
+
+**Partition by message ID (random).** Writes spread perfectly. Every read is a scatter-gather
+across all partitions, because messages for one conversation are scattered. Unusable.
+
+**Partition by conversation ID.** A conversation's messages live together, so the dominant read
+is a single-partition range scan. A user's unread count spans their conversations, so that
+becomes a fanout across a bounded number of partitions. A very busy group chat is a hot
+partition.
+
+**Partition by user ID.** A user's data lives together, so unread counts and history search are
+single-partition. But a conversation involves several users, so a message must be written to
+each participant's partition — which means the same message is stored multiple times, and
+consistency between copies is now your problem.
+
+None is right in the abstract. The second is usually best for a chat product because reading a
+conversation dominates, and that is a statement about the product rather than about databases.
+
+</Example>
+
+## Formal explanation
+
+Two ways to map keys to partitions, with different properties:
+
+**Range partitioning.** Partitions own contiguous key ranges. Range scans within a partition
+are efficient, which is why time-series and ordered data often use it. The hazard is that
+sequential keys — timestamps, auto-increment IDs — send all writes to the newest partition, so
+you get one active writer and many idle ones.
+
+**Hash partitioning.** The key is hashed and the hash determines the partition. Distribution is
+even, and range scans are destroyed: adjacent keys land on different machines.
+
+<C id="consistent-hashing" /> addresses a different problem: what happens when the number of
+partitions changes. With naive modulo hashing, adding a node remaps nearly every key. With a
+hash ring, only about 1/N of keys move. <C id="virtual-nodes">Virtual nodes</C> — many small
+ring positions per physical node — smooth the distribution further and make rebalancing
+incremental.
+
+<Callout kind="warn" title="Consistent hashing is not a hot-key solution">
+It distributes *distinct* keys evenly and limits redistribution cost. A single popular key
+still lands on a single node. That is a different problem with different answers: replicate it,
+cache it near the reader, or split it.
+</Callout>
+
+Two things get harder immediately:
+
+**<C id="cross-shard-query">Cross-partition queries</C>.** A query without the partition key
+must ask every partition and merge the results. Cost scales with partition count, and latency
+becomes the slowest partition rather than the average — fanout amplification, arriving in your
+data layer.
+
+**<C id="secondary-index">Secondary indexes</C>.** Either local to each partition, which means
+every lookup is a scatter-gather; or global, which means the index is itself partitioned by a
+different key, and keeping it consistent with the data is a distributed write.
+
+<Deeper title="Choosing a key, in practice">
+
+Four criteria, in the order they matter:
+
+1. **Does the dominant read include it?** If your most frequent query cannot name the partition
+   key, that query becomes a scatter-gather, and its cost scales with partition count. This is
+   usually the deciding criterion.
+2. **Is it high-cardinality?** Country has 200 values. If you have 500 partitions, 300 are
+   empty and the largest country is a permanent hot spot.
+3. **Is access to it roughly even?** A key that correlates with popularity — tenant ID in a
+   product with one enormous customer — produces skew you cannot fix by adding nodes.
+4. **Does it avoid monotonic growth?** Timestamps and sequential IDs concentrate all writes on
+   the newest partition under range partitioning.
+
+The common resolution is a **composite key**: something high-cardinality to spread, plus
+something ordered to keep range queries local. For time-series, a hash of the entity plus a time
+bucket. For chat, conversation ID plus message timestamp.
+
+<Claim label="fact" source="cassandra-docs">
+Cassandra's primary key separates a partition key, which determines placement, from clustering
+columns, which determine ordering within the partition. This structure exists precisely to let
+one key spread data while another keeps related rows together and ordered.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="What the partition key makes cheap, and what it makes a scatter-gather."
+  columns={[
+    { title: 'Query', nodes: [{ id: 'q1', label: 'Has the key', tone: 'accent' }, { id: 'q2', label: 'Lacks the key' }] },
+    { title: 'Routing', nodes: [{ id: 'router', label: 'Router', note: 'hash or range' }] },
+    { title: 'Partitions', nodes: [{ id: 'p1', label: 'Partition 1' }, { id: 'p2', label: 'Partition 2' }, { id: 'p3', label: 'Partition 3' }] },
+    { title: 'Merge', nodes: [{ id: 'merge', label: 'Gather + merge', note: 'slowest wins' }] },
+  ]}
+  edges={[
+    { from: 'q1', to: 'router' },
+    { from: 'q2', to: 'router' },
+    { from: 'router', to: 'p1', label: 'one hop', tone: 'accent' },
+    { from: 'router', to: 'p2', label: 'scatter' },
+    { from: 'router', to: 'p3', label: 'scatter' },
+    { from: 'p2', to: 'merge' },
+    { from: 'p3', to: 'merge' },
+  ]}
+  stages={[
+    {
+      label: 'Query with the key',
+      show: ['q1', 'router', 'p1'],
+      because:
+        'The router computes the partition and asks one machine. Cost and latency are independent of how many partitions exist. This is the case you design for.',
+    },
+    {
+      label: 'Query without the key',
+      show: ['q1', 'q2', 'router', 'p1', 'p2', 'p3', 'merge'],
+      because:
+        'Every partition must be asked, and the answer waits for the slowest. Cost grows with partition count, so this query gets worse every time you scale.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '4 partitions',
+      behaviour:
+        'Scatter-gather queries touch 4 machines. Slow but survivable, so bad key choices are not yet obvious.',
+      firstToBreak: 'Nothing. This is where the wrong key gets locked in.',
+    },
+    {
+      scale: '50 partitions',
+      behaviour:
+        'Scatter-gather latency is now the p99 of 50 machines, which is far worse than the average of one.',
+      firstToBreak:
+        'Any query without the partition key, and any transaction spanning partitions.',
+    },
+    {
+      scale: '500 partitions',
+      behaviour:
+        'Each partition is provisioned for 1/500 of the load, so a hot key is a much larger multiple of what its node expects.',
+      firstToBreak: 'The hottest partition, and the operational cost of managing that many units.',
+    },
+    {
+      scale: 'Changing the key',
+      behaviour:
+        'The entire dataset must be rewritten under a new mapping, while it is serving traffic, with a plan for consistency during the transition.',
+      firstToBreak:
+        'Project timelines. This is why the key deserves more thought than the rest of the schema combined.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Hot partition from a skewed or monotonic key',
+      symptom:
+        'One partition consistently busier than the rest. Cluster average utilisation looks comfortable.',
+      cause:
+        'The key correlates with popularity, or it grows monotonically so all new writes land in one place.',
+      mitigation:
+        'Compose the key with something high-cardinality. Monitor per-partition maxima, never the cluster average.',
+    },
+    {
+      what: 'Scatter-gather becoming the dominant query',
+      symptom:
+        'Latency degrades as you add partitions — scaling out makes things slower.',
+      cause:
+        'The most common query does not include the partition key, so it asks every partition and waits for the slowest.',
+      mitigation:
+        'Maintain a secondary structure keyed for that access pattern, accepting the write cost, or reconsider the partition key.',
+    },
+    {
+      what: 'Cross-partition transaction requirements appearing late',
+      symptom:
+        'A new feature needs two rows in different partitions to change atomically, and there is no mechanism.',
+      cause:
+        'The partition boundary was drawn without considering which invariants must hold across it.',
+      mitigation:
+        'Identify the invariants first and place boundaries so they stay within a partition. Where genuinely impossible, use a saga with compensations and be explicit about the intermediate states.',
+    },
+    {
+      what: 'Rebalancing during peak load',
+      symptom:
+        'Adding a node to relieve pressure makes latency worse for hours.',
+      cause:
+        'Moving data consumes the same disk and network the queries need, exactly when there is none spare.',
+      mitigation:
+        'Rate-limit rebalancing, schedule it outside peak, and add capacity before it is urgent. Rebalancing is a slow remedy, not an emergency one.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Partition by tenant ID in a multi-tenant application"
+  options={[
+    'Partition by tenant ID: all of a tenant’s data together',
+    'Partition by a hash of the row ID: perfectly even, no locality',
+    'Composite: tenant ID plus a bucket, so large tenants spread across several partitions',
+  ]}
+  why="In a multi-tenant system almost every query is scoped to one tenant, so tenant ID appears in the dominant access pattern. It also gives natural isolation: a tenant's data is contiguous, which simplifies export, deletion and per-tenant backup."
+  gain="Nearly every query is single-partition. Cross-tenant queries are rare and can be handled offline. Per-tenant operations — export, delete, restore, migrate — become tractable, which matters more than people expect."
+  sacrifice="Tenant sizes are almost always heavily skewed. Your largest customer may exceed a single partition's capacity, and no rebalancing helps because one tenant cannot be split under this key."
+  failureModes={[
+    'A single large tenant saturating one partition',
+    'A tenant growing beyond one partition entirely, with no way to divide them',
+    'Cross-tenant analytics requiring a scatter-gather over every partition',
+  ]}
+  operationalBurden="Moderate. It needs per-tenant size and load monitoring, and a plan for the tenant that outgrows a partition — which will happen if the product succeeds."
+  cost="Uneven partition utilisation means provisioning for the largest partition rather than the average, so you pay for capacity that most partitions do not use."
+  whenNot="When tenant sizes vary by orders of magnitude and the largest are a substantial share of total load, a pure tenant key concentrates that share on one machine. There, a composite key — tenant plus bucket — spreads large tenants while keeping small ones local, at the cost of making single-tenant queries touch several partitions. Also avoid it when the dominant access pattern is genuinely cross-tenant, though that is rare enough to be worth double-checking."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dynamo">
+Dynamo uses consistent hashing with virtual nodes so that adding or removing a node moves only
+a fraction of keys, and so that load distributes more evenly than one ring position per node
+would allow.
+</Claim>
+
+<Claim label="fact" source="bigtable">
+Bigtable range-partitions data into tablets ordered by row key, splitting and merging them as
+they grow. Row key design therefore determines both locality and write distribution, and is
+the primary schema decision.
+</Claim>
+
+<Claim label="fact" source="cockroach-docs">
+CockroachDB partitions data into ranges replicated by Raft, and splits ranges automatically as
+they grow, presenting distributed SQL over the result. Cross-range transactions are supported
+and carry a coordination cost relative to single-range ones.
+</Claim>
+
+<Claim label="recommendation">
+Write the partition key decision down with its reasoning, and record which queries it makes
+expensive. That document is what a future team will need when a new access pattern arrives and
+someone asks why the obvious query is slow.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you choose a partition key from access patterns rather than from what is available, and whether you know what it costs. Candidates who say 'shard by user ID' without naming the queries that become expensive are guessing."
+  depth="Be able to name the dominant queries, choose a key that serves them, and state what becomes a scatter-gather. Recognising skew and monotonic-key problems is expected at senior level."
+  followUps={[
+    'What is your partition key, and which queries does it make expensive?',
+    'One tenant is 40% of your traffic. What happens?',
+    'How do you support a query that does not include the key?',
+    'You need to change the partition key. How?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will shard by user ID; it spreads evenly.',
+      why: 'It spreads distinct users evenly and says nothing about whether the important queries include user ID. If the dominant read is by conversation, or by product, or by time, this key makes it a scatter-gather across every partition.',
+      instead:
+        'Name the dominant query first, then choose the key that makes it single-partition. Then say which queries you have made expensive as a result.',
+    },
+    {
+      mistake: 'Sharding will make the queries faster.',
+      why: 'Sharding gives each machine less data. A query that scans still scans, now on many machines with a merge on top. If the query is slow for lack of an index, sharding multiplies the problem.',
+      instead:
+        'Shard when one machine cannot hold the data or sustain the write rate. Fix slow queries with indexes and access-pattern changes.',
+    },
+    {
+      mistake: 'We can change the partition key later if we need to.',
+      why: 'Changing it means rewriting the entire dataset under a new mapping, while serving traffic, with dual writes and a consistency plan for the transition. It is one of the largest projects a data team can take on.',
+      instead:
+        'Treat it as close to irreversible. Spend the time up front enumerating access patterns, including the ones the product roadmap implies.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['partition-key', 'cross-shard-query']}
+  prompt="An e-commerce system partitions orders by order ID (a random UUID). The dominant query is 'show me my recent orders'. What is the consequence?"
+  options={[
+    {
+      id: 'a',
+      text: 'It is fine: order IDs distribute evenly so load is balanced',
+      implies: 'You are evaluating the key on distribution alone.',
+      why: 'Distribution is excellent and that is the only criterion this key satisfies. The dominant query does not include the order ID, so finding one customer\'s orders means asking every partition and merging.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The dominant query becomes a scatter-gather across every partition, and it gets worse as you add partitions',
+      implies: 'You checked the key against the access pattern rather than against distribution.',
+      why: 'A customer\'s orders are scattered by construction, so the most common request in the system asks every machine and waits for the slowest. The cost scales with partition count, which means scaling out actively degrades your primary read path.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'You need a global secondary index on customer ID',
+      implies: 'You are proposing a fix rather than naming the problem.',
+      why: 'A reasonable remedy, and it has costs worth stating: the index is itself partitioned by a different key, so writes must update both, and keeping them consistent is a distributed write.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes a composite key — customer ID as the partition key, order date as the clustering column — so a customer's orders live together and are already in date order. It then notes what that costs: lookup by order ID alone now needs a secondary lookup, and a very large customer becomes a hot partition."
+/>
+
+<Check
+  concepts={['sharding', 'resharding', 'hot-partition']}
+  prompt="You partition an events table by hour. Ingest is 200,000 events per second across 720 partitions covering the last 30 days. Why is throughput no better than a single machine?"
+  options={[
+    {
+      id: 'a',
+      text: 'The partitions are too small',
+      implies: 'You are looking at partition sizing.',
+      why: 'Size is not the issue. The problem is which partition is receiving traffic, and how many of them are receiving any at all.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Every write has the current hour, so all 200,000 per second land on one partition while 719 are idle',
+      implies: 'You spotted that a monotonic key concentrates writes regardless of partition count.',
+      why: 'Time-based partitioning under an append workload gives you exactly one active partition at any moment. The other 719 hold history and receive nothing, so your write throughput is single-machine throughput with extra operational complexity.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The router is not distributing requests properly',
+      implies: 'You suspect the routing layer.',
+      why: 'The router is doing precisely what it was told. It routes by hour, and every current write has the same hour. The defect is in the key, not the mechanism.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer gives the fix and its cost: compose the key from a hash bucket plus the time window, so writes spread across N buckets per hour while time-range queries remain answerable by reading N partitions per window. It also names the tension — more buckets means better write distribution and more work per range query — and observes that this is the same trade as key splitting for hot keys, one layer up."
+/>
+
+<CompleteCheck
+  concepts={['partition-key', 'cross-shard-query', 'secondary-index', 'sharding']}
+  prompt="Orders are sharded by customer id, which makes every customer’s order history a single-shard read. Support needs to look up an order by its order number, which now requires asking every shard. What goes in the gap?"
+  pipeline={[
+    { label: 'Support UI', note: 'has an order number' },
+    { label: 'Lookup table', note: 'order number to customer', gap: true },
+    { label: 'Router', note: 'now knows the shard' },
+    { label: 'One shard', note: 'single-shard read' },
+    { label: 'Order', note: 'result' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'A small global index from order number to customer id, so the lookup becomes one indexed read plus one single-shard read.',
+      implies: 'You are adding a way to find the partition key rather than a way to search without it.',
+      why: 'Every access path either has the partition key or has to find it. This one is tiny — two identifiers per order — so it can live in one place, be cached aggressively, and is written once when the order is created and never updated. Two cheap reads replace a scatter-gather across every shard, and the sharding scheme is untouched.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Query all shards in parallel and return whichever one has the order.',
+      implies: 'You are accepting the fan-out and parallelising it.',
+      why: 'It works and it is what you do when there is no alternative. The cost is that every lookup does work on every shard, so support traffic scales with shard count rather than with support volume, and the tail latency is the slowest shard. For a rare query that would be acceptable; for the main tool a support team uses all day it is not.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Reshard on order number instead, so order lookups are single-shard.',
+      implies: 'You are optimising for the second access pattern.',
+      why: 'It moves the problem rather than removing it: customer order history then becomes the scatter-gather, and that is the far more frequent query. Choosing a partition key means choosing which access pattern is cheap, and you cannot make both cheap by choosing differently.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer notes what makes this index safe, because the same trick is dangerous elsewhere. It maps immutable identifiers, is written exactly once at order creation, and is never updated — so it cannot drift, and a stale entry is impossible by construction. A global secondary index over mutable fields is a different proposition entirely, because it must be kept consistent with data spread across every shard, which is a distributed write on every update."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Partitioning, rebalancing and secondary indexes', sourceId: 'ddia' },
+    { label: 'Consistent hashing and virtual nodes', sourceId: 'dynamo' },
+    { label: 'Range partitioning and row key design', sourceId: 'bigtable' },
+    {
+      label: 'Next: coordination, because partitions must now agree with each other',
+      href: '/levels/4',
+    },
+  ]}
+/>

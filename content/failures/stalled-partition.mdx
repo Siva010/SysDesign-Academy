@@ -1,0 +1,168 @@
+---
+id: stalled-partition
+title: One Partition, Hours Behind
+symptom: A small, fixed set of customers stops receiving updates for hours. Aggregate consumer lag looks healthy the whole time.
+category: coordination
+concepts: [partition-ordering, head-of-line-blocking, poison-message, dead-letter-queue, consumer-group, offset, log-based-messaging, hot-partition, queue-depth, backpressure, replay, rebalancing, alerting, percentiles]
+sources: [kafka-docs, kafka-paper, ddia, aws-builders-library]
+status: reviewed
+---
+
+## What you see
+
+**07:50** — Nothing. The order-projection consumer is processing 200,000 messages a second across
+64 partitions. Total lag on the dashboard: 40,000 messages, which is a fifth of a second of work.
+Green.
+
+**11:30** — A support ticket. A customer says their order status has not updated since before
+08:00. Support reproduces it and escalates.
+
+**11:45** — The on-call engineer checks the consumer. Total lag is 3.9 million messages. That
+sounds alarming until you divide: at 200,000 a second it is twenty seconds of backlog. Still
+green. They move on to other hypotheses.
+
+**12:10** — Somebody graphs lag **per partition**. Partition 17 holds 3,870,000 of the 3.9 million.
+The other 63 partitions are at zero.
+
+**12:20** — Partition 17 contains a message the consumer cannot deserialise. It has failed on that
+message, backed off, and retried, continuously, for four and a half hours.
+
+The affected customers are exactly those whose account id hashes to partition 17 — about 1.5% of
+the customer base, completely stopped, for most of a working morning, with every dashboard green
+and every alert silent.
+
+## The mechanism
+
+A log has **one position per partition**. A consumer cannot commit an offset past a message it has
+not handled without deciding to skip it. So a message that fails deterministically — a malformed
+payload, a reference to a row that does not exist, a code path with a bug — never succeeds, and
+nothing behind it in that partition is ever processed.
+
+This is head-of-line blocking, and it is not a defect in the log. It is the direct cost of the
+ordering guarantee: the reason messages for one account arrive in order is the same reason one of
+them can block the rest.
+
+Then the part that made this a four-hour incident rather than a four-minute one.
+
+<Claim label="inference">
+Aggregation hides this perfectly, and it does so at every scale. The mean lag over 64 partitions
+where 63 are zero is one sixty-fourth of the real number. The sum is a large figure that divides
+into a reassuring duration, because the division silently assumes the backlog is spread across all
+the consumers. Both of the two most natural ways to summarise per-partition lag produce a healthy
+answer while one partition is stopped completely.
+</Claim>
+
+There is a second cause with an identical signature, which is why the diagnosis has to be
+per-partition before it can be per-message:
+
+- **A hot key.** One account with several hundred times the volume of any other, hashing to one
+  partition. The consumer is not stuck; it is working as fast as it can on a partition holding a
+  disproportionate share of the traffic.
+- **A data-dependent cost.** One key whose messages trigger an expensive path — a large payload, a
+  fan-out, a query with a bad plan for that shape. Throughput on that partition is a fraction of
+  the others and falls further behind every minute.
+
+The symptom is the same: one partition behind, everything else current, aggregate metrics fine.
+The remedies are entirely different, so the first question after "which partition" is "is it
+stopped, or is it slow?" — and the retry rate for that partition answers it immediately.
+
+## Why the obvious fixes make it worse
+
+**Restarting the consumer group.** Every member stops, partitions are reassigned, and processing
+pauses across all 64 while the group rebalances. Then partition 17 is assigned to somebody and
+fails on the same message. Repeated restarts under load can also push the group into a rebalance
+loop, at which point nothing progresses anywhere.
+
+**Increasing the retry count or the timeout.** The consumer now spends longer on each doomed
+attempt. The loop lasts longer and the backlog grows further.
+
+**Adding consumers to the group.** A partition is assigned to at most one member, so a group can
+never usefully have more members than partitions — and even below that limit, extra members
+trigger a rebalance and do nothing whatsoever for partition 17.
+
+**Resetting the offset past the bad message.** This does work, and done in a hurry it silently
+discards whatever was skipped. If nobody captured the message first, that is data loss with no
+record, discovered later by the same customers.
+
+## What actually works
+
+1. **Find the partition.** Maximum lag per partition, not the mean and not the sum.
+2. **Decide stopped or slow.** A high retry rate with no offset movement is a poison message. A
+   moving offset with low throughput is a hot key or an expensive path.
+3. **For a poison message: capture it, then skip it.** Write the payload, the offset and the error
+   somewhere durable *before* advancing. The capture is the part people skip when the ticket is
+   three hours old.
+4. **Then reprocess for the affected customers**, from the captured offset forward, once the bug
+   is fixed. They are identifiable — they are the keys that hash to that partition — which is one
+   of the few conveniences this failure offers.
+
+For the hot-key variant, none of the above applies: the answer is to reduce the per-message cost,
+or to accept that ordering for that key is worth the lag, or to change the partition key — which
+is a migration rather than an incident action.
+
+## How to prevent it
+
+**Bounded attempts, then dead-letter, then advance.** Automatically. This is the mechanism that
+converts an indefinite stall into one skipped record and one alert, and it must exist before you
+need it.
+
+**Distinguish retryable from non-retryable failures rather than only counting attempts.** A
+malformed payload will never parse; retrying it five times with backoff wastes ninety seconds and
+achieves nothing. A downstream timeout usually succeeds on the second attempt. Classify by the
+error, and dead-letter deterministic failures immediately.
+
+**Give the dead-letter destination an owner, an alert, and a tested re-injection path.** A
+dead-letter queue nobody reads is a data-loss mechanism with paperwork, and it fails silently by
+design.
+
+**Alert on maximum partition lag, in seconds.** Both halves matter. *Maximum*, because any
+aggregate hides exactly this shape. *Seconds*, because "partition 17 is four hours behind" is an
+incident and "3.87 million messages" is arithmetic that nobody does correctly at 11:45.
+
+**Ask whether you need per-key ordering at all.** If the consumer is idempotent and order does not
+matter, a queue with per-message acknowledgement has no head-of-line blocking: the failed message
+returns to the queue and everything else proceeds. This failure mode is the price of ordering, and
+plenty of workloads are paying it without using it.
+
+## How to detect it early
+
+- **Maximum per-partition lag, in seconds, as a service level indicator with an objective.** This
+  single metric would have turned four and a half hours into four minutes.
+- **Alert on any partition whose lag exceeds a multiple of the median.** Skew is the signal, and
+  it appears long before the absolute number looks bad.
+- **Time since last successful commit, per partition.** A partition that has not committed in five
+  minutes is stalled whether or not its lag has grown enough to notice yet — this is the leading
+  indicator, and lag is the lagging one.
+- **Retry rate per partition**, which distinguishes stopped from slow without any investigation.
+
+## Related
+
+<Claim label="fact" source="kafka-docs">
+Within a consumer group each partition is consumed by at most one member, so the number of
+partitions bounds the effective parallelism of the group and adding members beyond that count
+cannot increase throughput.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Ordering is guaranteed within a partition and not across partitions, and a consumer tracks a
+single position per partition. Progress past an unprocessed message therefore requires deciding to
+skip it.
+</Claim>
+
+<Claim label="fact" source="kafka-paper">
+Consumers maintain their own offset rather than the broker tracking per-message acknowledgement,
+which is what allows replay and multiple independent consumers — and what makes the position a
+single value per partition rather than a set of outstanding messages.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Bounding retries and moving repeatedly failing items to a separate destination is established
+practice, because unbounded retry of a deterministically failing item consumes capacity
+indefinitely without ever succeeding.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Ordering guarantees in a partitioned log apply per partition, so the choice of partition key
+determines which events are ordered with respect to each other and, consequently, which events can
+block each other.
+</Claim>

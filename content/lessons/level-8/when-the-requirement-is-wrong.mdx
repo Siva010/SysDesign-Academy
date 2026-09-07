@@ -1,0 +1,437 @@
+---
+id: when-the-requirement-is-wrong
+title: When the Requirement Is Wrong
+level: 8
+module: l8-ambiguity
+order: 1
+summary: The hardest system design problems are not technical. They are requirements that are internally inconsistent, or that describe a solution rather than a need.
+difficulty: staff
+minutes: 24
+prerequisites: [the-primitives-underneath, requirement-clarification]
+concepts: [requirement-clarification, non-functional-requirements, functional-requirements, cost, maintainability, operational-burden, consistency-generic, staleness]
+unlocks: [strangler-migration, control-plane-vs-data-plane]
+sources: [fundamentals-arch, sre-book, martin-fowler]
+status: reviewed
+---
+
+## The problem
+
+Three requirements, each of which sounds reasonable and is not:
+
+**&ldquo;It must be real-time.&rdquo;** Real-time means different things to a trading system
+(microseconds), a chat application (a few hundred milliseconds) and a dashboard (a minute is
+fine). Built to the strictest reading, the dashboard costs a hundred times more than it needs to.
+
+**&ldquo;It must never lose data and must always be available.&rdquo;** These conflict during a
+partition. One of them has to give, and if nobody chooses, the system will choose — probably
+badly, and probably at 3am.
+
+**&ldquo;We need a real-time analytics dashboard using Kafka.&rdquo;** This is a solution wearing
+a requirement's clothes. Kafka is an answer; nobody has said what the question is.
+
+The engineering skill at this level is recognising that **the requirement is the problem**, and
+resolving it without either blindly complying or refusing.
+
+## Intuition
+
+Requirements arrive in three broken shapes, and each has a different repair.
+
+**Underspecified.** &ldquo;It should be fast.&rdquo; Missing a number. The repair is to propose
+one: &ldquo;I will assume p99 under 300 ms. If that is wrong, tell me now, because it changes the
+design.&rdquo; Proposing beats asking, because it gives the other person something concrete to
+disagree with.
+
+**Overspecified.** &ldquo;Use Kafka with exactly-once semantics and an outbox.&rdquo; A solution
+has been supplied instead of a need. The repair is to walk backwards: what problem does this
+solve? Sometimes the answer is good and you proceed. Sometimes there is no such problem and you
+have just saved a quarter.
+
+**Internally inconsistent.** &ldquo;Never lose data, always available, and strongly
+consistent.&rdquo; These cannot all hold during a partition. The repair is not to pick one
+silently. It is to **surface the conflict, quantify what each choice costs, and get a decision
+from whoever owns the trade.**
+
+The last is the one that distinguishes staff-level work. Junior engineers implement the
+requirement. Senior engineers notice it is impossible. Staff engineers get the right person to
+choose, with the consequences made legible.
+
+## Concretely
+
+<Example title="Turning a solution back into a need">
+
+**Stated:** &ldquo;We need real-time analytics on user behaviour, using a streaming platform.&rdquo;
+
+The questions that recover the requirement:
+
+| Question | Answer received | What it changes |
+|---|---|---|
+| Who looks at this, and when? | The growth team, each morning | &ldquo;Real-time&rdquo; means &ldquo;by 9am&rdquo; |
+| What decision does it inform? | Which experiments to keep running | A daily decision, not a live one |
+| What happens if it is an hour stale? | Nothing | Freshness requirement is hours, not seconds |
+| How much data? | 40 million events a day | Modest for a batch pipeline |
+
+The actual requirement: **a daily aggregate, available by 9am, over 40 million events.**
+
+That is a nightly batch job writing into an analytical store. It costs a fraction of a streaming
+platform, has far lower operational burden, and is easier to change when the growth team's
+questions change — which they will, monthly.
+
+**None of these questions were technical.** They were about who, when, and what decision depends
+on it. The technical answer fell out once the requirement was recovered.
+
+</Example>
+
+## Formal explanation
+
+A requirement is usable when it names three things: **what must be true, for whom, and what it
+costs when it is not.**
+
+The recurring failure is a requirement that specifies a mechanism. &ldquo;Use a queue&rdquo;
+constrains the solution without stating the need. Walking it back — *what happens if the work is
+done synchronously?* — usually recovers a real requirement about latency or about a dependency's
+availability, and occasionally reveals that there was none.
+
+Three conflicts appear often enough to name:
+
+**Consistency versus availability.** These cannot both hold during a partition. The resolution is
+almost never global: it is per operation, because most operations do not need the strong
+guarantee.
+
+**Freshness versus cost.** Every order of magnitude of freshness costs roughly an order of
+magnitude. The question is not "how fresh would you like it" — everyone says "as fresh as
+possible" — but "what breaks at one hour, one minute, one second?"
+
+**Flexibility versus performance.** A system that answers any question is slower at every
+question than one built for a specific access pattern. Requirements that ask for both are asking
+for a trade to be made silently.
+
+<Callout kind="warn" title="Surfacing a conflict is not refusing to build">
+The failure mode of this lesson is an engineer who uses "the requirements are inconsistent" as a
+reason not to proceed. That is worse than building the wrong thing. The move is: state the
+conflict, quantify the options, recommend one, and build it — under stated assumptions if no
+decision arrives.
+</Callout>
+
+<Deeper title="Getting a decision from someone who does not want to make one">
+
+The common failure is asking &ldquo;do you want consistency or availability?&rdquo; That is an
+engineering question posed to someone who does not have the vocabulary, and the answer will be
+&ldquo;both&rdquo;.
+
+Translate it into their terms, with consequences attached:
+
+> &ldquo;During a network problem between regions — which we should expect a few times a year —
+> we can either keep taking orders and risk selling the last item twice, or stop taking orders in
+> one region for a few minutes. Selling twice means a refund and an apology. Stopping means lost
+> sales for that window. Which is worse for us?&rdquo;
+
+Now it is a business question with two concrete outcomes, and the person who owns that trade can
+answer it.
+
+Three properties make this work:
+
+- **Both options are real**, and neither is presented as obviously correct.
+- **The consequences are concrete**: a refund, or lost sales — not "reduced consistency".
+- **The frequency is stated**, so the decision is proportionate.
+
+Write down the answer and who gave it. Not to assign blame later, but because this decision will
+be re-litigated in eight months by someone who was not there, and the reasoning is what saves that
+conversation.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The stated requirement, the recovered requirement, and the design each implies."
+  columns={[
+    { title: 'Stated', nodes: [{ id: 'stated', label: '"Real-time, with Kafka"', note: 'a solution' }] },
+    { title: 'Questions', nodes: [{ id: 'who', label: 'Who reads it?' }, { id: 'when', label: 'What decision?' }, { id: 'cost', label: 'Cost if stale?' }] },
+    { title: 'Recovered', nodes: [{ id: 'real', label: 'Daily by 9am', note: 'the actual need', tone: 'accent' }] },
+    { title: 'Design', nodes: [{ id: 'batch', label: 'Nightly batch' }, { id: 'stream', label: 'Streaming platform', tone: 'muted' }] },
+  ]}
+  edges={[
+    { from: 'stated', to: 'who' },
+    { from: 'who', to: 'when' },
+    { from: 'when', to: 'cost' },
+    { from: 'cost', to: 'real' },
+    { from: 'real', to: 'batch', tone: 'accent' },
+    { from: 'stated', to: 'stream', label: 'if taken literally', tone: 'danger' },
+  ]}
+  stages={[
+    {
+      label: 'Taking it literally',
+      show: ['stated', 'stream'],
+      because:
+        'The fastest path from a stated requirement to a design, and it builds a streaming platform to answer a question a nightly job would answer.',
+    },
+    {
+      label: 'Recovering the requirement',
+      show: ['stated', 'who', 'when', 'cost', 'real', 'batch', 'stream'],
+      because:
+        'Three non-technical questions turn a solution back into a need, and the need implies a far smaller system that is also easier to change.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One team, one stakeholder',
+      behaviour:
+        'You can ask directly and get an answer. Conflicts are resolved in a conversation.',
+      firstToBreak: 'Nothing. This is the easy case, and it is where good habits are formed.',
+    },
+    {
+      scale: 'Several teams',
+      behaviour:
+        'Requirements arrive second-hand, already translated once. The original need is harder to recover.',
+      firstToBreak:
+        'Fidelity. Each hand-off converts a need into a solution, and the solution loses the reasoning.',
+    },
+    {
+      scale: 'Across an organisation',
+      behaviour:
+        'Requirements conflict between teams, and no single person owns the trade-off.',
+      firstToBreak:
+        'Decision-making. The conflict is escalated, unresolved, and the implicit answer is whatever gets built first.',
+    },
+    {
+      scale: 'Regulated or contractual',
+      behaviour:
+        'Some requirements genuinely are non-negotiable, and the conflict must be resolved in the design rather than in the requirement.',
+      firstToBreak:
+        'The assumption that everything is negotiable. Some things are not, and the skill is telling which.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Building the stated solution rather than the need',
+      symptom:
+        'A large platform is delivered and used for one small report. It is expensive to run and nobody will decommission it.',
+      cause: 'The requirement named a mechanism and nobody asked what problem it solved.',
+      mitigation:
+        'Always walk a named technology back to a need. If no need can be articulated, say so before building.',
+    },
+    {
+      what: 'Silently resolving a conflict',
+      symptom:
+        'During an incident, the system behaves in a way that surprises the business — orders rejected, or data diverged.',
+      cause:
+        'An engineer chose between consistency and availability without telling anyone, so nobody knew what to expect.',
+      mitigation:
+        'Surface the conflict, get a decision from the owner, and write down the answer and the reasoning.',
+    },
+    {
+      what: 'Taking the strictest reading of a vague word',
+      symptom:
+        'A system built for sub-second freshness serves a daily report, at many times the necessary cost.',
+      cause: '"Real-time" was interpreted defensively rather than clarified.',
+      mitigation:
+        'Propose a specific number and invite disagreement. Being told you are wrong early is the goal.',
+    },
+    {
+      what: 'Using ambiguity as a reason not to build',
+      symptom:
+        'Weeks pass with no progress and a document listing open questions.',
+      cause: 'Blocking on clarification that was never going to arrive.',
+      mitigation:
+        'State the assumption, build under it, flag it prominently. A working system under a stated assumption generates the feedback that resolves the ambiguity.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Build under an explicitly stated assumption rather than waiting for the requirement to be resolved"
+  options={[
+    'Block until the requirement is clarified',
+    'Build the strictest interpretation, so any answer is satisfied',
+    'State an assumption, build under it, and flag it prominently',
+  ]}
+  why="Requirements are frequently unresolvable in the abstract, because the person who owns the decision cannot evaluate it without seeing something. A working system under a stated assumption produces the feedback that resolves the question."
+  gain="Progress. The assumption is visible, so it can be challenged by anyone who disagrees. Most assumptions turn out to be right, and the ones that do not are discovered while the change is still cheap."
+  sacrifice="Some rework when the assumption is wrong. The visibility of the assumption is doing all the work here — an unstated one is a liability rather than a trade."
+  failureModes={[
+    'The assumption is buried in a document nobody reads, so it is never challenged',
+    'It is stated once at the start and forgotten as the design grows around it',
+    'A wrong assumption on an expensive-to-reverse decision, such as a partition key',
+  ]}
+  operationalBurden="None technically. It requires the discipline to keep a visible list of assumptions and revisit it, which is a habit rather than a process."
+  cost="Occasional rework, weighed against the delivery time lost to blocking."
+  whenNot="When the decision is expensive to reverse and the assumption is genuinely uncertain — a partition key, a data model, a regulatory boundary — the cost of being wrong exceeds the cost of waiting. There, escalate properly and do not proceed on a guess. The discipline is knowing which decisions are which."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="fundamentals-arch">
+Architecture characteristics — the qualities a system must exhibit — are described as needing to
+be explicit, measurable and prioritised, because they conflict and an unprioritised list provides
+no guidance when a trade must be made.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Service level objectives are recommended as the mechanism for turning vague reliability
+expectations into a number that can be traded against delivery velocity, precisely because
+"as reliable as possible" is not actionable.
+</Claim>
+
+<Claim label="recommendation" source="martin-fowler">
+Recording architecture decisions with their context and consequences is standard practice, and
+its main value appears later, when someone who was not present asks why the system is the way it
+is.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can identify that a requirement is impossible or self-contradictory, and handle it without either blindly complying or stalling. Interviewers introduce conflicting requirements deliberately."
+  depth="Notice the conflict, name it precisely, quantify both options in business terms, recommend one, and proceed. Doing all five is a staff-level answer; doing the first two is a senior one."
+  followUps={[
+    'It must be strongly consistent and always available. How do you proceed?',
+    'The requirement says real-time. What do you do?',
+    'You are told to use Kafka. Is it the right choice here?',
+    'Nobody can tell you the expected traffic. Now what?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'The requirements say X, so I built X.',
+      why: 'If X was a solution rather than a need, you have built a system nobody can justify, and it will be maintained for years by people who do not know why it exists.',
+      instead:
+        'Walk every named technology back to the problem it solves. If the problem is real, proceed with confidence. If it is not, say so before building.',
+    },
+    {
+      mistake: 'These requirements conflict, so I cannot start.',
+      why: 'Blocking is not neutral: it has a cost, and the person you are waiting for often cannot decide without seeing something concrete.',
+      instead:
+        'Pick the interpretation you would defend, state it prominently, build under it, and make the assumption easy to challenge.',
+    },
+    {
+      mistake: 'I asked whether they wanted consistency or availability.',
+      why: 'That is an engineering question asked of someone who does not have the vocabulary. The answer will be "both", which is not their fault.',
+      instead:
+        'Translate into concrete outcomes with a frequency attached: "a few times a year we would either sell the last item twice, or stop taking orders for five minutes. Which is worse?"',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['requirement-clarification', 'non-functional-requirements']}
+  prompt="A stakeholder says: 'The dashboard must show real-time data and must never be unavailable.' What is the most useful first move?"
+  options={[
+    {
+      id: 'a',
+      text: 'Design for sub-second freshness with multi-region redundancy, satisfying both readings',
+      implies: 'You are taking the strictest interpretation to be safe.',
+      why: 'It satisfies the words and probably costs an order of magnitude more than the need. "Real-time" and "never unavailable" are almost always shorthand rather than specifications, and building to the literal reading is a common and expensive failure.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Ask what decision the dashboard informs and what happens if it is an hour stale or briefly unavailable',
+      implies: 'You are recovering the underlying need before designing to the stated words.',
+      why: 'Both questions convert a vague adjective into a number, and they do it in the stakeholder\'s own terms rather than in engineering ones. The answers frequently reveal that hourly freshness and a few minutes of downtime are entirely acceptable, which changes the design by an order of magnitude in cost.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Explain that real-time and always-available are not simultaneously achievable',
+      implies: 'You are surfacing a technical conflict.',
+      why: 'Partly right and premature. It is worth saying eventually, and leading with it sounds like an objection rather than a collaboration — and for a dashboard, the conflict may be entirely theoretical once you learn that an hour of staleness is fine.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes a specific target rather than only asking: 'I will assume refreshed every 15 minutes, with a few minutes of downtime acceptable during a deploy. If that is wrong, it changes the design substantially, so tell me now.' Proposing gives the stakeholder something concrete to disagree with, which is far more productive than an open question."
+/>
+
+<Check
+  concepts={['consistency-generic', 'cost']}
+  prompt="Your product owner insists the system must never show stale data anywhere, and also must stay available during regional outages. How do you handle it?"
+  options={[
+    {
+      id: 'a',
+      text: 'Explain CAP and let them choose',
+      implies: 'You are handing over a technical framework.',
+      why: 'CAP is not a decision-making tool for a non-engineer. Presenting a theorem asks them to do the translation into business consequences, which is your job and not theirs.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Identify which operations genuinely need the strong guarantee, and present the conflict only for those, in terms of concrete outcomes and their frequency',
+      implies: 'You narrowed the conflict before escalating it, and translated it into their terms.',
+      why: 'Most operations do not need strong consistency, so the conflict usually applies to one or two — checkout, balance, permissions. Narrowing it makes the decision small and specific: "for checkout, during a regional problem a few times a year, we either risk overselling or stop selling for five minutes." That is answerable.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Build for strong consistency, since correctness is the higher priority',
+      implies: 'You are resolving the conflict yourself in the conservative direction.',
+      why: 'It is a defensible instinct and it is still an unsurfaced decision. You have chosen to be unavailable during partitions on their behalf, and the first time it happens the business will be surprised by behaviour nobody agreed to.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer records the decision with its reasoning and the date, so that when the trade-off is questioned in a year — probably during an incident — the reasoning is available rather than reconstructed. It also notes that the answer can differ per operation, which is usually what makes an apparently impossible requirement satisfiable."
+/>
+
+<TransferCheck
+  concepts={['requirement-clarification', 'non-functional-requirements', 'consistency-generic', 'cost']}
+  system="A hospital group asks for a real-time bed availability dashboard, updated within one second, showing every bed across eleven sites. The stated reason is that ambulance crews need to know where to take patients. Bed state currently changes in each site’s own admissions system, which are four different products, two of them updated by overnight batch export."
+  prompt="The one-second requirement is the headline. What should you do with it?"
+  options={[
+    {
+      id: 'a',
+      text: 'Establish what a crew actually decides and how stale the data may be before the decision changes, because two of the sources cannot be fresher than overnight and that fact outranks any latency target.',
+      implies: 'You are checking whether the requirement is achievable against the sources before designing to it.',
+      why: 'A one-second dashboard over a source that updates once a night is not a hard requirement, it is an impossible one, and building the fast path over the nine sites that can support it produces a display where some numbers are seconds old and others are eighteen hours old, presented identically. That is worse than a slower dashboard that is honest about age, and dangerously so when someone is routing an ambulance. The real requirement is almost certainly "accurate enough to route a patient", which is a different specification.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Build the one-second path for the nine sites that can support it, and refresh the other two nightly.',
+      implies: 'You are delivering the requirement where it is achievable.',
+      why: 'Pragmatic, and it produces the specific failure this domain cannot tolerate: a dashboard where freshness varies by an order of magnitude with nothing on screen to say so. If you take this route, per-site age must be displayed as prominently as the number itself — and once you have said that out loud, the conversation about what freshness is actually needed happens anyway.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Push back on the requirement as unrealistic and propose a five-minute refresh instead.',
+      implies: 'You are negotiating the number down.',
+      why: 'It replaces someone else’s arbitrary number with yours. Five minutes may be far too slow for a crew fifteen minutes out, or far faster than anyone needs; without knowing the decision it supports there is no way to tell, and you have spent your credibility on a figure you cannot defend either.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer separates the requirement from the constraint and returns with both. The requirement is a decision — where does this ambulance go — and the constraint is that two source systems export nightly, which is an integration problem and possibly a procurement one rather than an engineering one. Presenting it that way lets the customer choose between paying to change the sources and accepting a slower promise, which is their decision to make. It also notes what to build meanwhile: freshness per site, displayed, so the dashboard never implies a currency it does not have."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Architecture characteristics: making qualities explicit and prioritised', sourceId: 'fundamentals-arch' },
+    { label: 'Turning vague reliability expectations into objectives', sourceId: 'sre-book' },
+    { label: 'Recording decisions with their context and consequences', sourceId: 'martin-fowler' },
+    {
+      label: 'Next: getting from the system you have to the system you need',
+      href: '/lessons/migrating-a-live-system',
+    },
+  ]}
+/>

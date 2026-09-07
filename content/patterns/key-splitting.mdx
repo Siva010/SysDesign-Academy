@@ -1,0 +1,150 @@
+---
+id: key-splitting
+title: Key Splitting
+problem: One key receives far more traffic than any single node can serve, and a key cannot be partitioned.
+category: scaling
+concepts: [key-splitting, hot-key, hot-partition, load-distribution, local-cache, consistent-hashing, eventual-consistency]
+relatedPatterns: [cache-aside, read-through-edge, fanout-on-write]
+alsoKnownAs: [write sharding, salting, counter sharding]
+seenIn: [Flash-sale inventory, view counters, rate limit buckets]
+sources: [ddia, dynamo, aws-builders-library]
+status: reviewed
+---
+
+## Problem
+
+One key is enormously popular: a viral post, a flash-sale item, a global counter.
+
+Partitioning does not help. Every request for that key hashes to the same partition, so one node
+receives all of it while the rest of the cluster idles. Adding nodes makes it slightly worse,
+because each node is provisioned for a smaller share of the key space while the hot key's load is
+unchanged.
+
+**A single key cannot be partitioned. That is what "key" means.**
+
+## Pattern
+
+Turn one key into K keys.
+
+For a **counter**: instead of `views:post42`, keep `views:post42:0` through `views:post42:9`.
+Each increment picks a shard at random, so writes distribute across ten keys and therefore across
+ten partitions. Reading the total means summing all ten.
+
+For **inventory**: split 1,000 units into ten buckets of 100. A purchase decrements a randomly
+chosen bucket; if that bucket is empty, try another. Contention divides by ten.
+
+The trade is explicit and always the same shape: **a cheap write becomes a K-way read.** Use it
+when writes are the bottleneck.
+
+For read-heavy hot keys, the better answer is usually replication rather than splitting — put a
+copy near every reader via an edge cache or an in-process cache — because that divides load by
+the number of readers rather than by an arbitrary K.
+
+## Architecture
+
+<Arch
+  caption="Writes spread across K sub-keys; reads aggregate them."
+  columns={[
+    { title: 'Writers', nodes: [{ id: 'w', label: 'Writers', note: 'pick a shard' }] },
+    { title: 'Sub-keys', nodes: [{ id: 'k0', label: 'key:0' }, { id: 'k1', label: 'key:1' }, { id: 'k2', label: 'key:…K' }] },
+    { title: 'Readers', nodes: [{ id: 'r', label: 'Reader', note: 'sums K values', tone: 'accent' }] },
+  ]}
+  edges={[
+    { from: 'w', to: 'k0' },
+    { from: 'w', to: 'k1' },
+    { from: 'w', to: 'k2' },
+    { from: 'k0', to: 'r' },
+    { from: 'k1', to: 'r' },
+    { from: 'k2', to: 'r' },
+  ]}
+/>
+
+## Advantages
+
+- **Write contention divides by K.** A hot row that serialised every write becomes K rows that do
+  not contend with each other.
+- **Load spreads across partitions**, so cluster capacity is actually used.
+- **It requires no new infrastructure** — only a key naming convention and an aggregation step.
+- **K is tunable.** Raise it if contention persists, lower it if reads become expensive.
+
+## Costs
+
+- **Reads become K lookups plus an aggregation.** For a counter read on every page view, that
+  can be worse than the problem you solved.
+- **Exactness is harder.** Reading K values that are changing means the sum is a snapshot of
+  values from slightly different moments.
+- **Bucket exhaustion for finite resources.** With split inventory, one bucket can be empty while
+  others have stock, so a purchase may fail while units remain.
+- **Operational complexity.** K becomes a tuning parameter that someone must own, and changing it
+  requires migrating existing values.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Read cost becomes the new bottleneck',
+      symptom: 'Write contention is solved and read latency has risen sharply.',
+      cause: 'Every read now performs K lookups, and K was chosen for the write side.',
+      mitigation: 'Maintain a periodically-updated aggregate that reads use, accepting slightly stale totals. Reserve the K-way read for when exactness matters.',
+    },
+    {
+      what: 'Uneven bucket depletion',
+      symptom: 'A flash sale reports sold out with stock remaining, or oversells because a retry found another bucket.',
+      cause: 'Random bucket selection depletes buckets unevenly, and fallback logic can double-decrement.',
+      mitigation: 'On empty, try other buckets in a defined order and rebalance periodically. Make the decrement idempotent so a retry cannot take twice.',
+    },
+    {
+      what: 'K too small',
+      symptom: 'Contention is reduced but still limits throughput.',
+      cause: 'K was chosen without measuring the required concurrency.',
+      mitigation: 'Size K from measured write concurrency, with headroom. It is a capacity decision, not a convention.',
+    },
+    {
+      what: 'Applied to a read-heavy key',
+      symptom: 'Complexity increased and hot-key load did not meaningfully improve.',
+      cause: 'Splitting distributes writes; a read-heavy key needs replication toward the readers.',
+      mitigation: 'Use edge or in-process caching for hot reads. Reserve splitting for hot writes.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- **Writes** to one key are the bottleneck, and they contend.
+- The value is an aggregate — a count, a sum, a pool — that can be reconstructed from parts.
+- Reads of the aggregate are much rarer than writes, or can tolerate a periodically-computed
+  total.
+
+## When NOT to use it
+
+- **For hot reads.** Replication is strictly better: an edge cache or a local in-process cache
+  divides load by the number of readers and needs no aggregation. Splitting a read-heavy key adds
+  work to the common path.
+- **When the value is not decomposable.** A single status field, a document, or a lock cannot be
+  split into parts that sum. Only aggregates decompose.
+- **When exactness is required at read time.** Summing K concurrently-changing values gives an
+  approximation. For an account balance, that is not acceptable, and the answer is a different
+  data model rather than more shards.
+- **When the hot key is transient and unpredictable.** If you cannot know in advance which key
+  will be hot, a static split of a specific key does nothing. Runtime hot-key detection with
+  promotion to a local cache adapts; a hard-coded split does not.
+
+## Example systems
+
+<Claim label="convention" source="ddia">
+Relieving hot spots by adding a random component to a key, and reading across the resulting
+sub-keys, is described as a standard technique, with the explicit note that it makes reads more
+expensive and is therefore only worthwhile for genuinely skewed keys.
+</Claim>
+
+<Claim label="fact" source="dynamo">
+Consistent hashing with virtual nodes distributes many distinct keys evenly and bounds
+redistribution when membership changes. It does not address a single key receiving
+disproportionate traffic, which remains a separate problem.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Measure the busiest partition rather than the cluster average. Aggregate utilisation hides skew
+almost perfectly, and a cluster at low average utilisation can contain a node at capacity.
+</Claim>

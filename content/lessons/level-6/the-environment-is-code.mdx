@@ -1,0 +1,436 @@
+---
+id: the-environment-is-code
+title: The Environment Is Code, Except What Must Not Be
+level: 6
+module: l6-change
+order: 2
+summary: A machine nobody can rebuild is one nobody can safely change. Declaring the environment fixes that, and creates one thing that must live elsewhere.
+difficulty: core
+minutes: 25
+prerequisites: [changing-a-running-system, adversaries-and-abuse]
+concepts: [operability, iac, encryption-at-rest, key-management]
+unlocks: [blue-green, canary, disaster-recovery, data-residency, chaos-testing]
+sources: [sre-book, sre-workbook, aws-well-architected, release-it, martin-fowler]
+status: reviewed
+---
+
+## The problem
+
+There is a server that has been running for four years. It works. Nobody deploys to it on a Friday.
+
+At some point someone installed a package to fix a problem. Someone else edited a configuration
+file during an incident and did not write it down. A kernel parameter was raised. A certificate was
+placed in a directory by hand. None of that is recorded anywhere, and the people involved have left.
+
+The team knows two things about it. It works, and it cannot be recreated. Which means:
+
+- The disaster recovery plan is fiction, because rebuilding it is not a procedure anyone possesses.
+- Nobody will upgrade it, because the risk of not being able to put it back is unbounded.
+- The staging environment does not resemble it, so testing there proves less than it appears to.
+
+It is not a technical debt item. It is a machine the organisation is afraid of, and fear is a poor
+foundation for a system that has to keep changing.
+
+## Intuition
+
+Two ways to get a server into the state you want.
+
+**Do things to it.** Log in, install, edit, restart. Fast, obvious, and the result exists only on
+that machine. The *record* of what you did is your memory, and it decays.
+
+**Describe what it should be and let something make it so.** Slower to start, and the description
+is a file: it can be read, reviewed, versioned, diffed, and applied again to a second machine.
+
+The difference is not automation. It is that in the second case **the description is the artefact
+and the machine is disposable**. You are no longer maintaining a server; you are maintaining a
+statement about servers, and a server is a thing you can throw away and regenerate.
+
+That reframing carries a second idea with it. If the environment is a file in a repository, then
+everything that must not be in a repository has to live somewhere else — and there is exactly one
+such category: **secrets**. Credentials, private keys, tokens. The whole discipline of secret and
+key management exists because of the gap that opens the moment everything else becomes code.
+
+## Concretely
+
+<Example title="The same recovery, two ways">
+
+A zone is lost. Four services need to run somewhere else.
+
+**Machines built by hand.** Somebody must remember what was installed, in what order, with what
+configuration, on each of them. The wiki page describing it was last edited two years ago and was
+never accurate. Recovery is a reconstruction from evidence, and it takes days.
+
+**Environment declared as code.** Point the same declaration at a different zone and apply it.
+Recovery time is the time to provision plus the time to restore data, and both are numbers you have
+measured, because you have run it.
+
+The second case brings its own failure modes, and they are worth being specific about because
+people expect it to be uniformly safer:
+
+- The tool holds **state** describing what it believes exists. Lose or corrupt that state and it
+  can no longer connect intentions to reality — and its next instinct may be to create duplicates
+  or delete things it no longer recognises.
+- A change that appears small — renaming a parameter, altering an identifier — can compute a plan
+  that **replaces** a resource rather than modifying it, and replacing a database means deleting a
+  database.
+- **Drift**: somebody logs in and edits by hand during an incident. The declaration is now false,
+  and the next apply either reverts their emergency fix or, worse, is planned against a world that
+  no longer matches.
+
+</Example>
+
+## Formal explanation
+
+<C id="iac" /> means the environment is defined by version-controlled declarations rather than by
+accumulated manual action. What that buys is not primarily speed:
+
+- **Reproducibility.** The same declaration produces the same environment, so staging can genuinely
+  resemble production, and recovery is an operation rather than an excavation.
+- **Review.** An infrastructure change becomes a diff that another person reads before it happens.
+- **History.** &ldquo;When did this change and who approved it&rdquo; has an answer.
+- **Disposability.** Servers stop being pets. A machine behaving oddly is replaced rather than
+  investigated, which removes an entire genre of long-running mystery.
+
+The costs are real and specific: the declarations are production code with weak testing tools; the
+tool's state becomes a critical asset needing backup and locking; and any manual change silently
+invalidates the model.
+
+<C id="operability" /> is the property that determines how much of your team's life the system
+consumes. It is not monitoring, and it is not automation — it is whether the system can be
+understood, changed and recovered by someone who did not build it, at three in the morning.
+
+Concretely it means: a new engineer can deploy safely on their first week; every alert has a
+documented action; recovery procedures are exercised rather than described; routine operations do
+not require a person; and the system's state can be inspected without attaching a debugger to
+production. It is designed in from the beginning and cannot be retrofitted cheaply, which is why it
+belongs in a design discussion rather than in a follow-up ticket
+(<Cite id="sre-book" />).
+
+Then the exception. Everything above says *put it in the repository*. Secrets are the category that
+must not go there, and the reason is worth stating precisely: **a repository is designed to
+distribute and to remember.** A secret committed and then removed is still in the history, on every
+clone, on every developer's laptop, in every backup and in the CI cache.
+
+So the declarations reference secrets rather than containing them: a pointer to a secret manager,
+resolved at deploy time by an identity that is authorised for it. What the repository holds is the
+*name* of the secret and the *policy* for who may read it, both of which are safe to review.
+
+<C id="encryption-at-rest" /> encrypts stored data so that the storage medium alone is not enough
+to read it. It is worth being exact about what it defends against, because it is routinely
+over-claimed:
+
+- **It protects against**: a stolen or discarded disk, a mis-provisioned volume attached to the
+  wrong machine, a backup file that ends up somewhere it should not, a cloud provider's staff with
+  physical access.
+- **It does not protect against**: a compromised application, a leaked credential, an SQL
+  injection, or an over-permissive query. All of those read *through* the decryption layer, exactly
+  as legitimate access does, and see plaintext.
+
+<C id="key-management" /> is what determines whether any of that is real. Once data is encrypted,
+the key is the asset, and four questions decide whether the control means anything:
+
+- **Where does the key live?** A key stored next to the data it protects has moved the problem
+  rather than solved it.
+- **Who can use it?** The value is in the access policy, not the algorithm. If every service can
+  call the decrypt operation, encryption at rest has become an expensive way to store plaintext.
+- **Can it be rotated?** Rotation must be possible without downtime and must be rehearsed, or the
+  first time you need it — after a suspected compromise — you will be doing it under the worst
+  conditions available.
+- **What happens if it is lost?** Losing the key destroys the data as surely as deleting it. Key
+  backup is a durability requirement disguised as a security control.
+
+<Callout kind="info" title="Encryption at rest as a data-lifecycle tool">
+There is a use for it beyond confidentiality that is easy to miss. If each subject's data is
+encrypted under its own key, then destroying that key renders their data permanently unreadable —
+which is a workable answer to an erasure obligation over storage that is expensive or impossible to
+rewrite, such as backups and immutable logs.
+
+That only works if the key hierarchy was designed for it from the beginning. Retrofitting per-subject
+keys onto data already encrypted with one key means re-encrypting everything, including every
+backup you still hold.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="Everything in the repository except the one thing that must never be."
+  columns={[
+    { title: 'Source', nodes: [{ id: 'repo', label: 'Repository', note: 'declarations, reviewed', tone: 'accent' }] },
+    { title: 'Pipeline', nodes: [{ id: 'ci', label: 'Pipeline', note: 'plan, review, apply' }] },
+    { title: 'Tool state', nodes: [{ id: 'state', label: 'State', note: 'backed up, locked' }] },
+    { title: 'Environment', nodes: [{ id: 'infra', label: 'Infrastructure' }, { id: 'app', label: 'Services' }] },
+    { title: 'Secrets', nodes: [{ id: 'kms', label: 'Key and secret manager', note: 'referenced, never stored', tone: 'accent' }] },
+    { title: 'Data', nodes: [{ id: 'db', label: 'Stores', note: 'encrypted at rest' }] },
+  ]}
+  edges={[
+    { from: 'repo', to: 'ci' },
+    { from: 'ci', to: 'state' },
+    { from: 'ci', to: 'infra' },
+    { from: 'infra', to: 'app' },
+    { from: 'app', to: 'kms', label: 'resolve by name' },
+    { from: 'kms', to: 'db', label: 'data key' },
+  ]}
+  stages={[
+    {
+      label: 'Built by hand',
+      show: ['infra', 'app', 'db'],
+      because:
+        'Machines configured by people over years. It works, and nobody can recreate it, so recovery is an excavation and upgrades are postponed indefinitely.',
+    },
+    {
+      label: 'Declared and applied',
+      show: ['repo', 'ci', 'state', 'infra', 'app', 'db'],
+      because:
+        'The environment becomes a reviewed, versioned artefact and machines become disposable. New failure modes arrive with it: the tool state is now critical, and a plan can replace a resource rather than modify it.',
+    },
+    {
+      label: 'Secrets by reference',
+      show: ['repo', 'ci', 'state', 'infra', 'app', 'kms', 'db'],
+      because:
+        'The declarations name secrets and the policy for reading them; the values are resolved at deploy time by an authorised identity. Encryption at rest then means something, because the access policy on the key is what actually limits who can read the data.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'A handful of machines',
+      behaviour: 'Manual setup works. Everyone knows what was done because they were there.',
+      firstToBreak: 'The first person to leave, and the first environment that must match another.',
+    },
+    {
+      scale: 'Several environments',
+      behaviour:
+        'Declarations pay for themselves immediately, because staging and production are the same file with different parameters.',
+      firstToBreak: 'Drift, the first time somebody fixes production by hand and does not backport it.',
+    },
+    {
+      scale: 'Many teams, shared platform',
+      behaviour:
+        'Infrastructure changes are reviewed like code. Modules and policy become a product with its own users.',
+      firstToBreak:
+        'The state, and the blast radius of a single apply. One workspace covering everything means one mistake affecting everything.',
+    },
+    {
+      scale: 'Regulated, multi-region',
+      behaviour:
+        'Key hierarchies, residency constraints and audit requirements are expressed in the declarations, which is also how they are evidenced.',
+      firstToBreak:
+        'Key rotation, if it was never exercised. It becomes urgent precisely when everything else is already going wrong.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Drift',
+      symptom: 'An apply reverts a fix somebody made by hand, or plans a change against a world that no longer exists.',
+      cause: 'Manual edits to a declared environment during an incident, never brought back into the declaration.',
+      mitigation: 'Detect drift on a schedule and alert on it. Allow emergency manual changes, and require the same-day follow-up that encodes them. Treat unexplained drift as an incident.',
+    },
+    {
+      what: 'A plan replaces instead of modifies',
+      symptom: 'A parameter change deletes and recreates a database, destroying its data.',
+      cause: 'The changed attribute forces replacement, and the plan was approved without reading which resources it would destroy.',
+      mitigation: 'Require the plan to be read, block applies that destroy stateful resources without an explicit override, and protect data stores against deletion at the provider level.',
+    },
+    {
+      what: 'Lost or corrupted tool state',
+      symptom: 'The tool proposes to create everything that already exists, or to destroy things it no longer recognises.',
+      cause: 'The state file was lost, or two applies ran concurrently without locking.',
+      mitigation: 'Store state remotely with versioning and locking, back it up, and never let two applies run at once.',
+    },
+    {
+      what: 'Secret committed to the repository',
+      symptom: 'A credential is found in source history, potentially years after it was added.',
+      cause: 'A value was placed in a declaration for expediency, and removing it later did not remove it from history.',
+      mitigation: 'Scan commits automatically and block on detection. Treat any committed secret as compromised and rotate it — removing it from history is cleanup, not remediation.',
+    },
+    {
+      what: 'Encryption at rest that protects nothing',
+      symptom: 'A compromised application reads every record in plaintext, and the incident review notes the data was encrypted.',
+      cause: 'Every service could invoke the decrypt operation, so the encryption boundary contained the entire system.',
+      mitigation: 'Scope key access narrowly and audit its use. The access policy is the control; the cipher is not.',
+    },
+    {
+      what: 'Key rotation never rehearsed',
+      symptom: 'A key must be rotated after a suspected compromise and nobody knows whether the system survives it.',
+      cause: 'Rotation was designed and never executed, so it is untested code on the day it matters most.',
+      mitigation: 'Rotate on a schedule, in production, as routine. A rotation path exercised quarterly is a procedure; one exercised never is a plan.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Declare the environment as versioned code rather than configuring it directly"
+  options={[
+    'Manual configuration, documented in a wiki',
+    'Scripts that perform the setup steps',
+    'Declarative definitions applied by a tool that reconciles to the desired state',
+    'Immutable images rebuilt and redeployed for every change',
+  ]}
+  why="A system that cannot be rebuilt cannot be safely changed, and a system nobody dares change decays. Reproducibility is what makes recovery a procedure instead of an archaeology project, and it is also what makes staging meaningful."
+  gain="Environments are reproducible and comparable. Infrastructure changes are reviewed and have history. Recovery becomes an operation with a measured duration. Machines become disposable, which eliminates a whole class of long-running mystery."
+  sacrifice="The declarations are production code with poor testing tools. The tool state becomes a critical asset. Simple changes become slower, and there is a real learning curve before the team is faster than it was."
+  failureModes={[
+    'A plan that replaces a stateful resource rather than modifying it',
+    'Drift from manual changes, silently invalidating the model',
+    'Lost or concurrently written state, after which the tool cannot reconcile anything',
+    'Blast radius, when one workspace covers everything and one apply can touch all of it',
+  ]}
+  operationalBurden="Moderate, and it shifts rather than shrinks. Less time rebuilding machines and remembering what was done; more time maintaining modules, reviewing plans and managing state. The net is strongly positive above a few machines and negative below it."
+  cost="Mostly engineering time up front. The saving arrives during incidents and audits, which makes it easy to under-value while nothing is wrong."
+  whenNot="For a single machine that will never be replicated and whose loss is acceptable, the tooling costs more than it returns. For a genuine emergency, a manual change is the right action — the discipline is to encode it the same day rather than to forbid it. And do not use these tools to manage data: they reconcile toward a declared state, and applying that model to a database means a plan can decide the way to reach the desired state is to delete what is there."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="sre-book">
+Operational work that scales linearly with system size is identified as toil, and reducing it
+through automation is treated as engineering work with a measurable return rather than as
+housekeeping.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Recovery procedures should be exercised rather than documented, on the grounds that an untested
+procedure is a hypothesis and is first executed under the worst possible conditions.
+</Claim>
+
+<Claim label="recommendation" source="aws-well-architected">
+Infrastructure should be defined as code and changes made through that definition, and encryption
+keys should be managed with scoped access policies and audited use, on the grounds that the access
+policy rather than the algorithm determines what the control actually prevents.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+Infrastructure as code is described as applying software engineering practices — version control,
+testing, review, continuous integration — to infrastructure definitions, with reproducibility as
+the primary benefit rather than speed.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Systems should be designed for the people who operate them, with the ability to inspect state,
+change behaviour without a deploy, and recover without heroics treated as design requirements.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you think about operating the system as well as building it. Candidates who can say how their design is deployed, recovered and rotated are describing something real; the rest are describing a diagram."
+  depth="Know why secrets are the exception to configuration as code. Be able to say what encryption at rest defends against and what it does not. Know that key loss is data loss."
+  followUps={[
+    'Your primary region is gone. What do you actually run to recover?',
+    'Where do the database credentials come from at deploy time?',
+    'You encrypt at rest. Which attack does that stop?',
+    'How do you rotate a key, and when did you last do it?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Saying the data is encrypted at rest as though that settles the question.',
+      why: 'It defends against physical and provisioning threats. An attacker who has your application credentials reads plaintext through the decryption layer, which is the far more common path.',
+      instead:
+        'State which threat each control addresses. Encryption at rest covers stolen media and misplaced backups; application compromise is covered by least privilege, scoped key access, isolation and audit.',
+    },
+    {
+      mistake: 'Managing databases with the same declarative tool as the rest of the infrastructure.',
+      why: 'These tools reconcile toward a declared state, and a plan can legitimately decide that the way to reach the desired state is to destroy and recreate. For stateless resources that is a feature; for a database it is the incident.',
+      instead:
+        'Declare the database as a protected resource with deletion prevention, keep schema changes in a migration tool designed for them, and require an explicit override for any plan that destroys stateful resources.',
+    },
+    {
+      mistake: 'Treating operability as something to add after launch.',
+      why: 'The ability to inspect state, change behaviour without a deploy, and recover without heroics comes from structural choices. Retrofitting them means changing the structure, which is the expensive kind of change.',
+      instead:
+        'Include the operational path in the design: how it is deployed, how it is observed, how it is recovered, and what a new engineer must know. If those have no answers, the design is unfinished.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['key-management', 'encryption-at-rest']}
+  prompt="An attacker obtains valid application credentials and reads every customer record. The data was encrypted at rest with a managed key. What went wrong?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing about the encryption — it never addressed this threat. The application is authorised to decrypt, so a compromised application reads plaintext.',
+      implies: 'You are matching the control to the threat it covers.',
+      why: 'Encryption at rest defends against someone obtaining the storage: a stolen disk, a misplaced backup, a volume attached to the wrong machine. An attacker using the application own credentials goes through the decryption layer exactly as legitimate traffic does. The control worked as designed and this was never in its scope.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The key should have been rotated more frequently',
+      implies: 'You are reaching for key hygiene.',
+      why: 'Rotation limits the value of a stolen key and is worth doing. It has no effect here, because the attacker never had the key — they had an identity permitted to use it, and rotation does not change who is permitted.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'The data should have been encrypted at the application layer instead',
+      implies: 'You are moving the encryption boundary inward.',
+      why: 'A genuine and stronger design for the most sensitive fields: encrypt under a key the application server cannot use unaided, so a compromise yields ciphertext. It costs searchability, indexing and considerable complexity, so it is applied to specific fields rather than everywhere — which makes it a real option here rather than the general answer.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names what would actually have limited the damage: scoped key access so one service cannot decrypt every subject's data, per-subject data keys so a compromise is bounded, rate limits and anomaly detection on decrypt operations, and audit logging on key use so the bulk read is visible while it is happening. The lesson generalises — the access policy is the control, and the cipher is the least interesting part of it."
+/>
+
+<Check
+  concepts={['iac']}
+  prompt="Someone fixes production by hand during an incident. The fix works. What should happen next?"
+  options={[
+    {
+      id: 'a',
+      text: 'Encode the change in the declaration the same day, so the next apply does not revert it',
+      implies: 'You accept manual action in an emergency and close the loop afterwards.',
+      why: 'A manual fix during an incident is correct — arguing about process while users are affected is worse. The danger begins afterwards: the declaration is now false, so the next apply either reverts the fix or is planned against a world it does not match. Encoding it the same day, while the reason is still remembered, is what keeps the model true.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Revert the manual change and apply the fix properly through the pipeline',
+      implies: 'You are prioritising process consistency.',
+      why: 'Reverting a working fix in order to reapply it through a pipeline reintroduces the outage for the duration, which is a poor trade during an incident. Do it in the calm afterwards if the pipeline path differs materially — and often it does not.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Nothing. It works, and the declaration can be updated when someone next touches that area.',
+      implies: 'You are deferring the reconciliation.',
+      why: 'This is how drift accumulates. In three months nobody remembers the change or why it was needed, and it is silently reverted by an unrelated apply — producing an outage whose cause is a fix somebody made for a different outage. Undocumented drift converts one incident into two, separated by enough time that nobody connects them.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer adds the detection that makes the policy enforceable: run drift detection on a schedule and alert on unexplained differences, so the gap between the declaration and reality is visible rather than discovered by an apply. It also notes that frequent emergency edits in one area are a signal about that area — either the declaration is missing something people repeatedly need, or the pipeline is too slow to use under pressure, and both are fixable."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Toil, automation, and what operational work should cost', sourceId: 'sre-book' },
+    { label: 'Exercising recovery rather than documenting it', sourceId: 'sre-workbook' },
+    { label: 'Key management, scoped access, and audited use', sourceId: 'aws-well-architected' },
+    { label: 'Infrastructure as code and reproducibility', sourceId: 'martin-fowler' },
+    { label: 'Next: is the better architecture worth what it costs to run?', href: '/lessons/what-it-costs' },
+  ]}
+/>

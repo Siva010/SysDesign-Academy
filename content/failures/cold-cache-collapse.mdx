@@ -1,0 +1,128 @@
+---
+id: cold-cache-collapse
+title: The Cold Cache Collapse
+symptom: The cache restarts, and the database — which had been fine for months — falls over within seconds.
+category: overload
+concepts: [cache-stampede, hit-rate, request-coalescing, thundering-herd, load-shedding, cache-generic, capacity-headroom, ttl]
+sources: [aws-builders-library, redis-docs, rfc9111]
+status: reviewed
+---
+
+## What you see
+
+**09:41** — A routine cache cluster upgrade begins. Nodes restart one at a time, as designed.
+
+**09:41:20** — Database CPU goes from 30% to 100%. Query latency goes from 3 ms to 8 seconds.
+
+**09:41:45** — The application starts timing out. Error rate reaches 100%.
+
+**09:43** — Someone rolls back the cache upgrade. The cache is running again, and empty. Nothing
+improves, because the database is too saturated to serve the misses that would refill it.
+
+**10:12** — Traffic is blocked at the edge. The database recovers. Traffic is restored at 10%,
+then 25%, then fully. The cache refills. Total outage: 31 minutes, from a planned maintenance
+operation that had been performed successfully many times before.
+
+## The mechanism
+
+The arithmetic that nobody had written down:
+
+- Peak read traffic: **180,000 requests per second.**
+- Cache hit rate: **97%.**
+- Database load in normal operation: 180,000 × 0.03 = **5,400 queries per second.**
+- Database capacity at acceptable latency: roughly **8,000 queries per second.**
+
+Comfortable. The database ran at two-thirds of its capacity for months.
+
+With an empty cache, every request is a miss:
+
+- Database load: **180,000 queries per second.**
+- That is **22 times** its capacity.
+
+A database at 22 times capacity does not degrade gracefully. It saturates, queues, and stops
+being useful within seconds.
+
+<Callout kind="warn" title="The number worth writing on every design document">
+**Cold-cache overload factor = peak request rate ÷ origin capacity.**
+
+If it exceeds 1, a cache restart is an outage. Cache reliability does not change this; it only
+changes how often you find out.
+</Callout>
+
+The second mechanism is that recovery is not automatic. Refilling the cache requires the database
+to serve misses. A saturated database serves almost nothing, so the cache stays empty, so the
+database stays saturated. Without intervention this state is stable.
+
+## Why the obvious fixes make it worse
+
+**Rolling back the cache upgrade.** The cache was never the problem. Rolling back produces
+another empty cache.
+
+**Restarting the database.** It comes back with a cold page cache as well, so it is now slower
+than before while receiving the same 22x load.
+
+**Adding database replicas.** They take minutes to provision and replicate, and they arrive after
+the incident. During it, adding replicas adds load to a primary that is already saturated.
+
+## What actually works
+
+**Reduce load until the origin can serve, then let the cache refill.**
+
+1. Shed aggressively at the edge — accept perhaps 10% of traffic.
+2. That 10% produces misses the database can serve, and those misses populate the cache.
+3. As the hit rate climbs, database load falls, so admission can be increased.
+4. Repeat until fully open.
+
+The counter-intuitive part: **you recover by serving less**, because serving less is what allows
+the cache to refill, which is what allows you to serve more.
+
+## How to prevent it
+
+**Request coalescing.** When many concurrent requests miss the same key, one goes to the origin
+and the others wait for its result. This does nothing for a fully cold cache, where every key is
+different, but it is essential for the single-hot-key expiry case.
+
+**Load shedding at the entry point.** If the origin can serve 8,000 per second, admit
+approximately that many and reject the rest quickly. The system stays partially available instead
+of entirely unavailable — and it recovers on its own.
+
+**Cache persistence.** A cache that reloads its contents from disk on restart is not cold. This
+turns a planned restart from a risk into a non-event.
+
+<Claim label="fact" source="redis-docs">
+Redis offers optional persistence, which changes what a restart means for cached contents.
+Whether a restart produces a cold cache is a configuration decision rather than an inherent
+property.
+</Claim>
+
+**Staggered TTLs.** Add jitter so keys populated together do not expire together. Without it,
+a bulk warm produces synchronised expiry waves later.
+
+**Stale-while-revalidate.** Serve the expired value while refreshing in the background, so expiry
+never produces a miss storm.
+
+<Claim label="fact" source="rfc9111">
+HTTP defines stale-while-revalidate, allowing a cache to serve a stale response while refreshing
+it, which is a standards-level answer to expiry stampedes for cacheable content.
+</Claim>
+
+**Rehearse it.** Flush the cache deliberately, in production, during business hours, at a
+fraction of peak. If that is too frightening to contemplate, you have learned the finding without
+running the test.
+
+## How to detect it early
+
+- **Track the cold-cache overload factor** as a monitored quantity, not a one-time calculation.
+  It changes as traffic grows and as the origin is resized.
+- **Alert on hit rate**, not only on cache latency. A hit rate drifting from 97% to 93% doubles
+  origin load and is invisible in latency graphs until it is not.
+- **Load test with a cold cache.** Almost all load tests run warm, which measures a state you are
+  not worried about.
+
+## Related
+
+<Claim label="recommendation" source="aws-builders-library">
+Design for the cache being empty. A system whose origin cannot survive its full request rate has
+an outage waiting for the next restart, deploy or eviction event, independent of the cache
+tier's own reliability.
+</Claim>

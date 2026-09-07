@@ -1,0 +1,157 @@
+---
+id: saga
+title: Saga
+problem: A business operation spans several services, each with its own database, and there is no transaction that covers all of them.
+category: data
+concepts: [saga, distributed-transaction, two-phase-commit, atomicity, idempotency, eventual-consistency, dead-letter-queue, outbox]
+relatedPatterns: [transactional-outbox, idempotency-key]
+alsoKnownAs: [compensating transactions, long-running transaction]
+seenIn: [Order fulfilment, travel booking, provisioning workflows]
+sources: [ddia, martin-fowler, building-microservices]
+status: reviewed
+---
+
+## Problem
+
+Placing an order requires: reserve inventory, charge the card, create a shipment. Three services,
+three databases.
+
+You need all three or none. A charge with no shipment is a refund and a complaint; a shipment
+with no charge is lost money.
+
+A distributed transaction across all three would work and is expensive: participants hold locks
+for the duration, the coordinator becomes a critical dependency, and availability becomes the
+product of every participant's. That cost is rarely justified for a business workflow that
+takes seconds and involves a third party you do not control.
+
+## Pattern
+
+Give up atomicity. Replace it with a sequence of local transactions, each with a defined
+**compensating action** that undoes it.
+
+    Reserve inventory   →  compensate: release reservation
+    Charge card         →  compensate: refund
+    Create shipment     →  compensate: cancel shipment
+
+If step three fails, run the compensations for steps two and one, in reverse order.
+
+Two ways to drive it:
+
+- **Choreography.** Each service listens for the previous step's event and emits its own. No
+  central coordinator, and no single place that describes the workflow — which becomes hard to
+  reason about beyond three or four steps.
+- **Orchestration.** A coordinator explicitly calls each step and handles failures. One place to
+  read the workflow, and one more component to operate.
+
+Every step and every compensation must be idempotent, because retries are guaranteed.
+
+## Architecture
+
+<Arch
+  caption="Local transactions forward, compensations backward."
+  columns={[
+    { title: 'Driver', nodes: [{ id: 'orch', label: 'Orchestrator', note: 'or events', tone: 'accent' }] },
+    { title: 'Steps', nodes: [{ id: 's1', label: 'Reserve stock' }, { id: 's2', label: 'Charge card' }, { id: 's3', label: 'Create shipment' }] },
+    { title: 'On failure', nodes: [{ id: 'comp', label: 'Compensations', note: 'reverse order' }, { id: 'dlq', label: 'Manual review' }] },
+  ]}
+  edges={[
+    { from: 'orch', to: 's1' },
+    { from: 'orch', to: 's2' },
+    { from: 'orch', to: 's3' },
+    { from: 's3', to: 'comp', label: 'failed', tone: 'danger' },
+    { from: 'comp', to: 'dlq', label: 'compensation failed', tone: 'danger' },
+  ]}
+/>
+
+## Advantages
+
+- **No distributed locks.** Each service commits locally and releases immediately, so no
+  participant is held hostage by another's latency.
+- **Availability is not the product of every participant.** A step can be retried later rather
+  than failing the whole operation immediately.
+- **Services stay independent.** No shared transaction manager, no coupling of database
+  technologies.
+- **It works with third parties**, which can never join your transaction anyway.
+
+## Costs
+
+- **Intermediate states are visible.** For a period, inventory is reserved and the card is not
+  charged. Every such state must be a state the business can explain.
+- **Compensations are not rollbacks.** A refund is not the inverse of a charge: the money moved,
+  the statement shows both, and fees may not be returned.
+- **Some steps cannot be compensated.** An email has been read. A physical item has shipped.
+  Order the saga so irreversible steps come last.
+- **Failure handling is most of the code.** The happy path is short; the compensation logic,
+  retries and stuck-saga handling are the bulk of it.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Compensation itself fails',
+      symptom: 'A saga is stuck partway through, with inventory reserved and no order.',
+      cause: 'The compensating action failed and there is nothing to compensate the compensation.',
+      mitigation: 'Retry compensations indefinitely with backoff, and route persistent failures to a queue a human reviews. Some sagas end in manual intervention, and the design must admit that.',
+    },
+    {
+      what: 'Non-idempotent step retried',
+      symptom: 'A card charged twice, or stock reserved twice for one order.',
+      cause: 'A step was retried after a timeout with no deduplication.',
+      mitigation: 'Every step carries an idempotency key derived from the saga id and the step.',
+    },
+    {
+      what: 'Intermediate state visible to users',
+      symptom: 'A customer sees an order that exists but is not paid, and support cannot explain it.',
+      cause: 'The saga’s intermediate states leaked into the user interface.',
+      mitigation: 'Model the states explicitly and decide what each looks like to a user. "Processing" is a legitimate state; a half-created order is not.',
+    },
+    {
+      what: 'Choreography sprawl',
+      symptom: 'Nobody can say what happens when step four fails, because the logic is spread across five services.',
+      cause: 'Event-driven choreography with no single description of the workflow.',
+      mitigation: 'Use orchestration once the workflow exceeds three or four steps, so the sequence lives in one readable place.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The operation genuinely spans services with separate databases.
+- A distributed transaction is unavailable or too expensive.
+- Intermediate states can be explained to a user and to support.
+- Every step can be compensated, or the irreversible ones can be placed last.
+
+## When NOT to use it
+
+- **When the data is in one database.** Use a transaction. A saga across tables in a single
+  database is complexity with no corresponding benefit, and it is a surprisingly common mistake
+  in service-oriented codebases.
+- **When intermediate states are unacceptable.** If a regulator or an invariant forbids money
+  being deducted while an order does not exist, the saga's window is a compliance problem, not a
+  technical trade-off.
+- **When steps cannot be compensated and cannot be reordered.** If an irreversible action must
+  happen first, the pattern does not fit and the workflow needs restructuring.
+- **When the workflow is short and synchronous.** Two calls that both must succeed within one
+  request may be better handled by making the second idempotent and retrying, without saga
+  machinery.
+
+## Example systems
+
+<Claim label="convention" source="martin-fowler">
+The saga is described as a sequence of local transactions with compensating actions, contrasted
+with distributed transactions, and the choice between choreography and orchestration is framed
+as a trade between coupling and observability of the workflow.
+</Claim>
+
+<Claim label="convention" source="building-microservices">
+Service decomposition removes the possibility of a single transaction across the whole business
+operation, which is presented as one of the principal costs of splitting services — not as an
+incidental detail.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Two-phase commit provides atomicity across participants at the cost of blocking: participants
+hold locks until the coordinator returns, so availability depends on every participant and on
+the coordinator.
+</Claim>

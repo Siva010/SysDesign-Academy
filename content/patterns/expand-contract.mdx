@@ -1,0 +1,155 @@
+---
+id: expand-contract
+title: Expand and Contract
+problem: A breaking change must be made to something that several versions of code, or several clients, use at the same time.
+category: deployment
+concepts: [expand-contract, schema-migration, backward-compatibility, rollback, backfill, versioning, canary]
+relatedPatterns: [strangler-fig]
+alsoKnownAs: [parallel change, add-migrate-remove]
+seenIn: [Zero-downtime schema migrations, API evolution, message schema changes]
+sources: [martin-fowler, postgres-docs, sre-workbook]
+status: reviewed
+---
+
+## Problem
+
+You need to rename a column, change a field's type, or restructure an API response.
+
+The change is breaking, and during any rollout **two versions of the code are running against
+one dataset.** A change valid for only one of them fails for the other, and the failure lands
+mid-deploy when diagnosis is hardest.
+
+Worse, rollback does not save you. Reverting the code does not un-write the data the new version
+created, so the old version now reads data it cannot interpret.
+
+## Pattern
+
+Never change anything in one step. Split it into three phases that each preserve compatibility.
+
+**Expand.** Add the new form alongside the old. Both exist. Nothing reads the new one yet.
+Additive changes are safe for every running version.
+
+**Migrate.** Write both forms. Backfill existing data into the new form. Then move readers to the
+new form, gradually. At every moment, both versions of the code can read what they need.
+
+**Contract.** Once nothing depends on the old form, remove it.
+
+The property that matters: **every intermediate state is valid for every currently-deployed
+version**, so any step can be rolled back by reverting one deploy.
+
+## Architecture
+
+<Arch
+  caption="Both forms coexist for the length of the transition."
+  columns={[
+    { title: 'Versions', nodes: [{ id: 'old', label: 'Version N' }, { id: 'new', label: 'Version N+1', tone: 'accent' }] },
+    { title: 'Old form', nodes: [{ id: 'oldcol', label: 'Old column' }] },
+    { title: 'New form', nodes: [{ id: 'newcol', label: 'New column' }] },
+  ]}
+  edges={[
+    { from: 'old', to: 'oldcol', label: 'reads + writes' },
+    { from: 'new', to: 'oldcol', label: 'writes' },
+    { from: 'new', to: 'newcol', label: 'reads + writes' },
+  ]}
+  stages={[
+    {
+      label: 'Expand',
+      show: ['old', 'oldcol', 'newcol'],
+      because:
+        'The new form exists and nothing uses it. Purely additive, so it is safe for every running version and safe to revert.',
+    },
+    {
+      label: 'Migrate',
+      show: ['old', 'new', 'oldcol', 'newcol'],
+      because:
+        'The new version writes both and reads the new; the old version continues on the old form. Both remain correct, which is what makes rollback real.',
+    },
+  ]}
+/>
+
+## Advantages
+
+- **No downtime and no maintenance window.** Every state is serviceable.
+- **Rollback is genuinely safe**, because the old code can still read everything written during
+  the transition.
+- **Progress is reviewable in pieces.** Each step is small enough to reason about, rather than one
+  large change nobody can fully check.
+- **It can be paused indefinitely** if something looks wrong, without leaving the system in a
+  broken state.
+
+## Costs
+
+- **Several deploys instead of one**, spread over days or weeks.
+- **The code writes both forms** during the transition, which is uglier and must be tested in both
+  directions.
+- **Storage and write cost are duplicated** while both forms exist.
+- **The contract phase requires discipline** and is frequently abandoned once the new path works.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Contract phase never happens',
+      symptom: 'Years of unused columns, dual-write code, and dead paths nobody dares remove.',
+      cause: 'The migration was declared complete when the new form worked, and cleanup had no owner or date.',
+      mitigation: 'Schedule the contract step with an owner and a date at the start. Track dual-writing as debt with an expiry.',
+    },
+    {
+      what: 'New column added as NOT NULL without a default',
+      symptom: 'The migration locks the table or takes hours on a large dataset.',
+      cause: 'Adding a non-nullable column may require rewriting every existing row.',
+      mitigation: 'Add it nullable or with a default, backfill in batches, then add the constraint once data is complete.',
+    },
+    {
+      what: 'Backfill overwhelms the database',
+      symptom: 'Replication lag grows, read replicas serve stale data, latency degrades — during the migration.',
+      cause: 'Unbatched or unthrottled bulk writes competing with production traffic.',
+      mitigation: 'Batch by key range, throttle, monitor replication lag, and define abort criteria before starting.',
+    },
+    {
+      what: 'Dual-write path has a bug in one direction',
+      symptom: 'Data written by one version is subtly wrong when read by the other.',
+      cause: 'The dual-write code is exercised only during the migration and is therefore lightly tested.',
+      mitigation: 'Add a verification phase: read both, compare, log discrepancies, and continue until they are zero.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The system serves traffic during the change.
+- Two versions of the code will run simultaneously — which is true of any rolling deploy.
+- The change is breaking: a rename, a type change, a restructure.
+- Rollback must remain possible after the change has been partially applied.
+
+## When NOT to use it
+
+- **For a purely additive change.** Adding a new nullable column that nothing yet reads is already
+  safe. The ceremony is the safety, and there is nothing here to make safe.
+- **For a new table or field nothing uses.** There is no old form to remain compatible with.
+- **When a maintenance window is genuinely cheap and acceptable.** A small internal system with an
+  agreed quiet period does not need five deploys — but say so deliberately rather than by default,
+  and know that this option disappears as you grow.
+- **When the old and new forms cannot coexist**, for example a change that must be atomic across
+  records for a legal reason. There the answer is a window or a different approach, and pretending
+  otherwise produces a half-migrated state that violates the constraint.
+
+## Example systems
+
+<Claim label="convention" source="martin-fowler">
+Parallel change — expand, migrate, contract — is the documented pattern for making breaking
+changes safely, by introducing the new form alongside the old and removing the old only once
+nothing depends on it.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+Locking behaviour differs by operation: some schema changes take brief locks while others require
+rewriting the table. The specific behaviour must be checked for the operation and version in use
+rather than assumed.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Progressive rollout with verification between stages is standard practice, and the same reasoning
+applies to schema changes: small reversible steps with evidence between them.
+</Claim>

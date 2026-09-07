@@ -1,0 +1,168 @@
+---
+id: cardinality-explosion
+title: The Cardinality Explosion
+symptom: Every dashboard and alert in the company degrades at once. Ingest volume, write throughput and storage are all normal.
+category: capacity
+concepts: [cardinality, time-series-storage, index, metrics, observability, alerting, tenant-isolation, load-shedding, rate-limiting, retention, blast-radius, operational-burden]
+sources: [datadog-eng, sre-book, sre-workbook, database-internals, clickhouse-docs]
+status: reviewed
+---
+
+## What you see
+
+**11:40** — A routine deploy of the checkout service. Four commits, none of them touching
+anything operational.
+
+**11:52** — Dashboards across several unrelated teams start loading slowly. Panels that took
+300 ms take nine seconds. Nobody connects it to a deploy in a service they do not own.
+
+**12:05** — Alert evaluation starts running longer than its interval. Two alerts fire six minutes
+after the condition they describe.
+
+**12:30** — The platform team is paged. They check everything a metrics platform is supposed to
+run out of: samples per second is normal, ingest CPU is at 40%, storage write throughput is
+unchanged, disk has months of headroom. Every capacity dashboard is green.
+
+**13:10** — Somebody graphs active series count. It was 52 million this morning. It is now
+1.4 billion, and the line has not flattened.
+
+**13:25** — The checkout deploy added a label to one metric. The label value is the request id.
+
+One line of code. Ninety minutes. Every team's observability degraded, and at no point was any
+component of the ingest path overloaded.
+
+## The mechanism
+
+A series is identified by its metric name **plus its complete label set**. So series count is not
+a sum over metrics — it is a **product** over the distinct values of every label.
+
+A metric with 1,000 series gains a label with an unbounded value space, and it does not gain a
+thousand more series. It gains one series per distinct value, forever.
+
+The reason nothing in the ingest path notices is worth being precise about, because it is what
+makes the incident so hard to find:
+
+- **Sample volume barely moves.** A request-id label means each new series receives exactly one
+  sample and never another. At 4,000 requests per second, that is 4,000 extra samples per second
+  against a baseline of five million. An increase of eight hundredths of one percent.
+- **Series creation rate goes up four hundredfold.** Normal churn is perhaps ten new series a
+  second across the whole fleet — a deploy here, an autoscale there. It is now 4,010.
+
+<Claim label="inference">
+The overloaded resource is the index, and the load on it is not measured in samples. It is
+measured in *new keys*, which almost nobody graphs. Every capacity dashboard in a metrics platform
+watches sample throughput, and sample throughput is the one thing this incident does not touch.
+</Claim>
+
+The index is a map from label values to the series carrying them, and it must be searchable by
+arbitrary combinations. At 52 million series and roughly 200 bytes of labels each it is about
+10 GB — small, memory-resident, fast. At 1.4 billion it is 280 GB, and it no longer fits.
+
+From that moment, **every query slows, including queries that touch none of the affected
+metrics**, because every label lookup that used to be a memory access is now a disk read. A team
+whose service was not deployed, whose metrics did not change, and whose dashboards reference
+entirely different series, watches their tooling degrade for reasons invisible from where they
+are standing.
+
+Then the part that turns a ninety-minute mistake into a multi-week problem: **the series already
+exist.** Removing the label stops new ones being created and repairs nothing. The 1.4 billion
+index entries persist until retention expires them, which for a thirteen-month retention means the
+platform is degraded until somebody deletes them deliberately.
+
+## Why the obvious fixes make it worse
+
+**Restarting the storage nodes.** They must rebuild the in-memory index on start, and the index is
+now twenty-eight times larger. A ninety-second startup becomes forty minutes, during which that
+node serves nothing. Restarting them in sequence extends the outage; restarting them together
+removes the platform entirely.
+
+**Adding memory.** It works, briefly, and it ratifies the growth — the platform now runs at a
+higher cost with the same absent limit, and the next occurrence starts from a larger base.
+Unbounded means unbounded: there is no amount of memory that survives one distinct value per
+request.
+
+**Rolling back the deploy.** Correct, necessary, and insufficient. It stops the bleeding. It does
+not remove a single existing series, and people who expect recovery within minutes of the rollback
+will conclude the diagnosis was wrong.
+
+**Deleting the offending series.** The right destination, and on a time-series store the deletion
+path is expensive: it creates markers that compaction must later process, which consumes exactly
+the I/O the platform currently has none of. Deleting a billion series during the incident can be
+slower than waiting.
+
+## What actually works
+
+The ordering matters, because two of these are urgent and two are not.
+
+1. **Stop new series at the ingest edge.** A per-metric and per-tenant series budget that
+   **rejects** new series and keeps serving existing ones. This is the only step that bounds the
+   problem, and it must happen before the rollback, because the rollback takes longer.
+2. **Protect alerting.** Move alert evaluation to a dedicated query path with strict priority.
+   Dashboards being slow is an inconvenience; alerts firing six minutes late is the platform
+   failing at its only real job.
+3. **Roll back the change**, and tell the owning team what happened in enough detail that they
+   understand the mechanism rather than just the instruction.
+4. **Reclaim the index**, at whatever pace the store can sustain: drop the affected blocks, or
+   shorten retention for the affected metric only, and accept a degraded period bounded by
+   whichever you choose.
+
+## How to prevent it
+
+**Series budgets enforced at ingest, per tenant and per metric name.** Enforcement must be at the
+edge, because by the time a sample reaches storage its index entry has already been written and
+the damage is done.
+
+**Reject rather than degrade.** This is the judgment call, and it is worth stating explicitly:
+refusing one team's new series is a small, attributable, fixable problem that produces an error
+message with an owner's name on it. Accepting them and degrading is a large, diffuse problem that
+nobody owns and everybody feels. The correct failure is the loud one.
+
+**Validate label names in the developer path.** A short deny-list catches most of it: anything
+matching `*_id`, `uuid`, `request`, `session`, `trace`, or a path containing an identifier. A CI
+check on metric definitions costs nothing and catches this before it exists.
+
+**Show each team their own cardinality budget** in the same place they see their error rate. A
+limit nobody can see is a limit people trip over.
+
+<Claim label="convention" source="datadog-eng">
+Published engineering writing on metrics platforms identifies cardinality — the number of distinct
+label combinations — as the dominant scaling constraint, ahead of raw sample volume.
+</Claim>
+
+## How to detect it early
+
+- **Series creation rate**, in new series per second, as a first-class metric. It moves hours
+  before anything else does and it is the only signal that leads rather than lags.
+- **Active series by metric name, top twenty by growth.** This turns a ninety-minute investigation
+  into a thirty-second one, because it names the metric and therefore the team.
+- **Index memory as a fraction of capacity**, alerted well below full. Once it stops fitting, the
+  degradation is not gradual.
+- **A canary query.** Run a fixed, trivial query on a schedule and alert on its latency. Its cost
+  should never change, so when it slows, the index did — and it will slow before any human notices
+  a dashboard is sluggish.
+
+## Related
+
+<Claim label="fact" source="database-internals">
+Index maintenance cost is driven by the number of distinct keys rather than by the volume of data
+written, so a workload that adds many new keys imposes far more index work than the same volume
+written against existing keys.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Deleting data in column-oriented and log-structured stores is implemented as marking rather than
+removal, and the space is reclaimed by a later merge. Deletion therefore adds work rather than
+freeing resources immediately.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Monitoring systems are recommended to be simple and to have few dependencies, because a
+degradation in the monitoring path removes the ability to observe every other system at the moment
+that ability matters most.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Alerting on a small number of user-visible symptoms rather than on every underlying cause directly
+reduces the number of series that alerting depends on, which limits the blast radius of a
+cardinality event on the paging path.
+</Claim>

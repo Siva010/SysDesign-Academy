@@ -1,0 +1,401 @@
+---
+id: what-sits-in-between
+title: What Sits Between You and the Server
+level: 0
+module: l0-lifecycle
+order: 3
+summary: Your request passes through machines you did not write. Each exists so a job stays out of the application, and each adds a place to be wrong.
+difficulty: core
+minutes: 24
+prerequisites: [the-life-of-a-request]
+concepts: [ip, proxy, reverse-proxy, tls-termination]
+unlocks: [load-balancer, l4-vs-l7, api-gateway, cdn, http-caching]
+sources: [rfc9110, rfc8446, hpbn, mdn-http, cloudflare-blog]
+status: reviewed
+---
+
+## The problem
+
+A request works from your laptop and fails from the office. Same code, same account, same
+everything you can see.
+
+Later, the same request works but arrives at your application claiming to come from an address in
+another country. Then a colleague reports that the site says their session expired, but only
+sometimes, and only on the corporate network.
+
+None of these are bugs in your program. They are the visible effects of machines between the
+client and your code — machines you did not write, cannot see in your logs, and did not know were
+there. Reasoning about a system while pretending the wire is a straight line produces exactly this
+category of unexplainable behaviour.
+
+## Intuition
+
+Think of posting a letter.
+
+The address on the envelope gets it to a building. That is all the postal system promises: best
+effort to a location. It does not promise the letter arrives, arrives once, or arrives in the
+order you sent it.
+
+Inside the building, a receptionist takes the letter, decides which department it belongs to,
+maybe opens it, maybe keeps a copy, maybe refuses it because you have sent forty today. To you
+the building has one address. Behind the desk there could be one person or two thousand.
+
+Two different kinds of intermediary appear in that picture, and confusing them is the source of
+most of the confusion in this area:
+
+- Something acting **for the sender**, deciding where their mail goes and possibly reading it on
+  the way out. That is a **proxy** — it belongs to the client's side.
+- Something acting **for the recipient**, receiving all mail addressed to a building and
+  distributing it inside. That is a **reverse proxy** — it belongs to the server's side.
+
+They can be literally the same software. What makes one a proxy and the other a reverse proxy is
+**whose interests it represents**, and therefore who configured it and who can change it.
+
+## Concretely
+
+<Example title="Three unexplainable behaviours, explained">
+
+**The request that fails from the office.** A corporate forward proxy inspects outbound traffic
+and blocks the domain. Nothing reached your server; there is no log line to find. The failure
+lives on a machine your organisation may not even own.
+
+**The request from another country.** Your application reads the source address of the connection
+it received. But the connection it received came from your own reverse proxy, standing between it
+and the user. Without the proxy passing the original address on in a header, every request in your
+logs appears to originate from your own infrastructure. With it, every request carries a claim
+about its origin that anyone can write — so it is trustworthy exactly to the extent that you trust
+the last proxy to have overwritten it.
+
+**The session that expires only sometimes.** Two application servers behind the reverse proxy hold
+session state in local memory. A user whose requests land on server A and then server B has a
+session on one and not on the other. The proxy did nothing wrong; it distributed traffic exactly as
+designed, which is what made the application's hidden assumption visible.
+
+</Example>
+
+## Formal explanation
+
+<C id="ip" /> delivers packets between addresses on a best-effort basis. Not reliable, not
+ordered, not deduplicated, not confidential. Every stronger guarantee in networking is built on
+top of that by someone paying for it — TCP pays round trips for reliability and ordering, TLS
+pays a handshake for confidentiality.
+
+An address identifies an **interface**, not a service and not a person. Several machines can share
+one address, one machine can have several, and the address a server sees may belong to the last
+device that handled the packet rather than to the client. Treating an address as an identity is
+the root of a whole family of security mistakes.
+
+A <C id="proxy" /> forwards traffic on behalf of the client. It is configured by the client side —
+a browser setting, a corporate policy, an operating system rule — and the server generally cannot
+tell it exists.
+
+A <C id="reverse-proxy" /> forwards traffic on behalf of the server. Clients address it as if it
+were the service. It exists because certain jobs are the same for every request and should
+therefore not live in the application:
+
+- Terminating TLS.
+- Routing by path or host to different backends.
+- Caching responses.
+- Rate limiting and rejecting obvious abuse.
+- Buffering slow clients so a slow reader does not occupy an application worker.
+
+That last one is underrated. An application server holding a connection open while a client on a
+poor mobile link reads a response at 20 KB/s has one fewer worker for the duration. A reverse proxy
+absorbs the response quickly and drips it out, so the expensive tier is freed immediately.
+
+<C id="tls-termination" /> is the point where the encrypted connection ends and plaintext begins.
+It is a *location* decision, and it decides which parts of your infrastructure can read the traffic
+and which parts merely move it:
+
+- **At the edge.** One place to manage certificates, and everything behind it can route, cache and
+  inspect. The internal network is now carrying plaintext.
+- **At the application.** Nothing but the application sees plaintext, so a compromised load
+  balancer reveals nothing. But the intermediary can no longer route by path, cache, or do anything
+  else that requires understanding the request.
+- **Re-encrypted after termination.** Terminate at the edge to get routing and caching, then open a
+  fresh TLS connection to the backend. Both properties, at the cost of two handshakes and twice the
+  certificate management.
+
+There is no default answer. It follows from your threat model, and specifically from whether
+&ldquo;someone is inside our network&rdquo; is a scenario you are designing against.
+
+## Architecture
+
+<Arch
+  caption="Same software, different side of the conversation, entirely different purpose."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'user', label: 'Browser' }] },
+    { title: 'Client side', nodes: [{ id: 'fwd', label: 'Forward proxy', note: 'their policy' }] },
+    { title: 'Internet', nodes: [{ id: 'net', label: 'IP', note: 'best effort only' }] },
+    { title: 'Server side', nodes: [{ id: 'rev', label: 'Reverse proxy', note: 'TLS, routing, cache', tone: 'accent' }] },
+    { title: 'Yours', nodes: [{ id: 'app1', label: 'App instance' }, { id: 'app2', label: 'App instance' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'fwd' },
+    { from: 'fwd', to: 'net' },
+    { from: 'net', to: 'rev', label: 'TLS ends here' },
+    { from: 'rev', to: 'app1' },
+    { from: 'rev', to: 'app2' },
+  ]}
+  stages={[
+    {
+      label: 'Direct',
+      show: ['user', 'net', 'app1'],
+      because:
+        'One client, one server, one connection. Everything the application needs to know it can see, including who is really calling. This is the model most code is written against.',
+    },
+    {
+      label: 'A reverse proxy appears',
+      show: ['user', 'net', 'rev', 'app1', 'app2'],
+      because:
+        'TLS, routing, caching and rate limiting move out of the application, and slow clients stop occupying application workers. In exchange, the application no longer sees the client directly: the source address and the protocol are now claims forwarded in headers.',
+    },
+    {
+      label: 'And one on their side too',
+      show: ['user', 'fwd', 'net', 'rev', 'app1', 'app2'],
+      because:
+        'The client may also be behind an intermediary you do not control and cannot see. Requests can be blocked, modified or cached before they ever reach the network, which is why a failure with no server-side log line is a real diagnosis rather than a mystery.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One server, no intermediary',
+      behaviour:
+        'The application handles TLS, serves static files, and sees the true client address. Entirely correct.',
+      firstToBreak:
+        'Nothing yet. The first pressure is usually certificate management or a slow-client problem.',
+    },
+    {
+      scale: 'Several application instances',
+      behaviour:
+        'A reverse proxy fronts them. TLS and routing move out. The application starts reading forwarded headers instead of the connection.',
+      firstToBreak:
+        'Anything that assumed the connection told the truth: client address, protocol, hostname. Rate limits keyed on the connection address now limit your own proxy.',
+    },
+    {
+      scale: 'Multiple regions and services',
+      behaviour:
+        'The proxy tier becomes a routing layer with its own configuration, deploys and outages. Path-based routing, header rewriting and caching accumulate there.',
+      firstToBreak:
+        'The proxy configuration, which is now business logic written in a language with no tests. A bad rule affects every service at once.',
+    },
+    {
+      scale: 'Global edge',
+      behaviour:
+        'Termination happens near users, hundreds of milliseconds before the request reaches an origin, and much traffic never reaches you at all.',
+      firstToBreak:
+        'Your model of where requests come from. Debugging now requires the edge provider logs as well as your own, and the two disagree about timing.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'The application trusts a forwarded address',
+      symptom: 'Rate limits, geo rules or audit logs are wrong, and can be manipulated by anyone.',
+      cause: 'A client-supplied header naming an origin address was read as fact. Any client can send that header.',
+      mitigation: 'Trust the forwarded address only when the proxy overwrites it rather than appends, and only for connections arriving from the proxy. Strip it at the edge for everything else.',
+    },
+    {
+      what: 'Everything is rate limited as one client',
+      symptom: 'Legitimate users are throttled at random once a reverse proxy is introduced.',
+      cause: 'The limiter keys on the connection address, which is now the proxy for every request.',
+      mitigation: 'Key limits on the forwarded client identity, and verify the assumption changed when the topology did.',
+    },
+    {
+      what: 'Timeout mismatch between layers',
+      symptom: 'Users see a gateway error while the application logs show the request completing successfully.',
+      cause: 'The proxy timeout is shorter than the application timeout, so it gives up and the application finishes into a closed connection.',
+      mitigation: 'Timeouts must increase outward from the innermost layer, and every layer must know the budget it was given.',
+    },
+    {
+      what: 'Plaintext on the internal network',
+      symptom: 'Nothing visible, until an incident review asks what an attacker inside the network could read.',
+      cause: 'TLS terminated at the edge with no re-encryption, because it was never a decision, just a default.',
+      mitigation: 'Make termination an explicit decision against a threat model, and re-encrypt where internal traffic must stay confidential.',
+    },
+    {
+      what: 'The proxy becomes the single point of failure',
+      symptom: 'Every service is unavailable although every service is healthy.',
+      cause: 'One tier now sits in front of everything and was deployed as one unit.',
+      mitigation: 'Redundant proxies, staged configuration rollout, and a rule that proxy config changes are deploys with the same review as code.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Terminate TLS at the reverse proxy rather than at the application"
+  options={[
+    'Terminate at the application: nothing but the application ever sees plaintext',
+    'Terminate at the edge: one certificate story, and the edge can route and cache',
+    'Terminate at the edge and re-encrypt to the backend',
+    'Pass through at layer 4: the proxy moves bytes without understanding them',
+  ]}
+  why="Anything that needs to route by path, cache a response, or apply a rule based on the request must be able to read it. An intermediary that cannot read the request can only move connections, which rules out most of the reasons to have one."
+  gain="Certificates managed in one place. Routing, caching, compression and rate limiting available at the edge. Application servers do no cryptographic work and are freed from slow clients."
+  sacrifice="Traffic between the proxy and the application is plaintext unless you re-encrypt. The application no longer observes the client directly and must trust forwarded metadata. One more tier that can be misconfigured."
+  failureModes={[
+    'Forwarded headers trusted without verifying who set them',
+    'Plaintext internal traffic that nobody decided to accept',
+    'Proxy and application timeouts that disagree, producing gateway errors on successful requests',
+    'Certificate expiry taking down every service at once, because there is now one certificate',
+  ]}
+  operationalBurden="Moderate and easy to underestimate. The proxy configuration becomes production logic with limited testing tools, and it is edited during incidents by people who are in a hurry."
+  cost="Small in money. The real cost is a layer that every request passes through and that few engineers fully understand."
+  whenNot="When end-to-end confidentiality is a requirement — regulated data, or a threat model that includes your own network — terminate at the application or re-encrypt. When the protocol is not HTTP, or when the proxy would only add a hop without doing any job, layer 4 pass-through is cheaper and simpler. And for a single application server, an added proxy tier is a new failure mode bought with no benefit."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc9110">
+HTTP defines intermediaries — proxies, gateways and tunnels — as part of the protocol rather than
+as deployment accidents, and specifies that a response may be served by an intermediary from cache
+rather than by the origin server.
+</Claim>
+
+<Claim label="fact" source="rfc8446">
+TLS establishes confidentiality and integrity for a connection between two endpoints. An
+intermediary that reads plaintext is one of those endpoints by definition, so terminating TLS is
+exactly the decision about where the protected connection ends.
+</Claim>
+
+<Claim label="fact" source="mdn-http">
+Forwarded and X-Forwarded-For carry the originating client address through proxies. Because they
+are ordinary request headers, a client can send them, so their value is only meaningful when a
+trusted intermediary has set or replaced it.
+</Claim>
+
+<Claim label="convention" source="hpbn">
+Placing termination close to users shortens the handshake round trips, which dominate the cost of
+establishing a connection over long distances. This is a latency argument for edge termination
+independent of any caching benefit.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Published engineering writing on edge networks describes absorbing abusive traffic before it
+reaches an origin as a primary function of the edge tier, rather than as a feature added to it.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know what the boxes you draw actually do. Almost every candidate draws a load balancer; far fewer can say what it terminates, what it can see, and what the application therefore cannot."
+  depth="Be able to distinguish a forward proxy from a reverse proxy by whose interests it serves. Be able to say where TLS terminates in your design and why. Knowing that the client address becomes a claim rather than an observation is a strong signal."
+  followUps={[
+    'Where does TLS terminate in your design, and who can read the traffic after that point?',
+    'Your rate limiter starts throttling everyone after you add a load balancer. Why?',
+    'How does the application know the client IP address, and can it trust it?',
+    'The proxy returns a gateway timeout but the application logs success. What is happening?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Drawing a load balancer without saying what it does.',
+      why: 'A box labelled "LB" hides every decision that matters: layer 4 or layer 7, TLS terminated or passed through, what it caches, what it rejects. Those decisions determine what the rest of the design can assume.',
+      instead:
+        'Say what it terminates and what it can see. "L7, terminates TLS, routes by path, rate limits by API key" is a design; "load balancer" is a rectangle.',
+    },
+    {
+      mistake: 'Treating the source IP address as an identity.',
+      why: 'Many users share one address behind a carrier or a corporate network, one user changes address between networks, and behind a proxy the address you see is the proxy. Blocking or identifying by address is coarse and evadable at the same time.',
+      instead:
+        'Use addresses as a weak signal alongside authenticated identity, and be explicit that a forwarded address is a claim whose trust depends entirely on who last wrote it.',
+    },
+    {
+      mistake: 'Assuming there are no intermediaries you did not put there.',
+      why: 'Corporate proxies, mobile carrier middleboxes and enterprise inspection appliances all modify traffic. A failure with no server-side trace is often one of these, and time spent searching your own logs is time wasted.',
+      instead:
+        'When a request never arrives, treat the path as a suspect. Reproduce from a different network before assuming the bug is yours.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['reverse-proxy', 'proxy']}
+  prompt="Your application logs show every request originating from 10.0.1.7, an address inside your own network. Rate limiting has started throttling users apparently at random. What changed?"
+  options={[
+    {
+      id: 'a',
+      text: 'A reverse proxy was introduced, so the connection the application sees comes from it rather than from the user',
+      implies: 'You understand that an intermediary replaces the observable peer.',
+      why: 'The application observes the peer of its own connection, which is now the proxy. Every request shares one source address, so a limiter keyed on that address treats the entire user base as one client. The fix is to key on the forwarded client identity, and to trust that header only for connections arriving from the proxy.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Network address translation is collapsing many users onto one address',
+      implies: 'You are reaching for a real phenomenon that does not explain an internal address.',
+      why: 'Carrier-grade address translation genuinely does put many users behind one address, and it is a real reason not to rate limit by address. But it produces a shared public address, not one inside your own network. The internal address points squarely at your own infrastructure.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A bug in the logging library is recording the wrong field',
+      implies: 'You are treating a topology change as a code defect.',
+      why: 'The logging is accurate. It is faithfully reporting the peer address of the connection it received, and that peer is now a machine you added. The assumption that broke lives in the application, not in the logger.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the security consequence as well as the fix: once you read the client address from a header, you must overwrite that header at the trust boundary rather than append to it, and you must only believe it on connections from the proxy. Otherwise any client can present whatever origin address it likes, and you have converted a logging inconvenience into an authorisation bypass."
+/>
+
+<Check
+  concepts={['tls-termination']}
+  prompt="You want the edge to route requests by URL path to different backend services. What does that require, and what follows from it?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing special — routing by path works at the connection level',
+      implies: 'You are treating layer 4 and layer 7 as interchangeable.',
+      why: 'A connection carries bytes. The path lives inside the request, which lives inside the encrypted stream. Something that only moves connections cannot see a path, which is exactly the difference between layer 4 and layer 7 balancing.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'TLS must terminate at the edge, which means the edge and everything behind it can read the traffic',
+      implies: 'You connect the routing requirement to the confidentiality consequence.',
+      why: 'Reading a path requires decrypting the request, so the encrypted connection ends at the edge. That is a security decision as much as a routing one: the edge is now a device that sees plaintext, and traffic beyond it is unprotected unless you re-encrypt.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Route on the server name from the TLS handshake instead',
+      implies: 'You know the handshake exposes the hostname before encryption begins.',
+      why: 'That genuinely works and is worth knowing: the server name is visible early, so a proxy can route by hostname without decrypting anything. But it routes by host, not by path — different services on different hostnames, yes; different paths on one hostname, no.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer offers the third option explicitly: terminate at the edge for routing and caching, then open a fresh TLS connection to the backend. It costs two handshakes and a second certificate story, and it is the standard answer when internal traffic must stay confidential — which is a threat-model question, not a networking one."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'HTTP intermediaries, caching and forwarding semantics', sourceId: 'rfc9110' },
+    { label: 'What TLS protects, and between which two endpoints', sourceId: 'rfc8446' },
+    { label: 'Connection setup costs and why termination location matters for latency', sourceId: 'hpbn' },
+    { label: 'Forwarded headers and why their trust is conditional', sourceId: 'mdn-http' },
+    { label: 'Next: when the server needs to speak first', href: '/lessons/when-the-server-speaks-first' },
+  ]}
+/>

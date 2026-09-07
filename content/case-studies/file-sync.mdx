@@ -1,0 +1,489 @@
+---
+id: file-sync
+title: File Sync
+ask: Design a service that keeps a folder of files identical across a user's devices, including when they edit offline.
+difficulty: advanced
+minutes: 55
+signatures: [large-object]
+concepts: [large-object, chunking, object-storage, immutability, cdn, encryption-at-rest, encryption-in-transit, key-management, conflict-resolution, last-write-wins, vector-clock, causal-consistency, happens-before, crdt, eventual-consistency, versioning, idempotency, sharding, partition-key, cross-shard-query, thundering-herd, exponential-backoff, push-vs-pull, websocket, keep-alive, http-caching, batching, backpressure, cost-optimisation, retention, backup, durability, rpo, threat-modeling, graceful-degradation, blast-radius]
+patterns: [read-through-edge, cache-aside, transactional-outbox, idempotency-key]
+prerequisites: [other-shapes-of-store, what-you-promise-a-reader]
+sources: [ddia, database-internals, rfc9110, hpbn, aws-well-architected, dropbox-tech]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a service that keeps a folder of files identical across a user's devices,
+> including when they edit offline.&rdquo;
+
+There are two systems here, and almost every good decision in this design comes from refusing to
+merge them.
+
+**Metadata** is small, mutable, ordered and transactional. Which files exist, what they are called,
+which version is current, who may see them.
+
+**Data** is enormous, immutable, cheap and eventually delivered. The bytes.
+
+They have opposite requirements in every dimension, and the second rule that follows immediately
+is: **the bytes must never travel through your application servers.**
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Are files edited in place, or replaced wholesale? | Most operating systems rewrite a file on save. A 2 GB file with a 4 KB edit becomes a 2 GB upload unless the design prevents it. |
+| Must concurrent offline edits merge, or may a conflict be surfaced? | Merging arbitrary binary content is not possible. If the product demands it, the product is wrong about what it is asking for. |
+| Is sharing in scope? | Sharing changes the unit of ordering from the user to the folder, and it is not a feature you can add to a per-user design later. |
+| Largest file, and largest number of files? | Ten files of 1 GB is a bytes problem. Ten million files of 1 KB is a metadata problem, and much harder. |
+| Client-side end-to-end encryption? | It removes cross-user deduplication and server-side previews entirely. A single answer here changes the cost model by a large factor. |
+| How quickly must a change propagate? | Seconds means a push channel and millions of live connections. Minutes means polling, which is far cheaper. |
+
+**Assumed answers:** files are usually replaced wholesale but change in small ways; conflicts are
+surfaced as a conflicted copy rather than merged; sharing is in scope; up to 50 GB per file and up
+to a million files per user; server-side encryption; propagation within seconds while a device is
+online.
+
+## Requirements
+
+**Functional:** upload; download; list what changed since a cursor; delete; move and rename; share
+a folder; produce a conflicted copy when two devices diverge.
+
+**Non-functional**
+
+- Never lose a file the user believes is saved.
+- Never silently overwrite a change made on another device.
+- A 4 KB change to a 2 GB file must not transfer 2 GB.
+- An interrupted transfer resumes rather than restarts.
+- File bytes never pass through an application server.
+
+**Out of scope:** real-time collaborative editing, full-text search of file contents, a version
+history interface beyond conflicted copies, selective sync UX.
+
+## Estimate
+
+- **10,000,000 active users**, averaging **30,000 files** each.
+- **300 billion file records.** At about 200 bytes of metadata each, roughly **60 TB of metadata**,
+  all of it mutable and transactional.
+- Average file 300 KB → about **90 PB of logical data**.
+- Each user changes about **100 files a day** → 1 billion changes a day, roughly
+  **12,000 changes per second**.
+- Naive transfer: 1 billion × 300 KB = **300 TB per day**, in both directions.
+
+<Claim label="inference">
+The metadata half is the harder half, which inverts most people's intuition. Ninety petabytes of
+immutable blobs is a solved commercial problem — object storage exists precisely for this and is
+sold by the gigabyte. Three hundred billion mutable rows, transactionally updated, ordered per
+user, and queried by every device every few seconds, is not something you can buy off a shelf.
+The &ldquo;big data&rdquo; half is easy and the &ldquo;small metadata&rdquo; half is where the
+design effort goes.
+</Claim>
+
+<Estimator preset="storage" />
+
+Two runs are worth doing. Set writes per day to 1 billion at 300,000 bytes to see the naive
+transfer and storage cost. Then set bytes per record to 30,000, representing a tenfold reduction
+from transferring only changed chunks. The gap between those two numbers is the entire budget
+justification for the chunking work in Round 2, and it is large enough that the work is not
+optional.
+
+## Data model
+
+| Entity | Store | Why there |
+|---|---|---|
+| Block | Object storage, keyed by content hash | Immutable, deduplicated, never updated, never deleted eagerly |
+| File version | Metadata database | An ordered list of block hashes, plus size, timestamps and parent version |
+| Namespace | Metadata database | A user's root, or a shared folder. The unit of ordering and of sharding. |
+| Journal entry | Metadata database | Monotonic per namespace. The answer to &ldquo;what changed since N&rdquo;. |
+| Device | Metadata database | The last cursor this device acknowledged |
+
+Two structural choices carry most of the weight.
+
+**Blocks are content-addressed.** The key is the hash of the bytes, so identical content is
+naturally one object, uploading the same block twice is idempotent, and a block can never be stale
+because it can never change. Immutability is what makes caching, replication and retries trivial
+here.
+
+**Sync is journal replay, not tree comparison.** A client sends its cursor and receives the entries
+after it. Comparing two trees costs one operation per file; replaying a journal costs one per
+change. At 30,000 files and 100 daily changes, that is a factor of three hundred on every single
+sync, several times a minute, per device. It is the difference between a service that can exist
+and one that cannot.
+
+<Callout kind="info" title="Content-defined chunking, and why fixed blocks fail">
+Split a file at fixed 4 MB boundaries and insert one byte at the front. Every boundary shifts by
+one byte, every chunk hash changes, and nothing deduplicates — the whole file is re-uploaded for a
+one-byte edit.
+
+Choose boundaries by running a rolling hash over the content and cutting where the hash matches a
+pattern. Now the boundaries are properties of the bytes rather than of the offsets, so an insertion
+changes only the chunks around it and everything after re-aligns on its own.
+
+This one mechanism is what makes delta transfer work without either side knowing what the other
+had.
+</Callout>
+
+## Design v1
+
+<Arch
+  caption="Metadata is committed through the service. Bytes go around it, in both directions."
+  columns={[
+    { title: 'Devices', nodes: [{ id: 'client', label: 'Client' }] },
+    { title: 'Control', nodes: [{ id: 'meta', label: 'Metadata service', note: 'commit, journal', tone: 'accent' }] },
+    { title: 'State', nodes: [{ id: 'db', label: 'Metadata store', note: 'sharded by namespace' }, { id: 'journal', label: 'Journal', note: 'per namespace cursor' }] },
+    { title: 'Data', nodes: [{ id: 'blocks', label: 'Block store', note: 'content addressed', tone: 'accent' }] },
+    { title: 'Notify', nodes: [{ id: 'push', label: 'Notification service' }] },
+    { title: 'Other devices', nodes: [{ id: 'other', label: 'Other devices' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'meta', label: 'have / need' },
+    { from: 'client', to: 'blocks', label: 'direct upload' },
+    { from: 'meta', to: 'db', label: 'commit' },
+    { from: 'db', to: 'journal' },
+    { from: 'journal', to: 'push' },
+    { from: 'push', to: 'other' },
+    { from: 'other', to: 'blocks', label: 'direct download' },
+  ]}
+  stages={[
+    {
+      label: 'Everything through the API',
+      show: ['client', 'meta', 'db', 'other'],
+      because:
+        'Upload the whole file to the service, which stores it. Correct, simple, and it fails in a specific way worth seeing: the application server becomes a byte pipe, and its network card is the ceiling for the entire product.',
+    },
+    {
+      label: 'Bytes go around the service',
+      show: ['client', 'meta', 'db', 'blocks', 'other'],
+      because:
+        'The client is authorised to upload directly to the block store and commits metadata afterwards. The service now handles a few hundred bytes per file instead of megabytes, and the ordering between the two steps becomes a real design question.',
+    },
+    {
+      label: 'Journal and push',
+      show: ['client', 'meta', 'db', 'journal', 'blocks', 'push', 'other'],
+      because:
+        'A per-namespace journal makes "what changed" cheap, and a push channel means devices learn about changes without polling. Both exist to keep per-device cost proportional to changes rather than to files.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;The API servers are at 100% network and 4% CPU.&rdquo;
+
+The bytes are flowing through the application, which is the most expensive possible place for them
+to be. Move to **direct upload**: the client asks the metadata service for a short-lived
+authorisation, uploads to the block store itself, then commits the metadata.
+
+That splits one operation into two, and the client can die between them. Both orderings are
+possible and only one is safe.
+
+- **Bytes first, then metadata.** A crash leaves an **orphan block**: uploaded data nothing
+  references. Because blocks are content-addressed and immutable, an orphan is inert — it costs
+  storage and nothing else. A garbage collector removes unreferenced blocks after a grace period.
+- **Metadata first, then bytes.** A crash leaves a file that appears in the interface and fails to
+  download. The user experiences that as data loss, and they are right to.
+
+So: **always bytes first.** And the grace period before collecting an orphan must be much longer
+than any plausible slow upload, or the collector races a client on a poor connection and deletes
+data that was about to be referenced.
+
+### Round 2 — &ldquo;A 4 KB edit transfers 2 GB.&rdquo;
+
+Chunk the file with content-defined boundaries, then negotiate:
+
+1. The client computes the hash of each chunk.
+2. It sends the list of hashes — a few kilobytes, not a few gigabytes.
+3. The server answers which it already has.
+4. The client uploads only the missing ones.
+
+One small round trip converts a 2 GB upload into a 4 MB one, and it works without either side
+knowing anything about the previous version of the file.
+
+**New cost, and it lands on the user's machine:** hashing requires reading the file. A 2 GB file
+re-hashed on every change is real disk I/O on a laptop, and it will be noticed. Cache the chunk
+list keyed by path, size and modification time, so an unchanged file is never re-read. This is a
+case where the expensive part of a server-side optimisation is paid by the client, and it has to be
+designed for rather than discovered in a support ticket about fan noise.
+
+### Round 3 — &ldquo;Two devices edit the same file while both are offline.&rdquo;
+
+Detect first. Each file version records its **parent version**, so a commit whose parent is not the
+current head is provably concurrent rather than sequential — that is a causal test, not a timing
+one, and it does not depend on any clock.
+
+Then resolve, and the honest resolution is to refuse to choose:
+
+- **Create a conflicted copy.** Both versions are preserved, both are visible, and the user decides.
+  It is not elegant and it never loses a byte.
+
+Two tempting alternatives, and why each is wrong here:
+
+- **Last write wins** silently discards a change. The problem is not that it discards one — some
+  policy must — it is that it does so invisibly. And because the two devices' clocks disagree, it
+  can discard the *newer* edit while reporting success.
+- **CRDTs** merge automatically for data types with a defined merge operation, which is why
+  collaborative text editors use them. A JPEG has no merge function. A CRDT applied to opaque bytes
+  degenerates into last-write-wins with more machinery, which is worse than last-write-wins alone.
+
+### Round 4 — &ldquo;Three hundred billion metadata rows.&rdquo;
+
+Shard by **namespace**. The property that makes this work is not the shard function — it is that
+every operation a client performs is already scoped to one namespace, so cross-shard transactions
+are rare **by construction**. That property came from the data model, not from the database.
+
+The exception is moving a file into a shared folder, which crosses namespaces. Do not pretend it is
+atomic. Make it an explicit two-step move with a visible intermediate state, or a copy followed by
+a delete, and keep such operations rare enough that their cost does not matter. A design that needs
+frequent cross-shard transactions has chosen the wrong shard key, and no amount of distributed
+transaction machinery repairs that.
+
+### Round 5 — &ldquo;A client asks what changed and we scan thirty thousand files.&rdquo;
+
+The journal answers it in one indexed read from the client's cursor. Three details make it work in
+practice:
+
+- **Per-namespace monotonic ordering** is enough. A global order across namespaces would be far
+  more expensive and no client needs it.
+- **The cursor is opaque to the client.** Today it is a sequence number; tomorrow it may be a
+  compound value. A client that parses it freezes the implementation.
+- **A full-sync fallback must exist and be tested.** A device offline for a year has a cursor older
+  than the journal's retention. That path is not an edge case: it is the path every client takes
+  after any incident that truncates or rebuilds a journal, so it will be exercised at the worst
+  possible moment.
+
+### Round 6 — &ldquo;A million devices reconnect at once after a network event.&rdquo;
+
+A thundering herd against the one endpoint every device calls first.
+
+- **Jittered exponential backoff** on the client, so devices that failed together do not return
+  together.
+- **Server-directed reconnect.** The response carries the delay before the next attempt, so the
+  server can throttle the herd rather than hoping clients behave. Client-side policy is a
+  suggestion; server-directed policy is a control you still have during the incident.
+- **Keep the journal endpoint cheap.** It is called by every device on every reconnect, so its cost
+  is multiplied by the size of your entire installed base at exactly the moment you have least
+  capacity.
+
+The push channel has its own arithmetic. Millions of long-lived connections are millions of open
+sockets with memory and file descriptors attached, and they cost whether or not anything is being
+sent. Where the platform offers a push service, use it for idle devices and hold live connections
+only for devices actively syncing.
+
+### Round 7 — &ldquo;Cross-user deduplication is a security problem.&rdquo;
+
+It is, and this is the round where a cost optimisation meets a privacy failure head-on.
+
+If the server answers &ldquo;I already have that block&rdquo; based on a hash across all users,
+then anyone who can guess a file's exact contents can test whether **someone else** has it. Upload
+the hash, observe whether the server asks for the bytes, and you have a membership oracle over
+other people's data. For a file with few plausible variants — a specific document, a specific
+build — that is a real disclosure.
+
+The available answers, none free:
+
+- **Deduplicate only within a trust boundary** — one user, or one shared folder. Loses most of the
+  cross-user saving, and removes the oracle completely.
+- **Always require the upload**, and deduplicate server-side after receiving the bytes. Keeps the
+  storage saving, loses the bandwidth saving, removes the oracle.
+- **Mix a per-user secret into the chunk identity.** Deduplication becomes per-user by
+  construction.
+
+And note what client-side end-to-end encryption does: identical plaintext encrypted under
+different keys produces different bytes, so cross-user deduplication becomes impossible whether or
+not you wanted it. That is a genuine three-way trade between privacy, cost and features — it also
+removes server-side previews, thumbnails and search — and it should be stated as a trade rather
+than settled quietly by whoever implements the upload path.
+
+### Round 8 — &ldquo;A user deletes a folder and then wants it back.&rdquo;
+
+Deletes are **tombstones**, not removals. The metadata entry is marked deleted, the journal records
+it, and the blocks stay.
+
+Blocks cannot be deleted eagerly anyway, because they are shared. Two mechanisms exist and both
+are unpleasant at this scale:
+
+- **Reference counting** is cheap to read and fragile to maintain. A missed decrement leaks
+  storage; a double decrement deletes data that is still referenced.
+- **Mark and sweep** over 300 billion references is correct and enormous, and must run
+  concurrently with continuous writes.
+
+The bias should be explicit and it should be conservative: **leak rather than lose.** Storage is
+purchasable and a data-loss incident is not. Whatever the mechanism, monitor the leak rate — an
+unreferenced-block ratio that climbs steadily is a bug you can fix on a Tuesday, and a collector
+that occasionally deletes a live block is an incident you cannot undo.
+
+### Round 9 — &ldquo;Storage cost is growing and nobody can explain the bill.&rdquo;
+
+- **Separate logical from physical bytes** in reporting. A user who stores 100 GB of which 60 GB
+  deduplicates against other content costs you 40 GB, and only one of those numbers belongs in a
+  capacity plan.
+- **Tier by access recency.** Files untouched for a year move to colder, cheaper storage.
+
+The failure mode of tiering is worth naming because it is invisible until a user hits it: a person
+opening a five-year-old photo expects it to open. If the cold tier has a first-byte latency of
+minutes, the product is broken for exactly the nostalgic case that made the user value the service.
+That bounds how cold the cold tier may be, and it is a product constraint on an infrastructure
+decision.
+
+### Round 10 — &ldquo;How do you know sync is actually working?&rdquo;
+
+You cannot observe this from the server. The server knows what it believes each device should have.
+Whether the folder on the laptop actually matches is a statement about the laptop.
+
+So the clients must report it. Each device periodically computes a checksum over its view of the
+namespace and sends it with its cursor; the server compares it against its own. **Divergence is the
+metric** — the only end-to-end correctness signal in the entire system.
+
+Without it, sync failures do not appear as alerts. They appear as a support ticket, three months
+later, from a user who has already lost trust in the product. Every other dashboard in this design
+measures whether the components are healthy. This one measures whether the promise is being kept.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Phantom files',
+      symptom: 'A file is listed and fails to download. Users describe it as losing their data.',
+      cause: 'Metadata was committed before the bytes were durably stored, and the client died in between.',
+      mitigation: 'Always bytes first, then metadata. Orphan blocks are inert; orphan metadata is data loss.',
+    },
+    {
+      what: 'Deduplication stops working after an edit',
+      symptom: 'A one-byte insertion at the top of a large file re-uploads the whole thing.',
+      cause: 'Fixed-size chunk boundaries shifted with the insertion, changing every subsequent chunk hash.',
+      mitigation: 'Content-defined boundaries from a rolling hash, so boundaries follow the bytes rather than the offsets.',
+    },
+    {
+      what: 'Silent overwrite',
+      symptom: 'A user reports that work done on their laptop vanished after their desktop came online.',
+      cause: 'Concurrent versions were resolved by comparing timestamps, and the two devices disagreed about the time.',
+      mitigation: 'Detect concurrency by parent version, not by clock, and preserve both versions as a conflicted copy.',
+    },
+    {
+      what: 'Journal truncation with no fallback',
+      symptom: 'Devices that have been offline for a long time never sync again and give no error.',
+      cause: 'The cursor predates journal retention and there is no full-sync path, or there is one that has never been exercised.',
+      mitigation: 'An explicit full-sync fallback, tested regularly, because every client takes it after any journal incident.',
+    },
+    {
+      what: 'Reconnect storm',
+      symptom: 'A brief network event is followed by a long outage of the sync service itself.',
+      cause: 'Every device retried on the same schedule against the one endpoint every device calls first.',
+      mitigation: 'Jittered backoff plus a server-directed retry delay, so the server retains control during the incident.',
+    },
+    {
+      what: 'Hash existence oracle',
+      symptom: 'An attacker determines whether a specific document exists in another user account.',
+      cause: 'Cross-user deduplication reveals block existence through whether the server requests the bytes.',
+      mitigation: 'Deduplicate within a trust boundary, or always transfer and deduplicate server-side.',
+    },
+    {
+      what: 'Garbage collector deletes a live block',
+      symptom: 'A small number of files across many users become permanently undownloadable.',
+      cause: 'A reference count was decremented twice, or a sweep raced a concurrent commit.',
+      mitigation: 'Bias the collector toward leaking, use a long grace period, and monitor unreferenced-block ratio as a bug rather than a crisis.',
+    },
+    {
+      what: 'Cold tier breaks old files',
+      symptom: 'Opening an old photo takes minutes, and users conclude their files are gone.',
+      cause: 'Tiering was chosen on price alone, without a first-byte latency requirement.',
+      mitigation: 'Bound how cold the cold tier may be by the product expectation, not by the cheapest storage class available.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Split metadata from blocks | Each half uses a store built for it | Two systems and a consistency seam between them | Files were tiny and few |
+| Direct upload, bytes before metadata | Application servers stop being byte pipes | Orphan blocks and a garbage collector | Bandwidth through the service were free |
+| Content-defined chunking | Delta transfer without server-side diffing | Client CPU and disk reads to hash | Files were small or rarely edited |
+| Journal and cursor | Sync cost scales with changes, not files | A full-sync fallback that must be maintained | Users had few files |
+| Conflicted copies | No byte is ever lost | Users occasionally see two files | Content had a real merge function |
+| Shard by namespace | Cross-shard transactions are rare by construction | Cross-namespace moves are explicitly non-atomic | Files moved between namespaces constantly |
+| Conservative garbage collection | Data loss is nearly impossible | Storage leaks and must be monitored | Storage were the dominant cost |
+| Server-side encryption | Deduplication, previews, search remain possible | The service can read user content | Privacy were the product |
+
+## Cost
+
+1. **Block storage at 90 PB logical**, reduced by deduplication and compression by an amount that
+   depends entirely on the corpus. Measure it; do not assume a ratio, and do not let anyone plan a
+   budget on an assumed one.
+2. **Metadata**, which is small in bytes and expensive in operations. Sixty terabytes is
+   unremarkable; twelve thousand transactional changes per second against 300 billion rows, with
+   every device polling a journal, is not.
+3. **Egress**, frequently the largest line on the bill and the least visible during design. Every
+   change propagates to every one of the user's devices, so a user with five devices multiplies
+   download volume by five.
+4. **The push channel**, priced per idle connection rather than per message.
+
+A materially cheaper design polls every few minutes instead of pushing, which removes the
+connection cost entirely and delays propagation. For a backup product that is fine. For a sync
+product people use to move a file from one machine to the machine in front of them, the delay is
+the whole experience — which is a good example of a cost saving that only makes sense once you know
+what the product is for.
+
+## What we did NOT build
+
+- **Real-time collaborative editing.** Concurrent edits to structured documents with automatic
+  merge is a different system with a different data model — operations rather than files. Bolting
+  it onto file sync produces something that does neither well.
+- **A filesystem.** Full POSIX semantics — hard links, partial writes, locking, permission bits
+  across platforms — is far harder than folder synchronisation, and users are not asking for it.
+- **Client-side end-to-end encryption.** A legitimate product, and a different one: no server-side
+  previews, no thumbnails, no search, no cross-user deduplication, and no recovery when a user
+  loses their key. It is a positioning decision, not a feature toggle.
+- **Unlimited version history.** Storing every version of every file forever is straightforward and
+  extremely expensive. A bounded window with explicit retention is the honest default.
+- **Cross-device identity merging.** Deciding that two devices belong to the same person is an
+  account problem, not a sync problem, and treating it as one keeps sync's failure modes legible.
+
+## Evidence
+
+<Claim label="fact" source="rfc9110">
+HTTP range requests allow a client to request part of a representation, which is what makes an
+interrupted transfer resumable rather than restartable.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Comparing timestamps from different machines to decide which write is later is unreliable, because
+clocks drift; version vectors detect concurrent writes without relying on time, and concurrency
+must then be resolved by an application-level policy rather than discarded silently.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Conflict-free replicated data types provide automatic merging for data structures with a defined
+merge operation. Opaque binary content has no such operation, so automatic merging is not available
+for it at any level of sophistication.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+Content-addressed immutable storage makes replication and caching straightforward, because an
+object identified by the hash of its content can never become stale and writing it twice is
+indistinguishable from writing it once.
+</Claim>
+
+<Claim label="fact" source="hpbn">
+Establishing a connection costs round trips, and long-lived connections consume server resources
+whether or not data is flowing, which is why connection count is a capacity dimension in its own
+right.
+</Claim>
+
+<Claim label="convention" source="aws-well-architected">
+Matching storage class to access pattern, and moving infrequently accessed data to cheaper classes
+with slower retrieval, is documented practice for cost optimisation. The retrieval characteristics
+are the constraint, not the price.
+</Claim>
+
+<Claim label="convention" source="dropbox-tech">
+Published engineering writing on file synchronisation describes separating file metadata from
+block storage and synchronising through a per-namespace journal that clients follow by cursor,
+rather than by comparing directory trees.
+</Claim>
+
+<Claim label="speculation">
+The user counts, file counts, chunk sizes, change rates and grace periods here are pedagogical
+choices derived from the stated requirements. They describe no particular product's internals.
+</Claim>

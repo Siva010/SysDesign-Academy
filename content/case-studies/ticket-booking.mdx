@@ -1,0 +1,347 @@
+---
+id: ticket-booking
+title: Ticket Booking
+ask: Design a system for selling tickets to events. Seats are limited and popular events sell out in seconds.
+difficulty: advanced
+minutes: 50
+signatures: [inventory-contention, hot-key, exactly-once-effect]
+concepts: [lost-update, optimistic-concurrency, locking, key-splitting, hot-partition, idempotency-key, saga, load-shedding, admission-control, back-of-envelope, linearizability, queue, rate-limiting, graceful-degradation]
+patterns: [idempotency-key, saga, key-splitting, cache-aside]
+prerequisites: [two-requests-at-once, what-the-database-promises]
+sources: [ddia, postgres-docs, stripe-eng, aws-load-shedding]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a system for selling tickets to events. Seats are limited and popular events
+> sell out in seconds.&rdquo;
+
+This is a **correctness** problem wearing a scale costume. The traffic is large but not
+extraordinary. What makes it hard is that the resource is finite, contention is concentrated on
+one event, and both failure modes are expensive: selling the same seat twice is a refund and a
+complaint, and failing to sell seats that exist is lost revenue.
+
+Everything interesting happens in a two-minute window when 500,000 people want 20,000 seats.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Assigned seats or general admission? | Assigned seats means per-seat contention and a seat map. General admission is a single counter, which is a much easier problem. |
+| Is overselling ever acceptable? | Airlines oversell deliberately. Concerts do not. This decides whether you need strict correctness or can reconcile later. |
+| How long may a user hold a seat while paying? | Determines the hold mechanism and the expiry policy. |
+| Is payment synchronous with booking? | If payment is a third party, this becomes a distributed workflow with an unknown-outcome problem. |
+| How concentrated is demand? | 20,000 seats sold over a month is trivial. 20,000 sold in 90 seconds is the actual problem. |
+| Is a queue acceptable to users? | A virtual waiting room changes the entire load profile and is a product decision. |
+
+**Assumed answers:** assigned seats, no overselling, 10-minute hold while paying, third-party
+payment, extremely concentrated demand, and a waiting room is acceptable.
+
+## Requirements
+
+**Functional:** browse events; view seat availability; hold specific seats; pay; receive
+confirmation; release holds that expire.
+
+**Non-functional**
+
+- **Never sell the same seat twice.** This is the hard invariant.
+- Availability display may be slightly stale; a hold must be exact.
+- The purchase path must remain correct under extreme concentration.
+- A payment timeout must never produce a double charge or a lost seat.
+
+**Out of scope:** pricing, recommendations, resale, physical delivery.
+
+## Estimate
+
+- Event on sale: **500,000 concurrent users**, 20,000 seats.
+- Browse traffic: a few hundred thousand requests per second at the opening moment, almost all
+  of it reads of the same seat map.
+- Purchase attempts: essentially all 500,000 users within the first minute, so roughly
+  **8,000 attempts per second**, concentrated on **one event**.
+- Successful purchases: 20,000 total, then zero forever.
+
+<Claim label="inference">
+The write rate is modest in absolute terms. What makes it hard is concentration: every one of
+those 8,000 attempts per second targets rows belonging to a single event, so no partitioning
+scheme spreads them. This is a hot-partition problem with a correctness requirement attached.
+</Claim>
+
+Storage is trivial — a few hundred thousand events and a few tens of millions of seats. Nothing
+here is a storage problem.
+
+## Data model
+
+| Entity | Partition key | Notes |
+|---|---|---|
+| Event | event id | Small, heavily read, perfectly cacheable |
+| Seat | event id | Contention concentrates here by construction |
+| Hold | seat id | Short-lived, with an expiry |
+| Order | order id | Immutable once complete |
+
+Seat state is a small state machine, and being explicit about it is most of the design:
+
+    available → held (expires) → sold
+                  ↓ expiry
+               available
+
+Partitioning by event id keeps a single event's seats together, which makes the seat map a
+single-partition read. It also guarantees a hot partition during a sale, which we address below
+rather than by choosing a different key — because any key that spreads seats makes the seat map
+a scatter-gather on the most frequent read.
+
+## Design v1
+
+<Arch
+  caption="Hold, then pay, then confirm. The hold is what makes payment safe."
+  columns={[
+    { title: 'User', nodes: [{ id: 'user', label: 'Buyer' }] },
+    { title: 'Entry', nodes: [{ id: 'room', label: 'Waiting room', note: 'admission control', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'api', label: 'Booking service' }] },
+    { title: 'State', nodes: [{ id: 'seats', label: 'Seats', note: 'conditional update' }, { id: 'orders', label: 'Orders' }] },
+    { title: 'External', nodes: [{ id: 'pay', label: 'Payment provider' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'room' },
+    { from: 'room', to: 'api', label: 'admitted' },
+    { from: 'api', to: 'seats', label: 'hold' },
+    { from: 'api', to: 'pay', label: 'idempotency key' },
+    { from: 'api', to: 'orders', label: 'confirm' },
+  ]}
+  stages={[
+    {
+      label: 'Naive',
+      show: ['user', 'api', 'seats', 'pay'],
+      because:
+        'Check availability, take payment, mark sold. It works with one buyer and oversells with two, because the check and the write are separate.',
+    },
+    {
+      label: 'Hold then pay',
+      show: ['user', 'api', 'seats', 'orders', 'pay'],
+      because:
+        'The hold claims the seat atomically before payment starts, so payment latency and third-party failures cannot cause overselling. The hold expires so an abandoned checkout releases the seat.',
+    },
+    {
+      label: 'Admission control',
+      show: ['user', 'room', 'api', 'seats', 'orders', 'pay'],
+      because:
+        'With 500,000 users for 20,000 seats, 96% of traffic cannot succeed. Admitting a manageable number at a time protects the correctness-critical path and gives users a fair, comprehensible experience.',
+    },
+  ]}
+/>
+
+The claim must be a single atomic operation:
+
+    UPDATE seats SET status = 'held', hold_id = ?, hold_expires = ?
+    WHERE seat_id = ? AND status = 'available'
+
+Then **check the affected row count**. Zero means someone else took it. A `SELECT` followed by an
+`UPDATE` is the classic lost-update race and will oversell under this load.
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Two people click the same seat at the same millisecond.&rdquo;
+
+The conditional update above resolves it. One updates a row; the other updates none and is told
+the seat is gone.
+
+What must not happen: an application-level check, a distributed lock, or a cache consulted for
+availability. The database row is the only thing that sees both requests, so it must adjudicate.
+
+### Round 2 — &ldquo;The user holds a seat and abandons checkout.&rdquo;
+
+Holds expire. Two ways to implement expiry, and the difference matters:
+
+- **A sweeper job** that periodically releases expired holds. Simple, and there is a window where
+  a seat is expired but still shows as held.
+- **Expiry evaluated on read.** A hold whose expiry has passed is treated as available by the
+  claim query itself:
+
+      WHERE seat_id = ? AND (status = 'available'
+                             OR (status = 'held' AND hold_expires < now()))
+
+The second is better: no window, no dependency on a job running. The sweeper still exists, but
+only to keep the data tidy rather than to enforce correctness.
+
+### Round 3 — &ldquo;8,000 purchase attempts per second, all for one event.&rdquo;
+
+Assigned seating helps more than it first appears: contention is per **seat**, not per event. Two
+users clicking different seats do not contend at all.
+
+Contention concentrates when everyone clicks the *same* seat — which happens, because the seat map
+highlights the best available seats and everyone wants those.
+
+Mitigations:
+
+1. **Admission control.** Admit a few thousand users at a time. This is the largest lever: it
+   converts an unservable 500,000 into a sequence of servable batches.
+2. **Randomise suggested seats.** If the interface offers "best available", give different users
+   different suggestions so their claims spread across rows.
+3. **Cache the seat map aggressively** and be explicit that it is stale. The map is a hint; the
+   claim is the truth. A user occasionally clicking a seat that has just gone is acceptable and
+   unavoidable.
+
+For **general admission**, where there is one counter rather than seats, the row becomes the
+bottleneck. There, split the pool into K buckets — 20,000 seats as 20 buckets of 1,000 — so
+claims spread across 20 rows.
+
+### Round 4 — &ldquo;The payment provider times out.&rdquo;
+
+This is the exactly-once problem, and the answer is the same as in any payment system:
+
+- The seat is **already held**, so it cannot be sold to anyone else while this resolves. The hold
+  is what makes the timeout survivable.
+- The payment attempt is recorded with an idempotency key **before** calling the provider.
+- The key is passed to the provider, so a retry returns the original result rather than charging
+  again.
+- A timeout is an **indeterminate** outcome, not a failure. The user sees "processing", never
+  "failed" — telling them it failed invites a second attempt and a second charge.
+- A reconciler queries the provider for attempts that never reached a terminal state.
+
+The hold must outlive the payment resolution, or the seat can be released while a charge is still
+in flight — which produces the worst outcome available: a charge with no seat.
+
+### Round 5 — &ldquo;A user pays and the confirmation write fails.&rdquo;
+
+Money moved; the order does not exist. The seat is held by an expiring hold that will release.
+
+This is why the payment attempt row is written first: the record of intent survives, and a
+reconciler can find attempts that were charged but not confirmed. It resolves them by completing
+the order, and the hold must be extended while it does so.
+
+Note the ordering rule appearing again: **the durable record must exist before the irreversible
+action.**
+
+### Round 6 — &ldquo;500,000 people arrive in the same second.&rdquo;
+
+No amount of capacity makes 500,000 concurrent purchases of 20,000 seats work, and 96% of that
+traffic cannot succeed by arithmetic.
+
+**The waiting room** is the honest answer:
+
+- Users are admitted to the purchase path in batches.
+- Everyone else sees a position and an estimate.
+- The correctness-critical path only ever sees a load it can serve properly.
+
+This is admission control presented as a product feature, and it is better for users than a site
+that fails unpredictably. It also fails *fairly*: an explicit queue is more defensible than a
+race won by whoever has the fastest connection.
+
+**New cost:** the waiting room must itself withstand the full 500,000, which means it must be
+extremely cheap per user — a token and a position, served from the edge, with no database work.
+
+### Round 7 — &ldquo;The seat map is stale and users click unavailable seats.&rdquo;
+
+Expected and acceptable. Availability display is eventually consistent; the claim is linearizable.
+The interface must handle a failed claim gracefully — reload the map, suggest alternatives — rather
+than treating it as an error.
+
+Trying to make the display exact would put every seat map read on the correctness-critical path,
+which is exactly backwards: reads outnumber claims by orders of magnitude.
+
+### Round 8 — &ldquo;A bot is buying everything.&rdquo;
+
+Rate limit per identity and require authentication before entering the waiting room. Limit seats
+per account per event. Use the waiting room to enforce fairness — a bot that can send 10,000
+requests per second gains nothing if admission is by queue position rather than by arrival speed.
+
+This is worth stating: **admission control is an anti-abuse mechanism as much as a capacity one.**
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Overselling',
+      symptom: 'Two orders for one seat. Discovered by a customer at the venue.',
+      cause: 'A check-then-write race: availability checked, then the seat marked sold in a separate statement.',
+      mitigation: 'A single conditional update with the condition inside the write, and always check the affected row count.',
+    },
+    {
+      what: 'Seats held and never released',
+      symptom: 'An event shows sold out with unsold seats; revenue is lost.',
+      cause: 'A hold expiry mechanism that depends on a job which stopped running.',
+      mitigation: 'Evaluate expiry in the claim query itself, so correctness never depends on a background job.',
+    },
+    {
+      what: 'Charge with no seat',
+      symptom: 'A customer is charged and has no booking. The most damaging outcome available.',
+      cause: 'The hold expired while payment was in flight, or the confirmation write failed with no reconciliation.',
+      mitigation: 'Extend the hold for the duration of payment resolution; record the payment attempt before calling the provider; reconcile indeterminate attempts.',
+    },
+    {
+      what: 'Hot row on general admission',
+      symptom: 'Throughput on the purchase path caps regardless of how many servers run.',
+      cause: 'Every claim contends on one counter row.',
+      mitigation: 'Split the pool into K buckets, with a defined fallback order when a bucket is empty.',
+    },
+    {
+      what: 'Waiting room collapses',
+      symptom: 'The queue itself fails under the load it was built to absorb.',
+      cause: 'The waiting room does database work per user.',
+      mitigation: 'It must be extremely cheap per user — a signed token and a position, served from the edge with no origin work.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Hold then pay | Payment cannot cause overselling | Complexity, expiry handling | Payment were synchronous and instant |
+| Expiry in the claim query | Correctness independent of jobs | Slightly more complex SQL | Holds were long-lived |
+| Conditional update | Atomic, no locks held across logic | Nothing meaningful | — |
+| Admission control | Correctness path sees servable load | Users wait in a queue | Demand were not concentrated |
+| Stale seat map | Reads scale freely | Occasional failed claims | Failed claims were unacceptable to users |
+| Partition by event | Seat map is one read | A guaranteed hot partition during sales | Seat maps were rarely read |
+
+## Cost
+
+Small compared with the revenue at stake, and concentrated in bursts:
+
+1. **Waiting room capacity at the edge**, sized for the peak arrival, used for minutes per event.
+2. **Seat map caching**, cheap and high-value.
+3. **The database**, which does very little work in absolute terms — a few tens of thousands of
+   conditional updates per event.
+
+<Claim label="recommendation">
+This is a system where correctness spending is obviously justified and capacity spending is not.
+The failure that costs money is selling a seat twice, not being slightly slower.
+</Claim>
+
+## What we did NOT build
+
+- **A distributed lock service.** The database row adjudicates correctly and atomically. A
+  distributed lock would be a heavier, less reliable version of a unique constraint.
+- **Strong consistency on the seat map.** Reads outnumber claims by orders of magnitude, and the
+  claim is the only operation that must be exact.
+- **A sharded database.** Tens of thousands of writes per event is not a sharding problem.
+  Contention is the difficulty, and sharding does not reduce contention on the same rows.
+- **Distributed transactions with the payment provider.** They cannot join your transaction. The
+  hold plus an idempotency key plus reconciliation is the available answer.
+- **Eventual consistency on purchases.** Reconciling a double sale after the fact means telling a
+  customer their ticket is void, which is not a recoverable experience.
+
+## Evidence
+
+<Claim label="fact" source="postgres-docs">
+A conditional UPDATE evaluates its predicate and performs the write as a single atomic operation,
+so a check-then-write race cannot occur between them. The affected row count reports whether the
+condition held.
+</Claim>
+
+<Claim label="convention" source="stripe-eng">
+Client-supplied idempotency keys are established practice for payment operations, so that a
+retried request returns the original outcome rather than charging again.
+</Claim>
+
+<Claim label="convention" source="aws-load-shedding">
+Admission control during overload — accepting only what can be served and rejecting the rest
+early and cheaply — is standard practice, and it maximises completed useful work rather than
+accepted requests.
+</Claim>
+
+<Claim label="speculation">
+The hold durations, bucket counts and admission batch sizes here are pedagogical choices derived
+from the stated requirements, not descriptions of any commercial ticketing system.
+</Claim>

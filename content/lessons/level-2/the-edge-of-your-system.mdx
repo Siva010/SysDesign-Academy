@@ -1,0 +1,421 @@
+---
+id: the-edge-of-your-system
+title: The Edge of Your System
+level: 2
+module: l2-more-machines
+order: 2
+summary: Once there are many machines, something stands in front of them. What you put in that layer, and what you keep out, decides how the system fails.
+difficulty: core
+minutes: 25
+prerequisites: [many-machines-one-service, what-sits-in-between]
+concepts: [cdn, api-gateway, sticky-sessions]
+unlocks: [cache-invalidation, anycast, large-object, rate-limiting, tenant-isolation, ddos]
+patterns: [read-through-edge, cache-aside]
+failures: [cold-cache-collapse]
+sources: [rfc9111, rfc9110, hpbn, cloudflare-blog, aws-well-architected, netflix-tech]
+status: reviewed
+---
+
+## The problem
+
+The team adds a second application server, then a fifth, then a twentieth. Something has to stand
+in front of them, so a front layer appears. It is sensible and small.
+
+Then authentication moves there, because every service needs it. Then request validation, because
+it should happen once. Then a rewrite rule for a legacy client, then a special case for one
+partner, then a rate limit with three exceptions.
+
+Eighteen months later, shipping a change to one service requires a change to the front layer, and
+the front layer is a single configuration that every team edits and nobody tests. It is deployed
+by hand during incidents. And when it breaks, every service is down at once, including the ones
+that have not changed in a year.
+
+Separately: a user complains that their shopping cart empties at random. It empties whenever their
+next request lands on a different machine from the last one — so the team pins each user to one
+machine. The carts stop emptying. Now deploys log everyone out, one machine runs at 90% while the
+others idle, and adding capacity does not relieve it.
+
+Both stories are the same mistake. Something was pushed into the layer where it is hardest to fix.
+
+## Intuition
+
+The front layer is the only place every request goes. That makes it enormously valuable and
+enormously dangerous, for the same reason.
+
+Valuable, because work done there happens once instead of in every service, and work *avoided*
+there is avoided for the whole system. The cheapest request is the one that never arrives.
+
+Dangerous, because it is a shared fate. Everything that lives there fails for everyone at the same
+moment, changes to it are changes to every product simultaneously, and it is the layer with the
+fewest tests and the most manual editing.
+
+A useful test for whether something belongs at the edge: **is it the same for every request, and
+is it cheaper the earlier it happens?**
+
+- Terminating TLS: same for everyone, cheaper early. Yes.
+- Serving a public image: same for everyone, and if it is served early it never touches you at
+  all. Yes, emphatically.
+- Rejecting a request with no credentials: same for everyone, and rejecting it early saves the
+  whole chain. Yes.
+- Deciding whether *this* user may see *that* order: not the same for every request, and it needs
+  domain knowledge the edge should not have. No.
+
+The second question — pinning users to machines — is the same test applied to state. If a machine
+holds something a user needs, you have made a routing decision into a correctness requirement, and
+routing decisions are the thing you least control.
+
+## Concretely
+
+<Example title="What the edge absorbs, in numbers">
+
+A product page issues 1 request for HTML, 40 for static assets, and 3 for personalised data.
+
+**Nothing at the edge.** 44 requests reach your servers. Your capacity is sized for 44 times your
+page rate, and 40 of those are for bytes that are identical for every user on earth.
+
+**Static assets at the edge, cached for a year with versioned filenames.** 4 requests reach you.
+You have removed 91% of your traffic by changing no application code, and the 40 that vanished
+were served from a machine near the user, so the page also got faster.
+
+**Add caching of the HTML shell for 60 seconds.** Roughly 2 requests reach you per page view during
+a traffic spike, and the spike no longer scales with popularity.
+
+Then consider the day something goes wrong. A flood of traffic aimed at a static asset is absorbed
+at the edge and never reaches your origin. The same flood aimed at the personalised endpoint
+arrives in full — because a personalised response cannot be cached, and that is not a
+configuration you can change.
+
+</Example>
+
+## Formal explanation
+
+A <C id="cdn" /> is a set of caches near users. Its two jobs are latency — distance costs round
+trips, and no code change beats being closer — and absorption, since a request answered at the
+edge never consumes origin capacity.
+
+The mechanics matter more than the idea:
+
+- **Cacheability is declared, not inferred.** Response directives say what may be stored, by whom,
+  and for how long (<Cite id="rfc9111" />). A missing header is a decision, usually the wrong one.
+- **The cache key is not just the URL.** Anything the response varies by — encoding, language,
+  device class — must be declared, or one user's response is served to another. Getting this wrong
+  is the mechanism behind cache poisoning of the most embarrassing kind.
+- **Invalidation is the hard half.** Purging is slow, eventually consistent across many locations,
+  and easy to get wrong. **Versioned URLs avoid it entirely**: if the filename contains a content
+  hash, the new version is a different object and the old one simply expires. Immutable content
+  with a long lifetime is strictly easier than mutable content with invalidation, and choosing it
+  is a design decision available at the start and expensive to retrofit.
+
+An <C id="api-gateway" /> is a reverse proxy that has taken on cross-cutting responsibilities:
+authentication, rate limiting, routing, protocol translation, request and response shaping. The
+argument for it is real — doing authentication in forty services means forty implementations and
+forty chances to differ.
+
+The counter-pressure is just as real, and it is where judgment lives. Everything placed there is
+shared fate and shared release cadence. A gateway that contains per-endpoint business rules has
+become a monolith that every team must modify and nobody owns, with the additional property that
+its failure is total. The discipline is to keep only what is genuinely uniform: *is this request
+authenticated* belongs there; *may this user see this order* does not.
+
+<C id="sticky-sessions" /> pin a user to one server so that the server's local memory stays useful.
+They buy something genuine — a warm local cache, an in-memory session, a held connection that
+cannot move — and they cost four things that all arrive together:
+
+- **Load is balanced at connection time and never afterwards.** A server that has been up longest
+  has the most users, and nothing corrects it.
+- **A deploy destroys state.** Whatever was in local memory is gone, for everyone on that machine
+  at once.
+- **A degraded machine keeps its users.** They stay slow while other machines are idle, and the
+  aggregate metrics look fine.
+- **Scaling out does not relieve the hot machine**, because existing users do not move to the new
+  one.
+
+The rule that follows: **stickiness may be an optimisation, never a correctness requirement.** If
+the system breaks when a user's request lands elsewhere, the state is in the wrong place, and the
+fix is to move it — to a shared store, to the client, or into the request itself — rather than to
+constrain routing forever.
+
+## Architecture
+
+<Arch
+  caption="Each layer answers what it can and forwards the rest. The value is in what never reaches the next box."
+  columns={[
+    { title: 'Users', nodes: [{ id: 'user', label: 'Clients' }] },
+    { title: 'Edge', nodes: [{ id: 'cdn', label: 'CDN', note: 'static, cacheable', tone: 'accent' }] },
+    { title: 'Entry', nodes: [{ id: 'gw', label: 'Gateway', note: 'TLS, authn, limits' }] },
+    { title: 'Services', nodes: [{ id: 'app', label: 'App instances', note: 'stateless' }] },
+    { title: 'State', nodes: [{ id: 'sess', label: 'Session store' }, { id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'cdn' },
+    { from: 'cdn', to: 'gw', label: 'miss only' },
+    { from: 'gw', to: 'app' },
+    { from: 'app', to: 'sess' },
+    { from: 'app', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'Balance and go',
+      show: ['user', 'gw', 'app', 'db'],
+      because:
+        'A load balancer in front of interchangeable servers. Correct, and every byte of every image is served by your own machines from wherever they happen to be.',
+    },
+    {
+      label: 'Move state off the machine',
+      show: ['user', 'gw', 'app', 'sess', 'db'],
+      because:
+        'Session data goes to a shared store, so any instance can serve any request. Stickiness becomes an optimisation you may keep or drop rather than a rule the system depends on, and deploys stop logging people out.',
+    },
+    {
+      label: 'Answer before it arrives',
+      show: ['user', 'cdn', 'gw', 'app', 'sess', 'db'],
+      because:
+        'Public bytes are served near the user and never reach the origin. This is simultaneously the largest latency win, the largest capacity win, and the first line of defence against a traffic flood — one mechanism, three benefits.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'A few servers',
+      behaviour: 'A load balancer distributes requests. No edge, no gateway, and both would be premature.',
+      firstToBreak: 'Nothing. The first real pressure is usually static asset bandwidth or a certificate to manage.',
+    },
+    {
+      scale: 'One product, many instances',
+      behaviour:
+        'Static assets move to an edge cache, removing most requests. TLS and basic rate limiting consolidate into one entry layer.',
+      firstToBreak:
+        'Any assumption that a user returns to the same machine. Sessions in local memory fail here, and stickiness is the tempting fix.',
+    },
+    {
+      scale: 'Many services, many teams',
+      behaviour:
+        'The entry layer routes across services and accumulates cross-cutting concerns. Configuration becomes substantial.',
+      firstToBreak:
+        'The gateway configuration, which is now production logic edited by everyone and tested by no one. A bad rule affects every product simultaneously.',
+    },
+    {
+      scale: 'Global, multi-region',
+      behaviour:
+        'Requests are routed to the nearest healthy region, and most cacheable traffic never crosses an ocean.',
+      firstToBreak:
+        'Cache correctness. Personalised or region-varying responses served from a shared cache key become a data leak rather than a performance bug.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'One user response served to another',
+      symptom: "A logged-in user sees someone else's name or data on a cached page.",
+      cause: 'A personalised response was cacheable, or the cache key omitted a header the response varied by.',
+      mitigation: 'Default to no-store for anything authenticated, declare every dimension the response varies by, and test the cache key rather than assuming it.',
+    },
+    {
+      what: 'Gateway becomes a shared monolith',
+      symptom: 'Every team is blocked on one configuration, and one mistake takes down unrelated services.',
+      cause: 'Per-service logic accumulated in the one place every request passes through.',
+      mitigation: 'Keep only what is uniform across all traffic. Give the gateway configuration the same review, testing and staged rollout as application code, because that is what it is.',
+    },
+    {
+      what: 'Deploy logs everyone out',
+      symptom: 'Users lose sessions or carts on every release.',
+      cause: 'Session state lived in instance memory and stickiness made that invisible until the instance restarted.',
+      mitigation: 'Move session state to a shared store or into a signed token. Stickiness may then remain as a cache optimisation with no correctness role.',
+    },
+    {
+      what: 'Persistent load imbalance',
+      symptom: 'One instance sits at 90% while others idle, and adding instances changes nothing.',
+      cause: 'Sticky routing assigns users once and never reassigns.',
+      mitigation: 'Balance by active connections rather than round-robin, expire affinity deliberately, and verify that dropping stickiness degrades performance rather than breaking correctness.',
+    },
+    {
+      what: 'Origin overwhelmed on cache expiry',
+      symptom: 'The origin collapses at a regular interval, often on the hour.',
+      cause: 'Many edge entries expire simultaneously and every location fetches at once.',
+      mitigation: 'Jitter expiry times, coalesce concurrent misses into one origin fetch, and serve stale content while revalidating in the background.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Put cross-cutting concerns in a gateway rather than in each service"
+  options={[
+    'Each service handles its own authentication, limits and routing',
+    'A shared gateway handles them once for everyone',
+    'A shared library each service embeds, with no runtime hop',
+    'A sidecar per service, so policy is central and failure is not shared',
+  ]}
+  why="Concerns that are genuinely identical for every request should be implemented once. Forty implementations of authentication produce forty subtly different behaviours, and the differences are discovered by attackers rather than by tests."
+  gain="One implementation of authentication, rate limiting and TLS. A single place to apply an emergency block. Services shed work they should never have had, and a new service inherits the protections for free."
+  sacrifice="Shared fate: the gateway's failure is everyone's outage. Shared release cadence: its configuration becomes a queue. And a strong gravitational pull for logic that does not belong there, which is the failure that actually happens."
+  failureModes={[
+    'Total outage from one bad configuration change',
+    'Accumulation of per-service special cases until nobody understands the whole',
+    'Version skew, where the gateway assumes a request shape a service no longer produces',
+  ]}
+  operationalBurden="Moderate to high. It must be redundant, staged, and reviewed like code — while in practice being edited fastest during incidents, which is when mistakes are most likely and most damaging."
+  cost="Small in infrastructure. Substantial in coordination, because it is a shared resource with many claimants and usually one owner."
+  whenNot="When the concern is not actually uniform. Authorisation — whether this user may see this specific object — requires domain knowledge and belongs in the service that owns the data; putting it in the gateway couples the gateway to every domain model. A shared library gives you one implementation with no shared runtime failure, and is the better answer when all services share a language. And with a handful of services run by one team, a gateway is a tier to operate in exchange for consolidation you do not yet need."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc9111">
+HTTP caching is governed by explicit directives on responses that state whether a response may be
+stored, by shared caches or only private ones, and for how long it may be considered fresh. A
+cache may also be permitted to serve a stale response while revalidating.
+</Claim>
+
+<Claim label="fact" source="rfc9110">
+A response may vary by request headers, and the headers it varies by must be declared so that
+caches key correctly. Failing to declare them causes a cache to serve a response prepared for a
+different request.
+</Claim>
+
+<Claim label="convention" source="hpbn">
+Serving content from a location close to the user reduces the round trips that dominate perceived
+latency over long distances, which is why edge delivery improves page performance independently of
+any bandwidth saving.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Published engineering writing on edge networks describes absorbing volumetric attack traffic
+before it reaches an origin as a primary function of the edge tier, which makes cacheability a
+availability property as well as a performance one.
+</Claim>
+
+<Claim label="recommendation" source="aws-well-architected">
+Offloading static content to a content delivery network and keeping application tiers stateless
+are recommended practices, on the grounds that stateless tiers can be replaced, scaled and
+deployed without coordinating with the requests in flight.
+</Claim>
+
+<Claim label="convention" source="netflix-tech">
+Public engineering writing on large streaming platforms describes placing caching infrastructure
+close to users as a deliberate architectural choice driven by both delivery cost and origin
+capacity, rather than as a latency optimisation alone.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know what belongs in a shared layer and what does not. Many candidates draw a gateway; fewer can say what they would refuse to put in it, which is the more revealing question."
+  depth="Be able to state a caching policy for each response type in your design and justify it. Know that stickiness is an optimisation and never a correctness mechanism, and be able to say where session state lives instead."
+  followUps={[
+    'Which responses in your design are cacheable, for how long, and keyed on what?',
+    'Where does authorisation happen — the gateway or the service? Why?',
+    'What happens to sessions when you deploy?',
+    'A flood of traffic arrives. Which requests does it reach, and which does it not?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Adding a CDN and expecting it to help without a caching policy.',
+      why: 'A CDN with no cacheable responses is an extra hop that adds latency. Cacheability is declared by the origin, so a default configuration that marks everything private means the edge forwards everything.',
+      instead:
+        'Classify responses: immutable assets get a long lifetime and versioned URLs; shared pages get a short lifetime with revalidation; authenticated responses are not stored. State the key for each.',
+    },
+    {
+      mistake: 'Using sticky sessions to make local state work.',
+      why: 'It converts a routing preference into a correctness dependency. Deploys, autoscaling, instance failures and imbalance all become user-visible, and none of them can be fixed without undoing the stickiness.',
+      instead:
+        'Put session state in a shared store or a signed token, then keep stickiness only if it improves cache hit rates. The test is whether removing it degrades performance or breaks behaviour.',
+    },
+    {
+      mistake: 'Putting authorisation in the gateway.',
+      why: 'Deciding whether a user may see a specific object requires knowing what the object is, which means the gateway now depends on every service data model. It also centralises the highest-consequence logic in the layer with the least testing.',
+      instead:
+        'Authenticate at the edge — establish who the caller is, once. Authorise in the service that owns the data, where the question can actually be answered.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['sticky-sessions', 'statelessness']}
+  prompt="Carts empty when a user's request lands on a different server. Two fixes are proposed: sticky sessions, or a shared session store. What is the difference that matters?"
+  options={[
+    {
+      id: 'a',
+      text: 'Stickiness makes routing a correctness requirement; a shared store leaves the tier stateless',
+      implies: 'You are distinguishing a workaround from a fix.',
+      why: 'Both make the symptom disappear. But stickiness means the system is only correct while routing cooperates — so deploys, instance failures, autoscaling and rebalancing all become user-visible faults, and none of them can be resolved without giving up the stickiness. The shared store removes the dependency, after which stickiness is optional and can be kept purely for cache warmth.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Stickiness is faster because the session is in local memory',
+      implies: 'You are comparing them on latency.',
+      why: 'True and largely irrelevant at this scale: a session lookup from a shared cache is well under a millisecond, against a request budget of hundreds. Choosing the option that constrains your routing forever to save a fraction of a millisecond is a bad trade, and it is worth being able to say so with the numbers.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A shared store adds a dependency that can fail, so stickiness is safer',
+      implies: 'You are counting dependencies rather than failure modes.',
+      why: 'The shared store is a real dependency and needs redundancy. But stickiness does not remove the failure mode, it relocates it: the session now depends on one specific instance staying alive and staying reachable, which is a far less reliable component than a replicated store, and its failure cannot be repaired by retrying.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer notes the third option — put the session in a signed token held by the client — which removes the server-side store entirely, at the cost of not being able to revoke it before expiry and of carrying its bytes on every request. That trade is the same one that governs every stateless-versus-stateful choice, and naming it shows the pattern rather than the instance."
+/>
+
+<Check
+  concepts={['cdn', 'cache-invalidation']}
+  prompt="You deploy new CSS and users see the old styling for hours. What should have been designed differently?"
+  options={[
+    {
+      id: 'a',
+      text: 'The lifetime was too long. Shorten it so updates propagate faster.',
+      implies: 'You are tuning the freshness dial.',
+      why: 'It works and it trades away the reason for caching in the first place. A short lifetime means constant revalidation against the origin, so you have made every deploy safe by making every day more expensive. The dial has two bad ends and this is one of them.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Asset filenames should contain a content hash, so a new version is a new URL and invalidation never happens',
+      implies: 'You are removing the need to invalidate rather than doing it faster.',
+      why: 'A new build produces a different filename, which is a different object at the edge with no cached copy — the new asset is fetched because it has never been seen, not because anything expired. The old object is never invalidated; it simply stops being referenced. This lets you cache for a year and still deploy instantly, which no lifetime setting can do.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Purge the cached asset at every deploy',
+      implies: 'You are treating invalidation as the mechanism.',
+      why: 'Purging works and is the thing you fall back on. It is also slow, eventually consistent across many locations, one more step that can fail during a release, and it leaves a window where some users have the new HTML and the old stylesheet — which is worse than either version alone.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates the two kinds of content in the response: the HTML shell is mutable and gets a short lifetime with revalidation, while the assets it references are immutable and get a year. The mutable document names the immutable resources, so one cheap revalidation of the small thing correctly invalidates all the large things — which is the general form of the pattern, not a detail about stylesheets."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'HTTP caching: freshness, revalidation, and serving stale', sourceId: 'rfc9111' },
+    { label: 'Varying responses and cache keys', sourceId: 'rfc9110' },
+    { label: 'Why proximity dominates perceived latency', sourceId: 'hpbn' },
+    { label: 'The edge as an absorption layer, not only a cache', sourceId: 'cloudflare-blog' },
+    { label: 'Next: when a small fraction of traffic is most of the traffic', href: '/lessons/when-load-is-not-even' },
+  ]}
+/>

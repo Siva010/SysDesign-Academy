@@ -1,0 +1,412 @@
+---
+id: how-a-database-stores-things
+title: How a Database Actually Stores Things
+level: 3
+module: l3-engines
+order: 1
+summary: B-trees update in place and LSM trees append then merge. That single difference explains why one database is good at reads and another at writes.
+difficulty: core
+minutes: 28
+prerequisites: [index, wal]
+concepts: [btree, lsm-tree, sstable, compaction, write-amplification, read-amplification, bloom-filter]
+unlocks: [columnar-storage, time-series-storage, tail-latency]
+sources: [database-internals, ddia, postgres-docs, cassandra-docs, bigtable]
+status: reviewed
+---
+
+## The problem
+
+Two databases. Same hardware, same data, same schema.
+
+On database A, writes sustain 8,000 per second and reads are consistently 0.4 ms. On database
+B, writes sustain 60,000 per second, reads average 0.9 ms, and every few hours the p99 read
+latency jumps to 40 ms for several minutes.
+
+Neither is broken. Neither is misconfigured. They made different choices about one thing: what
+to do when you change a byte that is already on disk.
+
+## Intuition
+
+You keep a sorted address book.
+
+**Update in place.** When someone moves, you find their entry and rewrite it. The book stays
+perfectly sorted, so lookups are always fast. But rewriting means finding the page, erasing,
+writing — and if the entry grows, shuffling everything after it. Changes are slow and land in
+scattered places.
+
+**Append and merge later.** You never rewrite. New information goes on a fresh page at the
+back: &ldquo;Alex moved to 12 Oak Street&rdquo;. Writing is trivial — always the same place,
+always sequential. But now a lookup must check the back pages before trusting the main book,
+and the more back pages accumulate, the slower lookups get. So periodically you sit down and
+merge the loose pages into the book properly. That merge is expensive, and it happens while
+people are still asking you for addresses.
+
+The first is a <C id="btree">B-tree</C>. The second is an
+<C id="lsm-tree">LSM tree</C>. Everything else in this lesson is consequences.
+
+## Concretely
+
+<Example title="What one row update costs, in each design">
+
+**B-tree.** Locate the leaf page (a few reads, usually cached), modify it in memory, write the
+change to the WAL so it is durable, and eventually write the page back to its home location.
+The page write is at a fixed position determined by the key — which means it is a random write.
+If any index covers the changed column, repeat for each index.
+
+**LSM tree.** Append to the WAL, insert into an in-memory sorted structure, and return. That
+is the whole write. Later, when the in-memory structure is full, flush it to disk as an
+immutable sorted file. Later still, merge those files together.
+
+The LSM write path touches disk sequentially and never seeks. That is why write throughput can
+be an order of magnitude higher.
+
+The cost arrives on the read path and in the background. A read may have to check the in-memory
+structure, then several on-disk files, because the key could be in any of them. And compaction
+— the merging — competes with your live traffic for disk bandwidth and CPU, which is what
+produces those periodic p99 spikes.
+
+</Example>
+
+## Formal explanation
+
+**B-tree.** A balanced tree of fixed-size pages, sorted by key. Lookups descend from the root:
+a handful of page reads, with the upper levels almost always cached. Depth grows extremely
+slowly with data size, so lookup cost is nearly constant. Range scans walk the leaves in order.
+Writes modify pages in place, which produces random I/O and requires the
+<C id="wal">write-ahead log</C> for crash safety.
+
+**LSM tree.** Writes accumulate in a sorted in-memory structure. When it fills, it is flushed
+to disk as an immutable <C id="sstable" /> — a sorted file that is never modified again.
+Because files are immutable and sorted, merging them is a linear scan.
+<C id="compaction" /> does that merging, discarding superseded values and reclaiming space.
+
+Three amplification factors describe the trade:
+
+- **<C id="write-amplification" />**: one logical write becomes several physical writes.
+  B-trees amplify through page writes and index maintenance; LSM trees amplify through repeated
+  rewriting during compaction.
+- **<C id="read-amplification" />**: one logical read touches several structures. Minimal in a
+  B-tree, real in an LSM tree, mitigated by <C id="bloom-filter">Bloom filters</C> that let the
+  engine skip files that definitely do not contain the key.
+- **Space amplification**: how much more disk than the logical data. LSM trees hold superseded
+  versions until compaction removes them.
+
+<Callout kind="info" title="This is not a database-brand decision">
+Several databases offer both, and the right answer can differ per table. The question is
+always about the workload: read-heavy with strict latency, or write-heavy with tolerance for
+tail variance.
+</Callout>
+
+<Deeper title="Why compaction shows up in your p99">
+
+Compaction reads several SSTables and writes a merged one. That is a large amount of sequential
+I/O and CPU, and it happens on the same machine serving your queries.
+
+The consequences are characteristic and worth recognising in a graph:
+
+- **Periodic latency spikes** with no correlation to traffic. Reads compete with compaction for
+  disk bandwidth.
+- **A write-stall cliff.** If writes arrive faster than compaction can keep up, the number of
+  files grows, read amplification worsens, and eventually the engine throttles writes
+  deliberately to let compaction catch up. Throughput does not degrade gently here; it steps
+  down.
+- **Disk headroom is not optional.** A merge needs room for both the inputs and the output. A
+  full disk on an LSM store can be unrecoverable without adding capacity, because the operation
+  that would free space needs space to run.
+
+<Claim label="fact" source="cassandra-docs">
+Cassandra offers multiple compaction strategies, and the choice is workload-dependent:
+size-tiered favours write throughput, levelled favours read latency and space efficiency at
+the cost of more compaction I/O.
+</Claim>
+
+The general lesson generalises beyond LSM trees: **background maintenance work is part of your
+latency profile.** Vacuum in a B-tree engine, index rebuilds, garbage collection in your
+runtime — all of them show up in the tail, and all of them are invisible if you only monitor
+averages.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The same write, two paths. One seeks; one appends and pays later."
+  columns={[
+    { title: 'Write', nodes: [{ id: 'w', label: 'Write request' }] },
+    { title: 'Durability', nodes: [{ id: 'wal', label: 'WAL', note: 'sequential', tone: 'accent' }] },
+    { title: 'In memory', nodes: [{ id: 'buf', label: 'Page cache', note: 'B-tree' }, { id: 'mem', label: 'Memtable', note: 'LSM' }] },
+    { title: 'On disk', nodes: [{ id: 'pages', label: 'Tree pages', note: 'random writes' }, { id: 'sst', label: 'SSTables', note: 'immutable' }] },
+    { title: 'Background', nodes: [{ id: 'compact', label: 'Compaction', note: 'competes for I/O' }] },
+  ]}
+  edges={[
+    { from: 'w', to: 'wal' },
+    { from: 'wal', to: 'buf' },
+    { from: 'wal', to: 'mem' },
+    { from: 'buf', to: 'pages', label: 'in place' },
+    { from: 'mem', to: 'sst', label: 'flush' },
+    { from: 'sst', to: 'compact', label: 'merge' },
+  ]}
+  stages={[
+    {
+      label: 'B-tree path',
+      show: ['w', 'wal', 'buf', 'pages'],
+      because:
+        'Durability from the log, then the page is updated where it lives. Reads are one traversal, always. Writes seek.',
+    },
+    {
+      label: 'LSM path',
+      show: ['w', 'wal', 'mem', 'sst', 'compact'],
+      because:
+        'Writes only ever append. The cost is deferred to compaction, which never stops running and shares the disk with your reads.',
+    },
+    {
+      label: 'Both, side by side',
+      show: ['w', 'wal', 'buf', 'mem', 'pages', 'sst', 'compact'],
+      because:
+        'Both are durable via the same mechanism. They differ only in what happens after the log, and that difference is the whole performance profile.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Data fits in memory',
+      behaviour:
+        'Both designs are fast. Reads are memory accesses; the storage layout barely matters.',
+      firstToBreak: 'Nothing. Benchmarks at this size tell you almost nothing useful.',
+    },
+    {
+      scale: 'Working set fits, dataset does not',
+      behaviour:
+        'B-tree reads stay predictable. LSM reads depend on how many files a key might be in, so Bloom filters start earning their keep.',
+      firstToBreak: 'LSM read tail, when compaction falls behind.',
+    },
+    {
+      scale: 'Write-heavy, working set does not fit',
+      behaviour:
+        'B-tree random writes become the constraint. LSM sustains far higher ingest, at the cost of compaction load.',
+      firstToBreak:
+        'B-tree write throughput, limited by random I/O and index maintenance.',
+    },
+    {
+      scale: 'Sustained ingest above compaction throughput',
+      behaviour:
+        'File count grows, read amplification worsens, and the engine eventually throttles writes to let compaction catch up.',
+      firstToBreak:
+        'Write throughput, in a step rather than a slope. Disk space is usually the next casualty.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Compaction falls behind sustained ingest',
+      symptom:
+        'Read latency climbs steadily, file counts grow, and eventually writes are throttled by the engine itself.',
+      cause:
+        'Ingest exceeds compaction throughput, so merged output never catches up with new input.',
+      mitigation:
+        'Monitor pending compaction work and file counts as leading indicators. Provision disk bandwidth for compaction as well as for queries, and choose a compaction strategy matching the workload.',
+    },
+    {
+      what: 'Disk fills during compaction',
+      symptom:
+        'The store becomes read-only or crashes, and the operation that would reclaim space cannot run.',
+      cause:
+        'A merge needs room for both inputs and output simultaneously, so an LSM store needs substantial free headroom.',
+      mitigation:
+        'Alert on free space well above the largest expected compaction, and treat disk headroom as a hard requirement rather than a cost saving.',
+    },
+    {
+      what: 'B-tree index bloat under update-heavy load',
+      symptom:
+        'Storage grows well beyond the logical data size and scans slow down, with no growth in row count.',
+      cause:
+        'Under MVCC, updates create new row versions; dead versions must be cleaned up, and if cleanup falls behind, pages fill with dead space.',
+      mitigation:
+        'Monitor bloat and the progress of the cleanup process. A long-running transaction blocks cleanup, so it is usually the first thing to check.',
+    },
+    {
+      what: 'Benchmarking on a dataset that fits in memory',
+      symptom:
+        'A storage engine chosen on benchmark results performs quite differently in production.',
+      cause:
+        'When everything is cached, the read path differences largely disappear and the write path advantages are exaggerated.',
+      mitigation:
+        'Benchmark with a dataset several times larger than memory, and run long enough for compaction or vacuum to reach steady state.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Choose an LSM-based store for a high-ingest workload"
+  options={[
+    'B-tree engine: predictable reads, in-place updates',
+    'LSM engine: high write throughput, deferred merge cost',
+    'B-tree engine with the write path buffered by a queue and batched inserts',
+  ]}
+  why="If sustained write throughput is the binding constraint, sequential appends beat random page updates by roughly an order of magnitude, and no amount of tuning closes that gap for a B-tree."
+  gain="Much higher ingest on the same hardware. Better compression, because immutable sorted files compress well. Writes do not seek, so cheaper storage remains viable."
+  sacrifice="Read latency becomes variable rather than flat. Compaction consumes disk bandwidth and CPU continuously, and it shows up in your tail latency. You need substantial free disk headroom."
+  failureModes={[
+    'Compaction falling behind, causing read amplification and then write throttling',
+    'Disk exhaustion during a merge, which is hard to recover from',
+    'Tail latency spikes uncorrelated with traffic, which are hard to explain to stakeholders',
+  ]}
+  operationalBurden="Higher than a B-tree engine. Compaction strategy, disk headroom, and file-count monitoring are ongoing concerns rather than one-time settings."
+  cost="Often cheaper per unit of ingest, because the write pattern suits inexpensive storage and the data compresses well. The saving is partly offset by needing headroom you cannot use."
+  whenNot="When reads dominate and latency consistency matters more than ingest — a user-facing product catalogue, a permissions store — the compaction tail is a cost with no corresponding benefit. Also when the workload has heavy point updates to existing rows rather than appends, since LSM engines handle overwrite-heavy workloads less gracefully than their write throughput suggests."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="database-internals">
+B-trees update pages in place, producing random writes; LSM trees buffer writes and flush
+immutable sorted files, producing sequential writes at the cost of read amplification and
+ongoing compaction.
+</Claim>
+
+<Claim label="fact" source="bigtable">
+Bigtable's design uses in-memory tables flushed to immutable sorted files on a distributed file
+system, with periodic compaction — the structure that later became the standard LSM
+architecture for wide-column stores.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL's default index type is a B-tree, and its MVCC implementation requires periodic
+cleanup of dead row versions. A long-running transaction prevents that cleanup, which is a
+common cause of unexpected table growth.
+</Claim>
+
+<Claim label="recommendation">
+Judge a storage engine on your workload with a dataset larger than memory, run for long enough
+that background maintenance reaches steady state. Short benchmarks on small data reliably
+mislead in both directions.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can justify a storage choice from workload characteristics rather than from brand familiarity. It also tests whether you know that background work is part of latency."
+  depth="Know the two structures and what each optimises. Know the three amplification factors by name. You do not need compaction strategy details unless you have operated one, in which case say so and offer."
+  followUps={[
+    'Ingest is 500,000 events per second, reads are by key and recent. Which engine?',
+    'Read p99 spikes every few hours with no traffic change. What is your hypothesis?',
+    'Why might a Bloom filter matter here?',
+    'What happens if compaction cannot keep up?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'NoSQL is faster than SQL.',
+      why: 'The category names describe data models and query languages, not storage engines. A relational database can use an LSM engine and a document store can use a B-tree. The performance difference people attribute to the category usually comes from the engine or from having fewer guarantees.',
+      instead:
+        'Talk about the write path, the read path, and the guarantees. Those are the things that differ; the label is not.',
+    },
+    {
+      mistake: 'We will benchmark both and pick the faster one.',
+      why: 'A short benchmark on a small dataset measures neither compaction steady state nor cache miss behaviour, which are the two things that actually differ.',
+      instead:
+        'Benchmark with data several times larger than memory, for long enough for background maintenance to stabilise, using your real access distribution including its skew.',
+    },
+    {
+      mistake: 'Compaction is an implementation detail.',
+      why: 'It consumes disk bandwidth and CPU continuously, and it is the direct cause of periodic tail latency spikes. If your latency objective is a percentile, compaction is in scope.',
+      instead:
+        'Treat background maintenance as part of the capacity plan, and provision disk bandwidth and free space for it explicitly.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['lsm-tree', 'compaction', 'tail-latency']}
+  prompt="Your LSM-based store shows read p99 spiking to 40 ms every few hours, while p50 stays at 0.9 ms and traffic is flat. What is happening?"
+  options={[
+    {
+      id: 'a',
+      text: 'A periodic batch job is competing for the database',
+      implies: 'You are looking for an external cause.',
+      why: 'Worth ruling out, and easy to check. But the signature — periodic, uncorrelated with traffic, affecting only the tail — is the classic profile of the engine\'s own background work rather than an external client.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Compaction is running, consuming disk bandwidth that reads need',
+      implies: 'You recognise background maintenance as part of the latency profile.',
+      why: 'Compaction merges SSTables, which is heavy sequential I/O on the same disks serving reads. The spikes are periodic because compaction is triggered by accumulated files, not by traffic, and they hit the tail because most reads are still served from cache.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The Bloom filters have become ineffective',
+      implies: 'You are looking at read amplification.',
+      why: 'Bloom filter effectiveness degrades gradually as data grows, which would raise the whole distribution rather than producing periodic spikes against a flat p50. It is a real effect with a different signature.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes the diagnosis and the levers: correlate the spikes with compaction metrics, then either change compaction strategy, throttle compaction I/O, provision more disk bandwidth, or accept the tail if the latency objective allows. It also notes that throttling compaction trades a tail problem now for a write-stall problem later."
+/>
+
+<Check
+  concepts={['btree', 'lsm-tree', 'write-amplification']}
+  prompt="A table receives 300,000 inserts per second, is read only by primary key and by recent time range, and is never updated in place. Which storage design fits, and why?"
+  options={[
+    {
+      id: 'a',
+      text: 'B-tree, because reads must be predictable',
+      implies: 'You are prioritising read latency consistency.',
+      why: 'Defensible if latency consistency is the hard requirement, but 300,000 random-write inserts per second is well beyond what in-place page updates sustain on ordinary hardware. The write path would be the binding constraint long before read consistency mattered.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'LSM, because the workload is append-only with key and range reads, which is exactly what sorted immutable files serve well',
+      implies: 'You matched the access pattern to the structure rather than to a product.',
+      why: 'Sequential appends sustain the ingest rate; sorted files serve both point lookups and range scans; and because rows are never updated, space amplification from superseded versions is minimal. The compaction tail is the price, and it is the right price here.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Either would work at this rate',
+      implies: 'You are treating 300,000 per second as a modest number.',
+      why: 'It is not. Random page writes plus index maintenance at that rate would saturate the write path on most hardware, and this is precisely the workload class that motivated LSM designs.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the second-order design decisions this implies: a partition key combining entity and time bucket so writes spread rather than concentrating on the newest partition, a retention and downsampling policy because append-only data grows forever, and disk headroom sized for compaction."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Storage engine internals in depth', sourceId: 'database-internals' },
+    { label: 'Storage and retrieval: the trade-off framing', sourceId: 'ddia' },
+    {
+      label: 'Compaction strategies and their workload fit',
+      sourceId: 'cassandra-docs',
+    },
+    {
+      label: 'Next: what the database promises when transactions overlap',
+      href: '/lessons/what-the-database-promises',
+    },
+  ]}
+/>

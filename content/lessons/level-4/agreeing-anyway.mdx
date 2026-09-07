@@ -1,0 +1,466 @@
+---
+id: agreeing-anyway
+title: Agreeing Anyway
+level: 4
+module: l4-agreement
+order: 1
+summary: Consensus does not make a system more available. It makes it correct under failure, by deliberately refusing to proceed when it cannot be sure.
+difficulty: advanced
+minutes: 30
+prerequisites: [no-shared-clock, quorum]
+concepts: [consensus, raft, paxos, byzantine-failure, quorum-intersection, leader-election, membership, split-brain, lease, fencing-token, replicated-state-machine]
+unlocks: [linearizability, distributed-lock, failover]
+failures: [split-brain]
+sources: [raft, paxos-simple, chubby, mit-6584, ddia]
+status: reviewed
+---
+
+## The problem
+
+You need exactly one node to be the leader. Not zero, which means nothing works. Not two, which
+means both accept writes and the data diverges permanently.
+
+But you have just learned that you cannot tell a dead node from a slow one, and that clocks
+disagree. So how do you ever safely conclude &ldquo;the old leader is gone, I am in charge
+now&rdquo;?
+
+The answer turns out not to be better detection. It is an argument about sets.
+
+## Intuition
+
+Suppose a committee of five must make decisions, and members can be unreachable at any time.
+
+**Rule: no decision without three votes.**
+
+Now consider two groups that have lost contact with each other. Can both make a decision?
+
+For both to decide, both need three members. But there are only five members in total, and
+three plus three is six. **Any two groups of three must share at least one member**, and that
+member cannot vote for two conflicting decisions.
+
+So at most one group can decide. Not because anyone detected anything, but because arithmetic
+forbids it.
+
+That is <C id="quorum-intersection">quorum intersection</C>, and it is the entire foundation.
+Everything else — Raft, Paxos, leader election, leases — is machinery built on the observation
+that two majorities of the same set must overlap.
+
+There is a price, and it is the thing people misunderstand most:
+
+**If a group cannot reach a majority, it stops.** Not degrades — stops. A consensus system with
+three of five nodes unreachable does not serve stale data or accept writes optimistically. It
+refuses. That is the guarantee, and it is a deliberate reduction in availability in exchange for
+never being wrong.
+
+## Concretely
+
+<Example title="Why a majority, and not any two">
+
+Five nodes. A network partition splits them into a group of three and a group of two.
+
+**With a majority rule (3 of 5):** the group of three can proceed; the group of two cannot. One
+side serves, one side stops, and there is exactly one authoritative history.
+
+**With a "any two agree" rule:** the group of two can proceed *and* two members of the group of
+three can proceed. Two independent histories, both believing themselves valid. When the
+partition heals, there is no principled way to reconcile them — writes have been acknowledged
+on both sides that contradict each other.
+
+The majority rule is not conservative engineering taste. It is the minimum requirement for the
+overlap argument to hold, and dropping below it removes the guarantee entirely rather than
+weakening it.
+
+This is also why consensus clusters have odd sizes. Five nodes tolerate two failures; six nodes
+also tolerate two, because a majority of six is four. The sixth node adds cost and coordination
+latency and tolerates nothing extra.
+
+</Example>
+
+## Formal explanation
+
+<C id="consensus" /> is the problem of getting a set of nodes to agree on a single value, and to
+stay agreed through crashes and partitions. The properties an algorithm must provide:
+
+- **Safety** — no two nodes decide differently. This must hold under every failure the model
+  admits, including arbitrary delays.
+- **Liveness** — a decision is eventually reached, provided enough nodes are reachable.
+
+Safety is absolute; liveness is conditional. That asymmetry is the design.
+
+<C id="raft" /> decomposes the problem into pieces a human can implement:
+
+- **Terms.** Logical time, incremented on each election. A message from an older term is
+  rejected, which is how a returning old leader is neutralised without anyone detecting its
+  absence.
+- **<C id="leader-election" />.** A node that has not heard from a leader becomes a candidate
+  and requests votes. A node votes at most once per term, so at most one candidate can win.
+- **Log replication.** The leader appends entries and replicates them. An entry is committed
+  once a majority has stored it, which — by the overlap argument — means any future leader must
+  already have it.
+- **<C id="replicated-state-machine" />.** Every node applies committed entries in the same
+  order, so all replicas reach identical state.
+
+<Claim label="fact" source="raft">
+Raft was explicitly designed for understandability, decomposing consensus into leader election,
+log replication and safety, with a strong leader that simplifies log management. The paper
+includes the safety argument and the membership-change protocol.
+</Claim>
+
+<Callout kind="warn" title="Consensus reduces availability. That is what you are buying.">
+A quorum-based system deliberately stops rather than risk divergence. If your requirement is
+"always answer, even if the answer is slightly stale", consensus is the wrong tool and you want
+an eventually-consistent design. Use consensus where being wrong is worse than being
+unavailable — leader election, configuration, membership, and the small set of operations that
+genuinely need one order.
+</Callout>
+
+<Deeper title="Leases, fencing, and the node that comes back">
+
+Consensus gives you agreement among the nodes participating in it. It does not, by itself, stop
+a node that *was* the leader from acting on an external resource.
+
+Consider: node A is the leader. It pauses for 30 seconds. The cluster elects node B. Node A
+resumes and writes to shared storage, still believing it is the leader.
+
+The storage has no idea a consensus protocol exists.
+
+Two mechanisms close this:
+
+**<C id="lease">Leases</C>.** Leadership is granted for a bounded period. A leader must renew
+before acting; a leader that has been paused knows its lease may have expired and must not act
+without renewing. This converts a detection problem into a local clock check — which is why it
+depends on bounded clock drift, and why lease durations are set conservatively.
+
+**<C id="fencing-token">Fencing tokens</C>.** Each leadership term carries a monotonically
+increasing number. Every write to the protected resource includes it, and the resource rejects
+any token lower than the highest it has seen. Node A's stale token is refused even though node A
+has no idea anything changed.
+
+Fencing is the stronger mechanism because it requires no timing assumptions at all. It does
+require the protected resource to participate, which is why "distributed lock" libraries that do
+not integrate with the storage layer cannot give the guarantee people assume they do.
+
+</Deeper>
+
+<Deeper title="Paxos, and the failures this does not cover">
+
+Two things are worth knowing precisely here, and in both cases the useful knowledge is the
+boundary rather than the mechanism.
+
+**<C id="paxos" />** is the original solution to this problem and the one every later protocol is
+measured against. Its core is the same overlap argument used above: a proposer must get a promise
+from a majority before it can propose a value, and because any two majorities intersect, a value
+that has already been accepted cannot be lost. Its reputation for difficulty comes from what it
+leaves unspecified — the basic form agrees on **one value**, and turning that into an ordered
+log of many values, with a stable leader and a membership-change procedure, is an engineering
+exercise the paper does not carry out.
+
+That gap is why Raft exists and why this lesson teaches Raft. Raft is not a better algorithm in
+the sense of agreeing more correctly; it makes the same guarantee. It specifies the parts that
+Paxos leaves to the implementer, and it was designed so that the specification can be understood
+by the people who have to operate it. If you meet Paxos in production it will be as a
+multi-decree variant inside a system somebody else runs, and what you need is the overlap argument
+rather than the protocol.
+
+**<C id="byzantine-failure" />** is the assumption underneath all of this, and it is worth stating
+because it is almost always left implicit. Raft and Paxos assume nodes fail by **crashing or being
+unreachable** — they stop, or their messages are delayed or lost. They do not assume a node
+sends different answers to different peers, forges a message, or lies about what it stored. That
+is a Byzantine failure, and tolerating it requires different protocols and a larger quorum: three
+faulty nodes out of four is survivable for crash faults and not for Byzantine ones.
+
+The reason this curriculum does not pursue it is a judgment about threat model rather than about
+difficulty. Inside one organisation's infrastructure, with authenticated links and machines you
+control, a node that actively lies is usually a compromise — which is a security problem with
+a security response, not a consensus parameter. Byzantine fault tolerance earns its cost where the
+participants are **mutually distrusting**, which is the condition public blockchains are built
+for and most internal systems are not.
+
+The practical value of knowing this is being able to say what your protocol assumes. A system that
+survives a crashed node does not thereby survive a corrupted one, and the gap between those two
+sentences has been the subject of more than one confident and wrong design review.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="A majority decides; the minority stops; a returning leader is fenced out."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'client', label: 'Clients' }] },
+    { title: 'Leader', nodes: [{ id: 'leader', label: 'Leader', note: 'term 7', tone: 'accent' }, { id: 'old', label: 'Old leader', note: 'term 6, paused' }] },
+    { title: 'Followers', nodes: [{ id: 'f1', label: 'Follower' }, { id: 'f2', label: 'Follower' }, { id: 'f3', label: 'Minority side', tone: 'muted' }] },
+    { title: 'Resource', nodes: [{ id: 'store', label: 'Storage', note: 'rejects old tokens' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'leader', label: 'write' },
+    { from: 'leader', to: 'f1', label: 'replicate' },
+    { from: 'leader', to: 'f2' },
+    { from: 'leader', to: 'store', label: 'token 7', tone: 'accent' },
+    { from: 'old', to: 'store', label: 'token 6 rejected', tone: 'danger' },
+  ]}
+  stages={[
+    {
+      label: 'Normal operation',
+      show: ['client', 'leader', 'f1', 'f2', 'store'],
+      because:
+        'One leader accepts writes and replicates them. An entry is committed once a majority has it, which guarantees any future leader will already hold it.',
+    },
+    {
+      label: 'Partition',
+      show: ['client', 'leader', 'f1', 'f2', 'f3', 'store'],
+      because:
+        'The minority side cannot form a quorum, so it stops rather than serving. This is the availability cost, and it is deliberate.',
+    },
+    {
+      label: 'The old leader returns',
+      show: ['client', 'leader', 'old', 'f1', 'f2', 'f3', 'store'],
+      because:
+        'A paused leader has no way to know time passed. The fencing token is what makes its write harmless, and it works without any detection at all.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '3 nodes',
+      behaviour:
+        'Tolerates one failure. Commit requires two acknowledgements, so latency is the second-fastest node.',
+      firstToBreak: 'Availability, if two nodes are unreachable at once — which includes during a rolling upgrade.',
+    },
+    {
+      scale: '5 nodes',
+      behaviour:
+        'Tolerates two failures. Commit latency is the third-fastest node, so slightly worse than three.',
+      firstToBreak: 'Write latency, which rises as you require more acknowledgements.',
+    },
+    {
+      scale: '7+ nodes',
+      behaviour:
+        'Marginal additional fault tolerance, meaningfully worse write latency and more replication traffic.',
+      firstToBreak:
+        'Throughput and latency. This is why consensus groups are typically three or five.',
+    },
+    {
+      scale: 'Across regions',
+      behaviour:
+        'Every commit includes a cross-region round trip to reach a majority — tens or hundreds of milliseconds.',
+      firstToBreak:
+        'Write latency, dramatically. This is why global systems partition data and run a consensus group per partition rather than one group spanning everything.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Quorum lost, cluster stops',
+      symptom:
+        'All writes fail. The system is up, healthy, and refusing to do anything.',
+      cause:
+        'Fewer than a majority of nodes are reachable, so no decision can be safely made.',
+      mitigation:
+        'This is correct behaviour, not a bug. Restore nodes. Design so that only what genuinely needs consensus depends on it, so the rest of the system degrades rather than stopping.',
+    },
+    {
+      what: 'Election storms',
+      symptom:
+        'Leadership changes repeatedly, throughput collapses, and no leader lasts long enough to make progress.',
+      cause:
+        'Election timeouts too close to network latency, or a node repeatedly triggering elections after transient delays.',
+      mitigation:
+        'Randomised election timeouts well above observed round-trip latency, and a pre-vote step so a partitioned node cannot disrupt a healthy cluster by repeatedly incrementing terms.',
+    },
+    {
+      what: 'Split brain against an external resource',
+      symptom:
+        'Two nodes both write to shared storage; data is corrupted in a way that is hard to untangle.',
+      cause:
+        'Consensus made the cluster agree, but the external resource does not participate in the protocol and accepted a write from a stale leader.',
+      mitigation:
+        'Fencing tokens enforced by the resource. Leases help, and they depend on bounded clock drift; fencing does not.',
+    },
+    {
+      what: 'Membership change losing quorum',
+      symptom:
+        'Adding or removing nodes causes the cluster to become unavailable or, worse, briefly permits two majorities.',
+      cause:
+        'Changing the member set changes what a majority means. A naive change can create a window where two disjoint majorities exist.',
+      mitigation:
+        'Use the algorithm\'s defined membership-change protocol — joint consensus in Raft — and change one node at a time.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use a consensus system for leader election and configuration, not for the data path"
+  options={[
+    'Consensus for everything: all writes go through the replicated log',
+    'Consensus for metadata and leadership; data replicated by simpler means',
+    'No consensus: eventual consistency with conflict resolution',
+  ]}
+  why="Consensus is expensive per operation and reduces availability by design. Leadership and configuration are low-volume and genuinely need one agreed answer; bulk data usually does not, and paying quorum latency for every row write is a large cost for a guarantee most rows do not require."
+  gain="Correct leadership and configuration under partition, with no split brain. The data path stays fast and available, and can degrade rather than stop."
+  sacrifice="Two consistency models in one system, and engineers must know which operations are which. The boundary between them is a place where reasoning errors accumulate."
+  failureModes={[
+    'The consensus layer becoming unavailable and taking leadership decisions with it',
+    'Assuming data-path operations have the guarantees the metadata path has',
+    'A control-plane outage stopping the data plane, which should have kept serving',
+  ]}
+  operationalBurden="Running a consensus cluster is real work: membership changes, disk failures, upgrade ordering, and monitoring for leadership churn. Most teams should use an existing implementation rather than build one."
+  cost="Three or five nodes, plus the latency of a majority round trip on every consensus operation. Kept off the data path, that cost is small."
+  whenNot="When every operation genuinely requires one global order — a financial ledger where all entries must be totally ordered — putting the data path through consensus is correct and the latency is the price of the guarantee. Conversely, when the data has no cross-object invariants and staleness is acceptable, even the metadata may not need consensus, and a simpler design is better."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="raft">
+Raft guarantees that a leader for a given term is unique, because each node votes at most once
+per term and a candidate needs a majority. Committed entries are guaranteed to be present on any
+future leader, because a majority stored them and any two majorities intersect.
+</Claim>
+
+<Claim label="fact" source="chubby">
+Chubby provides a coarse-grained lock service built on consensus, and its published design notes
+that most clients use it for leader election and configuration rather than for fine-grained
+locking, with sequence numbers available so protected resources can reject stale holders.
+</Claim>
+
+<Claim label="fact" source="paxos-simple">
+Paxos establishes the safety of consensus through the requirement that any two quorums
+intersect. Its safety properties hold regardless of message delays, which is why practical
+implementations rely on timeouts only for liveness.
+</Claim>
+
+<Claim label="recommendation">
+Do not implement consensus yourself. Use a well-tested implementation, and design so that the
+number of operations requiring it is small. The interesting engineering is in deciding what
+needs agreement, not in the algorithm.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that consensus trades availability for correctness, and why a majority is required. Saying 'we use Raft for leader election' is fine; explaining why two leaders cannot both be elected is what shows understanding."
+  depth="Know the quorum intersection argument, know that safety must not depend on timing, and know that a returning leader needs fencing. Raft internals beyond terms and log commit are rarely required."
+  followUps={[
+    'Why does a consensus cluster need an odd number of nodes?',
+    'Three of your five nodes are unreachable. What does the system do, and is that correct?',
+    'A paused leader wakes up and writes to storage. What stops it?',
+    'Why not put every write through consensus?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We use Raft, so the system is highly available.',
+      why: 'It is the opposite trade. Raft guarantees correctness under partition by refusing to proceed without a majority — availability is deliberately sacrificed to prevent divergence.',
+      instead:
+        'Say what consensus buys: one agreed order, no split brain, and unavailability when a majority is unreachable. Then say which parts of the system need that and which are better off degrading.',
+    },
+    {
+      mistake: 'A distributed lock guarantees mutual exclusion.',
+      why: 'It guarantees that at most one client believes it holds the lock at any moment according to the lock service. A paused client can wake believing it still holds a lease that has expired, and act.',
+      instead:
+        'Require fencing: the protected resource rejects writes carrying a stale token. Without resource participation, the lock protects against contention, not against a stale holder.',
+    },
+    {
+      mistake: 'We will add more nodes to make consensus more reliable.',
+      why: 'Fault tolerance improves only when crossing to the next odd number, while write latency and replication traffic grow with every node, because each commit waits for a larger majority.',
+      instead:
+        'Use three or five. Beyond that, partition the data and run a consensus group per partition, so groups stay small and work in parallel.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['quorum-intersection', 'consensus']}
+  prompt="A five-node consensus cluster partitions into groups of two and three. What happens, and why is it the right behaviour?"
+  options={[
+    {
+      id: 'a',
+      text: 'Both groups elect a leader and reconcile when the partition heals',
+      implies: 'You are expecting the system to prioritise availability and merge later.',
+      why: 'That is what an eventually-consistent design does, and it is exactly what consensus exists to prevent. Two leaders would acknowledge conflicting writes, and there is no principled way to reconcile two histories that both told clients they succeeded.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The group of three continues; the group of two stops, because it cannot reach a majority',
+      implies: 'You applied the quorum rule and accepted the availability cost as the point of the design.',
+      why: 'Three of five is a majority, so that side can commit. Two cannot, so it refuses to serve rather than risk divergence. The minority stopping is not a failure — it is the guarantee working.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Both groups continue serving reads but only the majority accepts writes',
+      implies: 'You are separating read and write availability.',
+      why: 'Some systems do offer this deliberately, and it is a real design point — but those reads are stale and no longer linearizable, so it is a weaker guarantee that must be chosen and labelled, not assumed.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer adds the design consequence: because the minority stops, you should keep consensus off the paths that must remain available. Put leadership and configuration behind it, and let the data path degrade to stale reads or queued writes so a partition costs you freshness rather than total unavailability."
+/>
+
+<Check
+  concepts={['fencing-token', 'lease', 'split-brain']}
+  prompt="Your job scheduler uses a distributed lock so only one worker processes a queue. A worker acquires the lock, pauses for 40 seconds, and resumes. What is the safe design?"
+  options={[
+    {
+      id: 'a',
+      text: 'A long enough lock timeout that a 40-second pause cannot expire it',
+      implies: 'You are sizing the timeout against the observed worst case.',
+      why: 'It reduces the probability and does not remove it — a 90-second pause is possible — while making every genuine failure take that long to recover from. You have bought a partial reduction in risk with a large availability cost.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The lock issues an increasing token, and the resource the worker writes to rejects any token below the highest it has seen',
+      implies: 'You made safety independent of timing rather than dependent on it.',
+      why: 'The paused worker cannot know that time passed, so no amount of checking on its side helps. Enforcement has to be at the resource: the second worker\'s higher token has already been recorded, so the stale write is refused regardless of what the first worker believes.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The worker checks whether it still holds the lock before writing',
+      implies: 'You are adding a validity check on the client side.',
+      why: 'It narrows the window and cannot close it: the lock can expire between the check and the write. Any client-side check has this gap, which is why the guarantee has to come from the resource.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer generalises: safety properties must not depend on timing assumptions, because you cannot bound a pause. Leases are useful for liveness — they let a crashed holder's lock be reclaimed without human intervention — but the correctness guarantee comes from fencing, and a lock service that does not integrate with the protected resource cannot provide it."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'In Search of an Understandable Consensus Algorithm',
+      sourceId: 'raft',
+      note: 'Read sections 5 and 6 for elections, log replication and membership changes.',
+    },
+    { label: 'Paxos Made Simple', sourceId: 'paxos-simple' },
+    { label: 'A lock service built on consensus, and how clients actually use it', sourceId: 'chubby' },
+    {
+      label: 'Next: what guarantee you are actually offering a reader',
+      href: '/lessons/what-you-promise-a-reader',
+    },
+  ]}
+/>

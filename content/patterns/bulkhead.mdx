@@ -1,0 +1,155 @@
+---
+id: bulkhead
+title: Bulkhead
+problem: One dependency, or one tenant, consumes a shared resource and starves everything else that needed it.
+category: resilience
+concepts: [bulkhead, connection-pooling, cascading-failure, noisy-neighbour, tenant-isolation, blast-radius, littles-law]
+relatedPatterns: [circuit-breaker, cell-based-architecture]
+alsoKnownAs: [resource isolation, compartmentalisation, pool per dependency]
+seenIn: [Thread and connection pool isolation, per-tenant quotas, service meshes]
+sources: [release-it, aws-builders-library, sre-book]
+status: reviewed
+---
+
+## Problem
+
+Your service has one worker pool. It calls five dependencies.
+
+One of them — an optional recommendation service — slows from 30 ms to 4 seconds. By Little's
+law, the concurrency needed to sustain the same arrival rate rises by the same factor. Within
+seconds every worker is occupied waiting on that one call.
+
+Requests that never touch the slow dependency now queue behind the ones that do. An optional
+feature has taken down checkout, and CPU is at 20% the whole time.
+
+The same shape appears with tenants: one customer's traffic consumes the shared pool, and
+everyone else's latency triples.
+
+## Pattern
+
+Divide the shared resource into compartments, and give each dependency or tenant its own.
+
+- A **connection pool per dependency**, not one pool for all.
+- A **worker or thread pool per dependency class**, so a slow call can only exhaust its own.
+- A **concurrency limit per tenant**, so one account cannot consume the whole service.
+
+The name comes from ships: compartments below the waterline mean one breach floods one section
+rather than sinking the vessel.
+
+Sizing is the design work. Each compartment gets enough capacity for its normal concurrency —
+arrival rate times service time — plus headroom. The sum can exceed total capacity if you expect
+compartments not to saturate simultaneously, which is usually true and occasionally the reason
+this fails.
+
+## Architecture
+
+<Arch
+  caption="One pool per dependency, so saturation is contained."
+  columns={[
+    { title: 'Requests', nodes: [{ id: 'req', label: 'Incoming' }] },
+    { title: 'Handler', nodes: [{ id: 'app', label: 'Service' }] },
+    { title: 'Compartments', nodes: [{ id: 'p1', label: 'Pool: database', note: 'bounded', tone: 'accent' }, { id: 'p2', label: 'Pool: optional dep', note: 'bounded' }, { id: 'p3', label: 'Pool: auth', note: 'bounded' }] },
+    { title: 'Dependencies', nodes: [{ id: 'db', label: 'Database' }, { id: 'rec', label: 'Recommendations', note: 'slow' }, { id: 'auth', label: 'Auth' }] },
+  ]}
+  edges={[
+    { from: 'req', to: 'app' },
+    { from: 'app', to: 'p1' },
+    { from: 'app', to: 'p2' },
+    { from: 'app', to: 'p3' },
+    { from: 'p1', to: 'db' },
+    { from: 'p2', to: 'rec', label: 'saturated, contained', tone: 'danger' },
+    { from: 'p3', to: 'auth' },
+  ]}
+/>
+
+## Advantages
+
+- **Failure is contained.** A slow dependency exhausts its own compartment and nothing else.
+- **The failure becomes legible.** A saturated pool with a wait-time metric points directly at
+  the responsible dependency, instead of presenting as "everything is slow".
+- **It protects the dependency too.** A bounded pool caps the concurrency you send at something
+  already struggling, which is backpressure applied where it is cheapest.
+- **Per-tenant compartments give isolation** without separate infrastructure per customer.
+
+## Costs
+
+- **Capacity is reserved and often idle.** A compartment sized for a dependency's peak sits
+  unused most of the time, which looks like waste in a utilisation report.
+- **More configuration to size and maintain.** Each compartment is a number someone must derive
+  from measurement, and revisit when the workload changes.
+- **Requests can be rejected while capacity exists elsewhere.** The database pool may be full
+  while the recommendation pool is empty, and the rejected request cannot use it.
+- **Only useful if instrumented.** Without per-pool utilisation and wait time, a saturated
+  compartment is as invisible as a saturated shared pool.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Compartments sized by guesswork',
+      symptom: 'Pools saturate at normal load, or are so generous that isolation never engages.',
+      cause: 'Sizes chosen by intuition rather than from measured arrival rate and service time.',
+      mitigation: "Size from Little's law with measured numbers, add headroom, and monitor utilisation and wait time per pool.",
+    },
+    {
+      what: 'A shared resource behind the compartments',
+      symptom: 'Isolation is configured and one dependency still affects the others.',
+      cause: 'The pools are separate but they share something further down — an event loop, a CPU, a downstream database.',
+      mitigation: 'Trace the resource all the way down. Isolation at one layer means nothing if the layer beneath is shared.',
+    },
+    {
+      what: 'No acquisition timeout',
+      symptom: 'The pool is bounded and requests still pile up, waiting to enter it.',
+      cause: 'The queue for the compartment is unbounded, so the bound moved rather than took effect.',
+      mitigation: 'Every pool needs an acquisition timeout so waiting is bounded, and a rejection path when it expires.',
+    },
+    {
+      what: 'Per-tenant limits enforced per node',
+      symptom: 'A tenant exceeds their limit by roughly the fleet size.',
+      cause: 'Node-local counters on a fleet of many nodes.',
+      mitigation: 'Divide the limit by fleet size as an approximation, or use shared state for the largest tenants.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- One service calls several dependencies with different latency and reliability profiles.
+- At least one dependency is optional, so its failure should not affect the rest.
+- The service is multi-tenant and one tenant can plausibly generate disproportionate load.
+- Resources are genuinely shared and finite: threads, connections, memory.
+
+## When NOT to use it
+
+- **When there is only one dependency.** A single compartment is just a bounded pool, which you
+  should have anyway. The pattern adds nothing.
+- **When all dependencies are equally required.** If the request fails without any of them, then
+  saturating one and failing fast is not meaningfully better than saturating all of them.
+  Timeouts do the useful work here; isolation adds configuration without changing outcomes.
+- **When capacity is very tight.** Reserving per-compartment headroom costs total utilisation. On
+  a system running close to its limit, partitioning capacity can make saturation more likely, not
+  less.
+- **As a substitute for timeouts.** A compartment fills more slowly than a shared pool, and it
+  still fills if calls never end. Timeouts are the foundation; bulkheads bound the damage while
+  timeouts are doing their work.
+
+## Example systems
+
+<Claim label="convention" source="release-it">
+The bulkhead is documented as a stability pattern for partitioning resources so that failure in
+one part of a system cannot consume the capacity of another, and it is presented alongside
+timeouts and circuit breakers rather than as an alternative to them.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Bounding the concurrency sent to a dependency is described as protecting both caller and callee:
+the caller retains capacity for other work, and the callee is not overwhelmed by a caller that
+has no limit.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Isolating failure domains so that one component's degradation does not propagate is a
+foundational reliability practice, applied at every level from thread pools up to entire cells
+of infrastructure.
+</Claim>

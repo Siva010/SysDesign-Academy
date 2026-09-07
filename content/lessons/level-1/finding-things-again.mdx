@@ -1,0 +1,393 @@
+---
+id: finding-things-again
+title: Where Data Lives, and How You Find It Again
+level: 1
+module: l1-storing
+order: 1
+summary: An index is a second copy of your data organised differently. Everything good and bad about databases follows from that sentence.
+difficulty: intro
+minutes: 26
+prerequisites: [durability]
+concepts: [index, btree, query-plan, oltp, wal, fsync, page-cache]
+unlocks: [lsm-tree, secondary-index, n-plus-one, sharding]
+sources: [postgres-docs, database-internals, ddia]
+status: reviewed
+---
+
+## The problem
+
+Your application stores users in a table. Looking up a user by ID is instant. Looking up a user
+by email address takes 400 milliseconds, and it gets slower every week.
+
+Both are single-row lookups. Both return the same amount of data. The table is the same table.
+
+The difference is that one of those questions has a prepared answer and the other does not, and
+understanding why is the difference between someone who uses a database and someone who can
+reason about one.
+
+## Intuition
+
+Imagine a filing cabinet holding a million customer records, filed by account number.
+
+&ldquo;Find account 4,721,003&rdquo; is fast. You go straight to the right drawer.
+
+&ldquo;Find the customer whose email is alex@example.com&rdquo; means opening every folder in
+every drawer until you find it. A million folders. This is a **full scan**, and it costs time
+proportional to how much data you have.
+
+Now suppose you keep a second, thinner set of cards: email address on the front, account number
+on the back, sorted alphabetically. Finding an email is now fast — but every time a customer is
+added, changed or removed, you have to update the cards too, or they lie to you.
+
+That is an <C id="index" />. A second copy of part of your data, organised for a different
+question. It makes some reads dramatically faster and every write slower, and it takes up
+space. There is no version of this where the index is free.
+
+## Concretely
+
+<Example title="What it means to get slower every week">
+
+A lookup by primary key uses a structure that stays roughly flat as the table grows: a
+B-tree lookup touches a handful of pages whether the table holds a thousand rows or a
+billion.
+
+A lookup with no usable index scans. Its cost grows with the table. It was 4 ms when the table
+was small, then 40 ms, then 400 ms — and nothing in your code changed. This is the single most
+common cause of &ldquo;the application got slow and we do not know why&rdquo;.
+
+The tell is the shape of the graph: query latency rising steadily in proportion to table
+growth, with no corresponding change in traffic or deploys.
+
+</Example>
+
+## Formal explanation
+
+Data on disk is organised in **pages** — fixed-size blocks, typically a few kilobytes — because
+storage devices and the operating system work in blocks, not in rows. A query's real cost is
+roughly the number of pages it must read, not the number of rows it returns.
+
+A <C id="btree">B-tree</C> is a balanced tree of such pages, sorted by key. Finding a key
+means descending from the root: a handful of page reads, and the upper levels are almost
+always already in memory. This is why the depth barely changes as the table grows, and why
+primary key lookups stay fast.
+
+Three properties of a B-tree matter for design:
+
+- **It answers range queries.** Because it is sorted, &ldquo;all orders between March and
+  April&rdquo; is a scan along the leaves rather than many separate lookups.
+- **It answers prefixes of a composite key.** An index on `(user_id, created_at)` serves
+  queries on `user_id` alone, and on both together, but not on `created_at` alone. This one
+  fact resolves a large fraction of real-world index confusion.
+- **It must be updated on every write** that touches the indexed columns. This is where
+  <C id="write-amplification">write amplification</C> comes from: one logical row insert
+  becomes one heap write plus one write per index.
+
+The <C id="query-plan">query planner</C> decides how to execute your query, using statistics
+about the data. This is why the same query can be fast for months and then suddenly slow: the
+statistics changed, or the data distribution did, and the planner made a different choice.
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL's planner chooses among access methods using collected statistics on table
+contents, and the chosen plan can be inspected with EXPLAIN. Plan choice depends on estimated
+row counts, so stale or skewed statistics can produce a plan that is dramatically worse than
+the available alternative.
+</Claim>
+
+<Deeper title="Why durability needs a log, not just a write">
+
+When you commit a transaction, the database cannot afford to write every changed page to its
+final location immediately: those pages are scattered, and scattered writes are slow.
+
+So it writes the *intent* first, sequentially, to a <C id="wal">write-ahead log</C>, and only
+that write has to be durable before the commit can be acknowledged. The actual pages are
+updated later, in the background, in a more efficient order.
+
+If the machine dies, recovery replays the log to reconstruct any changes that had not yet
+reached their final pages.
+
+This is why sequential writes are the foundation of database durability, and why
+<C id="fsync">the point at which the log is actually forced to disk</C> is the true durability
+boundary. It is also the mechanism that later makes replication and change data capture
+possible: the log already contains an ordered record of every change, so shipping it elsewhere
+is nearly free.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="One row insert becomes several writes. This is the cost side of indexing."
+  columns={[
+    { title: 'Request', nodes: [{ id: 'app', label: 'Application' }] },
+    { title: 'Engine', nodes: [{ id: 'wal', label: 'Write-ahead log', note: 'sequential, durable', tone: 'accent' }, { id: 'buffer', label: 'Page cache', note: 'in memory' }] },
+    { title: 'Structures', nodes: [{ id: 'heap', label: 'Table pages' }, { id: 'pk', label: 'Primary index' }, { id: 'idx', label: 'Secondary indexes' }] },
+    { title: 'Disk', nodes: [{ id: 'disk', label: 'Disk' }] },
+  ]}
+  edges={[
+    { from: 'app', to: 'wal', label: 'insert' },
+    { from: 'wal', to: 'buffer' },
+    { from: 'buffer', to: 'heap' },
+    { from: 'buffer', to: 'pk' },
+    { from: 'buffer', to: 'idx' },
+    { from: 'heap', to: 'disk', dashed: true },
+    { from: 'idx', to: 'disk', dashed: true },
+  ]}
+  stages={[
+    {
+      label: 'What you wrote',
+      show: ['app', 'heap'],
+      because:
+        'From the application, an insert puts one row in one table. That is the whole mental model most people have.',
+    },
+    {
+      label: 'What the engine does',
+      show: ['app', 'wal', 'buffer', 'heap', 'pk', 'disk'],
+      because:
+        'The commit is durable once the log is flushed; the pages are updated in memory and written back later. This is what makes commits fast without giving up durability.',
+    },
+    {
+      label: 'With secondary indexes',
+      show: ['app', 'wal', 'buffer', 'heap', 'pk', 'idx', 'disk'],
+      because:
+        'Every additional index is another structure to update on every write. Five indexes means an insert does six structural updates, which is why "just add an index" is never free.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '10,000 rows',
+      behaviour: 'Everything is in memory. A full scan is fast. Indexes barely matter.',
+      firstToBreak: 'Nothing, which is why missing indexes survive code review and testing.',
+    },
+    {
+      scale: '10 million rows',
+      behaviour:
+        'Indexed lookups are still a handful of page reads. Unindexed queries are now clearly slow.',
+      firstToBreak: 'Any query without a usable index, and any report someone runs at 9am.',
+    },
+    {
+      scale: '1 billion rows',
+      behaviour:
+        'Whether the working set fits in memory becomes the dominant question. Index maintenance is a real share of write cost.',
+      firstToBreak:
+        'Page cache hit rate. When the hot data stops fitting in memory, performance falls off a cliff rather than degrading gently.',
+    },
+    {
+      scale: 'Beyond one machine',
+      behaviour:
+        'Indexes must be either local to a partition and therefore scattered, or global and therefore expensive to keep consistent.',
+      firstToBreak:
+        'Secondary indexes. This is one of the main things you give up when you shard.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Query slows steadily as the table grows',
+      symptom:
+        'Latency climbs in proportion to table size, with no change in traffic or code.',
+      cause: 'A full scan where an index lookup was assumed.',
+      mitigation:
+        'Read the query plan, do not guess. Add the index that serves the actual predicate, and check that the leading columns match how the query filters.',
+    },
+    {
+      what: 'Plan flip',
+      symptom:
+        'A query that has been fast for months becomes catastrophically slow overnight, with no deploy.',
+      cause:
+        'Statistics changed, or the data distribution did, and the planner chose a different access method. Common after a bulk load or a big deletion.',
+      mitigation:
+        'Keep statistics current. Alert on query latency per statement rather than only in aggregate, so a single plan flip is visible.',
+    },
+    {
+      what: 'Too many indexes',
+      symptom:
+        'Writes are slow and storage is much larger than the data. Read performance is fine.',
+      cause:
+        'Every index is maintained on every write. Indexes accumulate over years and are rarely removed.',
+      mitigation:
+        'Audit index usage. Most databases can report which indexes are never used; those are pure cost.',
+    },
+    {
+      what: 'Working set stops fitting in memory',
+      symptom:
+        'A sudden, severe performance change with no obvious trigger. Disk read rate jumps sharply.',
+      cause:
+        'The hot pages no longer fit in the page cache, so reads that were memory accesses become disk accesses — orders of magnitude slower.',
+      mitigation:
+        'Monitor cache hit ratio as a leading indicator, not database latency as a lagging one. This is a cliff, not a slope.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Add a secondary index to make a slow query fast"
+  options={[
+    'Add the index',
+    'Change the query or the access pattern so an existing index serves it',
+    'Cache the result of the query instead',
+    'Accept the scan, because the table is small and will stay small',
+  ]}
+  why="An index converts a scan into a handful of page reads, which is usually orders of magnitude and often the difference between viable and not. When the query is frequent and the table is large, nothing else comes close."
+  gain="Read latency becomes roughly independent of table size for that access pattern, and stays that way as the data grows."
+  sacrifice="Every write that touches the indexed columns now maintains an additional structure. Storage grows. Write latency rises, and write throughput falls."
+  failureModes={[
+    'An index on a low-cardinality column that the planner correctly refuses to use: pure cost, no benefit',
+    'An index whose leading column does not match how queries filter, which therefore cannot be used',
+    'Index bloat over time from update-heavy tables, needing periodic maintenance',
+  ]}
+  operationalBurden="Building an index on a large live table takes time and resources, and a naive build can lock the table. Most engines offer a concurrent build; use it, and know how long it will take before you start."
+  cost="Storage proportional to the indexed columns plus overhead, and a measurable share of write throughput. On a write-heavy table with many indexes, index maintenance can exceed the cost of the row write itself."
+  whenNot="When the table is small enough that a scan is genuinely cheap, an index adds write cost for no measurable read benefit. When the query is rare — a monthly report — the right answer is usually to run it against a replica or an analytical store rather than to slow every write to serve it."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL supports several index types with different capabilities: B-tree for equality and
+range on ordered types, hash for equality only, GIN and GiST for containment and full-text,
+and BRIN for very large naturally-ordered tables. Choosing the type is part of choosing the
+index, not an afterthought.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+B-trees update pages in place, which produces random writes, while log-structured merge trees
+buffer writes in memory and flush sorted files, producing sequential writes at the cost of
+read amplification and ongoing compaction. Neither is universally better; the choice follows
+the workload.
+</Claim>
+
+<Claim label="recommendation">
+Read the query plan before adding an index. The planner will tell you what it is doing and
+what it estimates; guessing produces indexes that are never used and whose write cost you pay
+forever.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know that reads and writes trade against each other, and whether you can reason about access patterns rather than reciting 'add an index'. This underpins every later conversation about partition keys, because a partition key is an index decision you cannot change."
+  depth="Know why a B-tree lookup is roughly constant-cost, know the leading-column rule for composite indexes, and know that every index costs write throughput. Storage engine internals are a bonus, not a requirement."
+  followUps={[
+    'The query filters on status and sorts by created_at. What index do you create?',
+    'Why might a query that was fast yesterday be slow today with no deploy?',
+    'What does adding a fifth index to this table cost you?',
+    'When would you not add the index, even though it would make the query fast?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'The query is slow, so we should shard the database.',
+      why: 'Sharding gives each machine less data; it does not make a query faster. A scan is still a scan, now running on many machines with a scatter-gather on top, and you have given up joins and transactions to get there.',
+      instead:
+        'Read the plan. Almost always the answer at this stage is an index, a query change, or a bigger machine. Sharding is for when one node cannot hold the data or sustain the write rate.',
+    },
+    {
+      mistake: 'We added indexes on every column so any query will be fast.',
+      why: 'Write throughput is now a fraction of what it was, storage has multiplied, and most of those indexes will never be chosen by the planner anyway.',
+      instead:
+        'Index the access patterns you actually have. Composite indexes matching real query shapes beat many single-column indexes.',
+    },
+    {
+      mistake: 'We will cache the query result instead of fixing the index.',
+      why: 'You have added staleness, a stampede risk, and a new dependency, to avoid writing one line of DDL. And the first cache miss still pays the full scan.',
+      instead:
+        'Fix the read first. Cache what is genuinely expensive to compute, not what is expensive only because it was never indexed.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['index', 'query-plan']}
+  prompt="Your query is: find all orders for a given customer, most recent first, limit 20. You have an index on customer_id alone. What is the most likely problem?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing — the index on customer_id covers this query',
+      implies: 'You are matching the filter but not the sort.',
+      why: 'The index finds the customer\'s rows efficiently, but they are not stored in date order. For a customer with 50,000 orders, the database must read all of them and sort to find the newest 20. The filter is indexed; the sort is not.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'A composite index on (customer_id, created_at descending) would let the database read only 20 rows',
+      implies: 'You understand that an index provides ordering as well as selectivity.',
+      why: 'With the sort order built into the index, the rows for that customer are already in date order, so the engine walks the first 20 and stops. This turns a query whose cost grows with a customer\'s order history into one that is genuinely constant.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Add a second index on created_at',
+      implies: 'You are indexing the sort column separately.',
+      why: 'A separate index on created_at is ordered globally by date rather than within a customer, so the engine would have to walk it filtering for the customer — potentially scanning a long way for an infrequent customer. The columns need to be in one index, in the right order.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer notes the general rule: put equality predicates first in a composite index, then the range or sort column. It also observes that this is the same reasoning used later for partition keys, where getting the order wrong is a migration rather than a DDL statement."
+/>
+
+<Check
+  concepts={['page-cache', 'index']}
+  prompt="Your database has been fine for a year. Over one week, p99 query latency rises 30-fold. Traffic is flat, no deploys, disk read throughput has jumped sharply. What happened?"
+  options={[
+    {
+      id: 'a',
+      text: 'The working set stopped fitting in memory',
+      implies: 'You connected the disk read jump to a cache miss cliff.',
+      why: 'While the hot pages fit in the page cache, reads are memory accesses. Once they do not, the same queries become disk accesses, which are orders of magnitude slower. Because it is a threshold rather than a slope, the change is sudden even though the growth was gradual.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'An index became fragmented',
+      implies: 'You are looking at index maintenance.',
+      why: 'Bloat does degrade performance and is worth checking, but it usually produces gradual degradation rather than a sharp change, and it would not typically produce a step change in disk read throughput.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'The queries are returning more rows than before',
+      implies: 'You are looking for a change in the workload.',
+      why: 'Worth ruling out, but the flat traffic and the specific signature of increased disk reads point at the cache rather than at the queries. If the queries had changed shape, you would expect plan or row-count changes too.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the leading indicator that would have caught this earlier: cache hit ratio, monitored as a trend. It also notes the options — more memory, a smaller working set through partitioning or archiving old data, or moving cold data to a different store — and that adding memory only buys time if the growth continues."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Index types and the query planner', sourceId: 'postgres-docs' },
+    {
+      label: 'Storage engine internals: B-trees, LSM trees and their trade-offs',
+      sourceId: 'database-internals',
+    },
+    { label: 'Storage and retrieval from first principles', sourceId: 'ddia' },
+    {
+      label: 'Next: what happens when two requests write at the same time',
+      href: '/lessons/two-requests-at-once',
+    },
+  ]}
+/>

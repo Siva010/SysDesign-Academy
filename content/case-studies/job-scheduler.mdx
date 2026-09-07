@@ -1,0 +1,480 @@
+---
+id: job-scheduler
+title: Job Scheduler
+ask: Design a service that runs a job at a specified future time, once, with hundreds of millions of jobs outstanding.
+difficulty: advanced
+minutes: 55
+signatures: [scheduling, exactly-once-effect]
+concepts: [delay-queue, queue, lease, fencing-token, at-least-once, exactly-once, effectively-once, duplicate-processing, idempotency, idempotency-key, clock-skew, leader-election, partitioning, partition-key, hot-partition, thundering-herd, backpressure, dead-letter-queue, poison-message, exponential-backoff, retry, retry-budget, timeout, load-shedding, tenant-isolation, rate-limiting, blast-radius, durability, wal, batching, versioning, expand-contract, graceful-degradation]
+patterns: [idempotency-key, token-bucket, bulkhead, circuit-breaker]
+prerequisites: [doing-it-later, delivery-and-duplicates]
+sources: [ddia, sre-book, aws-builders-library, aws-jitter, postgres-docs, chubby, kafka-docs]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a service that runs a job at a specified future time, once, with hundreds of
+> millions of jobs outstanding.&rdquo;
+
+Almost everyone starts by reaching for a timer, and the timer is the least interesting part. The
+real content is elsewhere:
+
+- **Durability.** The machine that accepted the schedule will not be the machine that runs it. It
+  may not exist by then.
+- **Effect-once.** You will get at-least-once delivery. Whether the job's *effect* happens once is
+  a separate problem with a separate answer.
+- **Concentration.** Humans schedule things on the hour. Your load is a set of spikes created by
+  a cultural convention about round numbers.
+- **Clocks.** Two machines disagree about what time it is, and your precision requirement is
+  bounded by that disagreement whether you acknowledge it or not.
+
+The framing that makes all of this tractable: **a scheduler is a database with
+`WHERE due_at <= now()` run in a loop.** Once it is a query, every problem becomes a familiar one —
+index design, partitioning, hot keys, claim contention, poll cost.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| What precision is required? | Plus or minus a minute is a cheap polling problem. Plus or minus 50 ms is a clock problem and costs an order of magnitude more. |
+| Once, at least once, or at most once? | A reminder email tolerates a duplicate. A charge does not. A stock trade tolerates neither a duplicate nor a late fire. |
+| How far ahead may a job be scheduled? | Anything beyond months means payloads outlive schema versions and timezone databases. |
+| Cancellable and reschedulable? | A mutable schedule introduces contention on a row that a poller is also trying to claim. |
+| One-shot or recurring? | Recurring means storing a rule and computing occurrences, which drags in timezones and daylight saving. |
+| Does the scheduler execute the job or dispatch it? | Running arbitrary handler code inside the scheduler means one slow handler stalls everyone's jobs. |
+
+**Assumed answers:** precision of about 5 seconds; effect-once required, with handler cooperation;
+horizon up to two years; cancellable; both one-shot and recurring; the scheduler dispatches to a
+separate worker pool and never runs handler code in its own process.
+
+## Requirements
+
+**Functional:** schedule a job for a time; cancel; reschedule; recurring schedules; dispatch to a
+handler; retry on failure with backoff; dead-letter after a bounded number of attempts.
+
+**Non-functional**
+
+- A job acknowledged as scheduled is never lost, including when the accepting machine dies one
+  millisecond later.
+- Fires within about 5 seconds of the due time at p99.
+- A job's effect is applied once, given a handler that honours the supplied idempotency key.
+- One tenant's backlog does not delay another tenant's jobs.
+- Recovery from an outage does not fire the entire backlog at once.
+
+**Out of scope:** what the jobs do; workflow orchestration with dependencies between jobs; the
+handlers themselves.
+
+## Estimate
+
+- **500,000,000 jobs outstanding.**
+- A job record — id, due time, tenant, handler, payload reference, state, attempt count — at about
+  300 bytes gives roughly **150 GB**, plus the time index.
+- Spread evenly across a year, 500 million jobs fire at about **16 per second**. Trivial.
+
+They are not spread evenly, and the average is a distraction.
+
+Reminders are set for the top of the hour. Digests go out at 09:00 local time. Billing runs at
+midnight UTC. Assume 5 million jobs fire on a normal day and that 20% of them are scheduled for the
+same minute:
+
+**1,000,000 jobs in 60 seconds — about 16,600 per second — against a daily average of 58 per
+second.** A peak-to-average ratio of nearly 300.
+
+<Claim label="inference">
+The average firing rate is irrelevant to this design. Capacity is set by the peak minute, and the
+peak exists because humans choose round numbers. This is one of the few systems whose load profile
+is determined by a cultural convention rather than by user growth, which also means it will not
+smooth out as the service gets bigger.
+</Claim>
+
+The poll cost is the other half. A due-jobs query that runs every second must be an **index range
+scan over the due-time index**, returning only rows that are actually due. If it is ever a scan
+with a filter, its cost grows with the 500 million outstanding jobs rather than with the handful
+that are due, and the system slows down as it succeeds.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Job | job id | Handler, payload reference, state, attempt count, expiry policy |
+| Schedule index | partition, due time, job id | The entire design lives in this index |
+| Lease | job id | Holder and expiry, with a monotonically increasing token |
+| Attempt | job id and attempt number | Audit trail, and the natural idempotency key |
+
+**The partition key is the decision that matters.**
+
+- **Partition by due time.** Every job scheduled for next Monday at 09:00 lands in one partition.
+  Reads are perfect and writes are catastrophically hot, at exactly the moments that matter.
+- **Partition by job id hash.** Writes spread evenly. The due query must now run against every
+  partition — but each one is a small index range scan, they run in parallel, and there is only
+  one poll per partition per second.
+
+The second wins, and the reasoning is worth making explicit because it inverts the usual advice.
+Normally you choose a partition key to avoid read fan-out. Here reads are rare and cheap (one
+indexed range scan per partition per second) while writes are frequent and clustered, so paying
+fan-out on the read side to buy an even write distribution is the right trade.
+
+<Callout kind="info" title="Precision does not have to come from the poll rate">
+Polling once a second to hit 5-second precision is fine. Hitting 50 ms precision by polling twenty
+times a second multiplies the query load by twenty, forever, for a rare requirement.
+
+The alternative is two tiers: the durable store holds everything, and a poller loads jobs due in
+the next few seconds into an **in-memory timer** on the dispatcher. The store remains the truth;
+memory is only a cache of imminent work, and losing it costs one poll interval of lateness rather
+than any jobs. Precision then comes from the timer, and cost from the poll rate, and the two stop
+fighting.
+</Callout>
+
+## Design v1
+
+<Arch
+  caption="Durable first, claimed second, dispatched third. Nothing is remembered in memory alone."
+  columns={[
+    { title: 'Callers', nodes: [{ id: 'api', label: 'Schedule API' }] },
+    { title: 'Truth', nodes: [{ id: 'store', label: 'Job store', note: 'partitioned, time-indexed', tone: 'accent' }] },
+    { title: 'Poll', nodes: [{ id: 'poller', label: 'Pollers', note: 'one per partition' }] },
+    { title: 'Claim', nodes: [{ id: 'lease', label: 'Lease and claim', note: 'conditional update', tone: 'accent' }] },
+    { title: 'Dispatch', nodes: [{ id: 'q', label: 'Dispatch queue', note: 'throttled' }, { id: 'dlq', label: 'Dead letters' }] },
+    { title: 'Execute', nodes: [{ id: 'worker', label: 'Workers' }, { id: 'handler', label: 'Handlers', note: 'idempotent' }] },
+  ]}
+  edges={[
+    { from: 'api', to: 'store', label: 'durable write' },
+    { from: 'store', to: 'poller', label: 'due <= now' },
+    { from: 'poller', to: 'lease' },
+    { from: 'lease', to: 'q' },
+    { from: 'q', to: 'worker' },
+    { from: 'worker', to: 'handler', label: 'idempotency key' },
+    { from: 'worker', to: 'dlq', label: 'after N attempts' },
+  ]}
+  stages={[
+    {
+      label: 'A timer',
+      show: ['api', 'worker', 'handler'],
+      because:
+        'An in-process timer is correct on one machine that never restarts. Every deploy erases every pending job with no record that they existed, which is why this stage exists only to be discarded.',
+    },
+    {
+      label: 'Durable and polled',
+      show: ['api', 'store', 'poller', 'q', 'worker', 'handler'],
+      because:
+        'Write the intent before acknowledging it, then poll for what is due. The job now survives the death of every machine involved, and the scheduler becomes a query rather than a timer.',
+    },
+    {
+      label: 'Claimed, throttled, bounded',
+      show: ['api', 'store', 'poller', 'lease', 'q', 'dlq', 'worker', 'handler'],
+      because:
+        'A lease stops two pollers from firing the same job and releases the work when a worker dies. A throttled dispatch queue stops the scheduler from destroying its own downstream at 09:00. A dead-letter path stops one bad job from retrying forever.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Why not just use a timer?&rdquo;
+
+Because a timer is memory on one process.
+
+A deploy, a crash, an out-of-memory kill or a scale-in event erases every pending timer, and
+leaves no record that anything was ever scheduled. There is nothing to reconcile against, because
+the promise existed only in the process that made it.
+
+The rule is the same one that governs payments and orders elsewhere in this curriculum: **the
+durable record must exist before the promise is acknowledged.** The API writes the job, waits for
+the write to be durable, and only then returns success. Everything else in this design is an
+optimisation on top of that one ordering constraint.
+
+A secondary problem: a timer for six months from now pins a process for six months. Durability and
+long horizons are the same requirement wearing different clothes.
+
+### Round 2 — &ldquo;Two pollers see the same due job and both fire it.&rdquo;
+
+At-least-once is what a distributed system gives you. Two independent mechanisms are needed, and
+neither is sufficient alone.
+
+**A claim, to make duplicates rare.** A conditional update, exactly the primitive that adjudicates
+a seat or a driver:
+
+    UPDATE jobs SET state = 'running', lease_until = now() + interval '60 s', lease_token = ?
+    WHERE job_id = ? AND (state = 'pending' OR (state = 'running' AND lease_until < now()))
+
+Check the affected row count. One poller wins; the other moves on.
+
+**Idempotency, to make duplicates harmless.** The dispatch carries a stable key — job id plus the
+scheduled occurrence, *not* the attempt number, or every retry would look like new work — and the
+handler must apply it once per key.
+
+Be precise about what has been achieved: delivery is still at-least-once, and no mechanism here
+changes that. What is exactly-once is the **effect**, and it lives in the handler, not in the
+scheduler. A scheduler that advertises exactly-once delivery is either wrong or redefining the
+term.
+
+### Round 3 — &ldquo;A worker takes the job and dies.&rdquo;
+
+The lease expires and the job returns to the pool. Evaluate expiry **inside the claim query**, as
+above, so recovery never depends on a sweeper that may have stopped.
+
+Then the harder case: the worker is not dead. It was paused — a long garbage collection, a
+hypervisor stall, a network partition — and it resumes after the lease expired and after another
+worker has already run the job. Two workers now believe they hold it.
+
+The general answer is a **fencing token**: the lease carries a number that only increases, the
+worker passes it downstream, and the downstream resource rejects anything carrying a token lower
+than the highest it has seen.
+
+The honest limitation, which is usually left out: **fencing requires the protected resource to
+participate.** Your own database can check a token. A third-party payment API cannot, because it
+has never heard of your lease. Where fencing is impossible, the idempotency key is the only
+protection you have — which is precisely why Round 2 requires both mechanisms rather than treating
+them as alternatives.
+
+### Round 4 — &ldquo;A million jobs are due at 09:00:00.&rdquo;
+
+A thundering herd, and this one is self-inflicted.
+
+**Jitter at schedule time, where the product allows it.** A digest requested &ldquo;at 9am&rdquo;
+can fire anywhere in a thirty-second window and no user will ever know. Spreading at write time is
+free, requires no runtime machinery, and is by a wide margin the largest lever available. A
+scheduler that stores exactly what it was told is technically faithful and operationally reckless.
+
+**Throttle the dispatch.** The scheduler is a load generator pointed at your own services. A
+scheduler that faithfully fires a million jobs in one second has correctly and completely
+destroyed its downstream. A token bucket on dispatch, per handler, is not optional.
+
+**Decide what late means, per job.** Firing late is usually far better than never — but not
+always. A &ldquo;your offer expires in five minutes&rdquo; notification delivered two hours late is
+worse than useless. Give each job an `expire_after`, default it to something generous, and require
+the caller to think about it for anything time-critical.
+
+### Round 5 — &ldquo;The scheduler was down for two hours. Three million jobs are overdue.&rdquo;
+
+Recovery must not become the second outage, which is the usual way a two-hour incident becomes a
+six-hour one.
+
+- **Drain through the same throttle** as normal dispatch. The backlog does not earn extra capacity
+  by being a backlog.
+- **Oldest first, with per-tenant fair share.** Strict oldest-first lets the tenant with the
+  largest backlog monopolise recovery.
+- **Apply `expire_after` during the drain.** A large fraction of an overdue backlog is often work
+  that is no longer worth doing, and dropping it deliberately is faster and better than delivering
+  it late.
+- **Ramp.** Start the drain at a fraction of capacity and increase while downstream error rates
+  stay flat. The downstream services also just spent two hours in a degraded state.
+
+### Round 6 — &ldquo;Two machines disagree about what time it is.&rdquo;
+
+They always do. If each poller compares `due_at` against its own local clock, a machine whose
+clock runs fast fires jobs early, and nothing in the system notices.
+
+**Evaluate the due comparison in one place** — the store, where the query runs — so a single clock
+decides. Never compare a timestamp taken on one machine against a timestamp taken on another and
+call the difference a duration.
+
+Then accept the consequence: **precision finer than clock skew is not achievable without a
+different and much more expensive time story.** The 5-second requirement is meetable precisely
+because it is far larger than ordinary skew between well-synchronised machines. A 50-millisecond
+requirement is a different project, and the right response to it is to ask what the requirement is
+for before agreeing to it.
+
+### Round 7 — &ldquo;One tenant schedules a hundred million jobs for the same second.&rdquo;
+
+Without isolation, the worst-behaved tenant defines everyone's experience.
+
+- **Quota at schedule time**, per tenant, per time bucket. Refusing to accept the hundred-millionth
+  job for one second is a better outcome than accepting it and delaying everyone.
+- **Dedicated dispatch concurrency** per tenant — a bulkhead — so a huge backlog occupies its own
+  share of workers and not the pool.
+- **Fair-share draining** on recovery, as above.
+
+Note that the quota has to be visible to the tenant who hits it, with a clear error. Silent
+rejection turns into a support ticket that costs more than the capacity would have.
+
+### Round 8 — &ldquo;A handler fails every time and the job retries forever.&rdquo;
+
+- **Exponential backoff with jitter.** Backoff alone re-synchronises the retries of everything
+  that failed together; jitter is what actually spreads them.
+- **A bounded attempt count**, then a dead-letter record carrying the payload, the error and the
+  attempt history. A dead-letter queue nobody reads is a data-loss mechanism with extra steps, so
+  it needs an owner and an alert.
+- **A retry budget across the pool.** If retries exceed a fraction of all dispatches, the system
+  has stopped scheduling and started amplifying a downstream failure. At that point the correct
+  action is to stop retrying and shed, which is the difference between a degraded dependency and a
+  retry storm.
+
+### Round 9 — &ldquo;A recurring job runs at 09:00 local time, and the clocks change.&rdquo;
+
+Store recurring schedules as a **rule** — a timezone plus an expression — and compute the next
+occurrence at fire time. Do not precompute a list of instants: a timezone database update, which
+happens several times a year as governments change their minds, would silently invalidate every
+stored instant.
+
+Then two anomalies that have no correct answer, only a documented one:
+
+- **Spring forward.** 09:00 does not exist on that day in that zone. Skip the occurrence, or fire
+  at the transition instant?
+- **Autumn back.** 09:00 happens twice. Fire once or twice?
+
+Choose per job class. A billing run must fire exactly once and must never be skipped, so it should
+be scheduled in UTC and not in a local zone at all. A morning digest should fire once, and either
+local 09:00 is fine. A monitoring sweep can harmlessly fire twice.
+
+The point is not the answer. It is that **if you do not choose, the library you used chose for
+you**, and you will find out which way in about six months, in production, on a Sunday.
+
+### Round 10 — &ldquo;Someone scheduled a job for 2029 and we have changed the payload format.&rdquo;
+
+A two-year horizon means stored payloads outlive the code that wrote them, several times.
+
+- **Version every payload** and keep readers tolerant of older versions — expand before contract,
+  and do not remove a version until the store contains none of it. The store is queryable, so
+  &ldquo;are there any v1 payloads left&rdquo; is a question with an actual answer.
+- **Never store a serialised object graph** whose deserialisation depends on classes you will
+  refactor. Store data, not objects.
+- **Consider a bounded horizon.** Accepting a maximum of one year and requiring long-lived
+  schedules to be re-created is frequently cheaper than supporting an unbounded one, and it is a
+  requirement worth pushing back on before the horizon exists.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Schedules lost on deploy',
+      symptom: 'Jobs scheduled shortly before a release never fire. No error anywhere.',
+      cause: 'The schedule lived in an in-process timer and was acknowledged before being made durable.',
+      mitigation: 'Durable write before acknowledgement, always. The timer is a cache of imminent work, never the record.',
+    },
+    {
+      what: 'Duplicate effects',
+      symptom: 'A customer is charged twice, or receives the same notification twice, at a rate of roughly one in ten thousand.',
+      cause: 'At-least-once dispatch met a handler that is not idempotent. The claim reduces duplicates but cannot eliminate them.',
+      mitigation: 'A stable idempotency key per occurrence, honoured by the handler. Treat effect-once as the handler contract, not a delivery promise.',
+    },
+    {
+      what: 'Self-inflicted thundering herd',
+      symptom: 'Downstream services fail every hour, exactly on the hour.',
+      cause: 'Jobs were stored at the exact times requested and dispatched without a throttle.',
+      mitigation: 'Jitter at schedule time where the product allows, plus a token bucket on dispatch per handler.',
+    },
+    {
+      what: 'Recovery stampede',
+      symptom: 'The scheduler comes back and immediately takes down everything it dispatches to.',
+      cause: 'A backlog drained at full rate into services that are themselves still recovering.',
+      mitigation: 'Drain through the normal throttle with a ramp, oldest-first with per-tenant fair share, dropping work past its expiry.',
+    },
+    {
+      what: 'Zombie worker',
+      symptom: 'A job runs twice, minutes apart, with the second completion overwriting the first.',
+      cause: 'A worker paused past its lease, another claimed the job, and the original resumed and completed anyway.',
+      mitigation: 'Fencing tokens where the resource can check them; idempotency keys where it cannot. Both, because neither covers every case.',
+    },
+    {
+      what: 'The poll query degrades as the system grows',
+      symptom: 'Poll latency rises steadily over months, tracking total outstanding jobs rather than due jobs.',
+      cause: 'The due query is a scan with a filter rather than a range scan over a time-ordered index, or a partition has grown too large.',
+      mitigation: 'Index on partition and due time, and verify the plan. Cost must scale with due jobs, never with stored jobs.',
+    },
+    {
+      what: 'Daylight saving double-fire',
+      symptom: 'A monthly billing job runs twice, once a year, in one timezone.',
+      cause: 'A local-time recurring rule with no stated policy for the repeated hour.',
+      mitigation: 'Schedule anything that must fire exactly once in UTC, and state the policy explicitly for every local-time rule.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Durable write before acknowledgement | No job is ever lost | Schedule latency includes a durable write | Losing schedules were acceptable |
+| Partition by job id hash | Even writes, no hot partition at 09:00 | The due query fans out to every partition | Writes were spread and reads concentrated |
+| Poll plus in-memory timer for imminent work | Precision without a high poll rate | One more moving part | Precision of a minute were sufficient |
+| Lease plus idempotency key | Duplicates are rare and harmless | Handlers must cooperate | Handlers could not be changed |
+| Jitter at schedule time | The largest herd reduction available, free | Fires are not at the exact requested instant | The exact instant were contractual |
+| Dispatch throttle | The scheduler cannot destroy its downstream | A large burst fires over minutes, not instantly | Downstream capacity were unbounded |
+| Recurring rules stored, not expanded | Survives timezone database updates | Occurrence computation at fire time | Timezones never changed, which they do |
+| Bounded horizon | Payload evolution stays tractable | Long-lived schedules must be renewed | Payloads were guaranteed stable |
+
+## Cost
+
+Modest, and dominated by two things that are easy to get wrong.
+
+1. **The store**, at 150 GB plus indexes, replicated. Small. It stays small only if completed jobs
+   are moved out rather than accumulated — an unbounded history table is the usual way this becomes
+   a terabyte nobody planned for.
+2. **The poll query**, running continuously: partitions times poll rate times seconds per day. It
+   is the one cost that scales with the number of partitions, which is the counterweight to
+   partitioning aggressively for write spread. More partitions buy write distribution and cost
+   poll queries, and there is an optimum rather than a direction.
+3. **Peak dispatch capacity**, sized for the 09:00 minute rather than the daily average — the whole
+   reason the estimate section refuses to use the average.
+
+The obvious saving is to poll less often and accept coarser precision. The two-tier design above is
+what lets you do that without giving up precision at all, which makes it the rare optimisation that
+is not a trade.
+
+## What we did NOT build
+
+- **Exactly-once delivery.** It does not exist across a network with failures. What exists is
+  at-least-once delivery with effect-once at the handler, and being precise about that distinction
+  is the difference between a system that works and a system whose documentation lies.
+- **A workflow engine.** Dependencies between jobs, fan-out and join, conditional branches,
+  compensation — that is a different problem with a different data model. A scheduler that grows
+  DAG support one feature at a time becomes a poorly specified workflow engine.
+- **Handler execution inside the scheduler.** One slow handler in-process delays every job in that
+  process. Dispatch to a separate pool keeps the scheduler's own latency independent of what it
+  schedules.
+- **Sub-clock-skew precision.** Available, expensive, and almost never actually required. The right
+  first move is to ask what the requirement is for.
+- **An unbounded scheduling horizon.** Every year of horizon is another year of payload
+  compatibility and timezone-rule drift to support. The cost is real and arrives long after the
+  decision.
+
+## Evidence
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL supports claiming rows for processing with SELECT ... FOR UPDATE SKIP LOCKED, which
+lets concurrent workers take distinct rows without blocking on each other. This is the standard
+mechanism behind a database-backed job queue.
+</Claim>
+
+<Claim label="fact" source="chubby">
+A lock service can issue a sequencer with each lock acquisition, which the holder passes to any
+resource it acts on; the resource rejects operations carrying a stale sequencer. This is why a
+paused process cannot act on an expired lease against a participating resource.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Lease expiry alone does not prevent a paused process from acting after its lease has gone. Fencing
+tokens are described as the mechanism that makes the guarantee real, and they require the
+protected resource to check them.
+</Claim>
+
+<Claim label="convention" source="aws-jitter">
+Exponential backoff without randomisation causes clients that failed together to retry together.
+Adding jitter is documented as substantially reducing contention and the work wasted on collided
+retries.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Bounding retries with a budget across the client population, rather than only per request, is
+established practice to prevent a degraded dependency from being converted into a retry storm.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Published practice on distributed periodic scheduling treats the choice between occasionally
+skipping a run and occasionally running twice as an explicit, per-job design decision that must be
+made when the outcome of a launch is uncertain.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+A partitioned log with retained offsets allows a consumer to fall behind and later replay from its
+last committed position, which is what makes a dispatch backlog a lag problem rather than a loss
+problem.
+</Claim>
+
+<Claim label="speculation">
+The job counts, record sizes, concentration ratios, lease durations and horizon limits here are
+pedagogical choices derived from the stated requirements. They describe no particular product.
+</Claim>

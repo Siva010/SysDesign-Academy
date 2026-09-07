@@ -1,0 +1,483 @@
+---
+id: the-primitives-underneath
+title: The Primitives Underneath
+level: 7
+module: l7-primitives
+order: 1
+summary: There are not forty system design questions. There are about eleven problems, and every prompt is a combination of a few of them wearing different nouns.
+difficulty: staff
+minutes: 26
+prerequisites: [when-load-is-not-even, delivery-and-duplicates]
+concepts: [fanout-on-write, fanout-on-read, hot-key, idempotency, large-object, inverted-index, time-series-storage, partition-key, requirement-clarification, cross-shard-query, coordination-cost]
+unlocks: [back-of-envelope, non-functional-requirements]
+caseStudies: [url-shortener]
+sources: [ddia, hello-interview, system-design-primer]
+status: reviewed
+---
+
+## The problem
+
+The list of system design interview questions looks endless: URL shortener, chat, feed, ride
+hailing, food delivery, video streaming, ticket booking, ad serving, metrics platform, job
+scheduler, payment system, search engine.
+
+Preparing by memorising architectures for each is a losing strategy. There are more questions
+than you can memorise, the interviewer will change the requirements, and you will be asked
+something not on the list.
+
+But the list is misleading. **Ride hailing and food delivery are the same problem.** So are
+Instagram and Twitter. So are ticket booking and flash sales. The nouns differ; the underlying
+difficulty does not.
+
+## Intuition
+
+Ask, of any prompt: **what makes this hard?**
+
+Not what the product does — what makes it *difficult to build*. Strip away the domain and you
+find a small number of recurring difficulties:
+
+- Something must be uniquely identified without coordination.
+- One write must reach many readers.
+- One item is far more popular than the rest.
+- A duplicate request must not double-apply.
+- A limited resource has concurrent claimants.
+- The data is too large to pass through your application.
+- Text must be matched and ranked.
+- Points on a map must be queried by proximity.
+- Enormous volumes of timestamped data must be ingested and summarised.
+- Work must happen later, once, reliably.
+- Events from different sources must be correlated.
+
+That is eleven. **Every system design prompt is a combination of two or three of them**, and
+each has a small set of known approaches with known trade-offs.
+
+Recognising the combination is the transferable skill. It is also what lets you say something
+useful about a system you have never thought about before.
+
+## Concretely
+
+<Example title="The same problem, different nouns">
+
+| Prompt | Primitives | The actual difficulty |
+|---|---|---|
+| Ride hailing | geo-index, scheduling | Find nearby drivers fast; match them exactly once |
+| Food delivery | geo-index, scheduling | Identical, with different latency tolerance |
+| Twitter timeline | fanout, hot-key | One write reaches many readers; some accounts are enormous |
+| Instagram feed | fanout, hot-key, large-object | Same, plus images that must not pass through your app |
+| Ticket booking | inventory-contention, exactly-once-effect | Concurrent claims on limited units; no double-selling |
+| Flash sale | inventory-contention, hot-key | Same, concentrated on one item |
+| Payments | exactly-once-effect | A timeout is an unknown outcome, not a failure |
+| Order placement | exactly-once-effect, scheduling | Same, with a workflow across services |
+| Metrics platform | time-series-ingest | Cardinality, retention, rollups |
+| Logging platform | time-series-ingest, search-index | Same, plus text search over it |
+| URL shortener | id-generation, hot-key | Unique codes without coordination; viral links |
+| Video streaming | large-object, geo-index | Bytes bypass your application; served near users |
+
+Two consequences worth noticing:
+
+**Ride hailing and food delivery differ in latency tolerance, not in structure.** If you can
+design one, you can design the other by changing one non-functional requirement.
+
+**Instagram is Twitter plus large objects.** The feed problem is identical; the images are a
+separate, well-understood problem bolted on.
+
+</Example>
+
+## Formal explanation
+
+Each primitive has a recognisable **signature** — the question that reveals it — and a small set
+of approaches with known costs.
+
+### id-generation
+
+*Signature:* something needs a unique identifier, and coordinating on every one is too expensive.
+
+Approaches: a counter allocated in blocks per instance; random with a uniqueness constraint; a
+hash of content; a composite of timestamp, machine id and sequence. Trade-offs are between
+coordination cost, guessability, and whether identifiers must be ordered.
+
+### fanout
+
+*Signature:* one write must become visible to many readers, and assembling at read time is too
+expensive.
+
+Approaches: <C id="fanout-on-write" /> precomputes; <C id="fanout-on-read" /> assembles on
+demand; hybrid does both. The distribution of follower counts decides, and it is always
+heavy-tailed, so the answer is always some hybrid.
+
+### hot-key
+
+*Signature:* one item receives more traffic than the rest combined.
+
+Approaches: replicate toward readers (edge cache, local cache) for hot reads;
+<C id="key-splitting" /> for hot writes. Never partitioning — a key cannot be divided.
+
+### exactly-once-effect
+
+*Signature:* a retry must not double-apply, and the network cannot tell you whether the first
+attempt succeeded.
+
+Approaches: caller-supplied idempotency key recorded atomically with the effect; reconciliation
+for attempts with unknown outcomes. Never "make the network reliable".
+
+### inventory-contention
+
+*Signature:* a limited resource with concurrent claimants, where overselling costs money.
+
+Approaches: conditional decrement with the condition inside the write; hold-then-confirm with
+expiry; split the pool into buckets when contention exceeds one row's throughput.
+
+### large-object
+
+*Signature:* the payload is too big to sit in a database row or pass through your application.
+
+Approaches: object storage with presigned upload URLs and CDN delivery. The rule is that **bytes
+never pass through your application**; the database stores metadata and a key.
+
+### search-index
+
+*Signature:* text must be matched approximately and ranked by relevance.
+
+Approaches: an inverted index maintained as derived data, updated asynchronously. Ranking is the
+product; matching is the easy part. Expect a consistency window and a reindex procedure.
+
+### geo-index
+
+*Signature:* "find things near me", at scale.
+
+Approaches: divide space into cells and index by cell id, so proximity becomes a key lookup over
+a small set of neighbouring cells. The parameter is cell size, which trades false positives
+against the number of cells to query.
+
+### time-series-ingest
+
+*Signature:* enormous volumes of timestamped data, queried mostly over recent ranges.
+
+Approaches: append-optimised storage, rollups, retention tiers. The failure mode is always
+**cardinality**, not volume.
+
+### scheduling
+
+*Signature:* do this later, exactly once, at scale, possibly at a specified time.
+
+Approaches: a durable queue with visibility timeouts, or a table of due work claimed with a
+conditional update. Idempotency is mandatory because at-least-once is what you get.
+
+### stream-join
+
+*Signature:* correlate events arriving from different sources, where one may be late.
+
+Approaches: windowed joins with a watermark policy. The hard decision is how long to wait for
+late data, which trades completeness against latency.
+
+<Callout kind="info" title="How to use this in an interview">
+When you receive an unfamiliar prompt, ask yourself which two or three of these it is. Then say
+so out loud: &ldquo;This is fundamentally a fanout problem with a hot-key complication, and the
+inventory piece is contention.&rdquo; That framing tells the interviewer you are reasoning from
+structure rather than from recall, and it gives you a plan for the next thirty minutes.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="Prompts differ; the primitives beneath them repeat."
+  columns={[
+    { title: 'Prompts', nodes: [{ id: 'ride', label: 'Ride hailing' }, { id: 'food', label: 'Food delivery' }, { id: 'feed', label: 'Social feed' }] },
+    { title: 'Primitives', nodes: [{ id: 'geo', label: 'geo-index', tone: 'accent' }, { id: 'sched', label: 'scheduling' }, { id: 'fan', label: 'fanout' }, { id: 'hot', label: 'hot-key' }] },
+    { title: 'Techniques', nodes: [{ id: 'cells', label: 'Spatial cells' }, { id: 'queue', label: 'Durable queue' }, { id: 'precompute', label: 'Precomputed lists' }, { id: 'replicate', label: 'Replicate to readers' }] },
+  ]}
+  edges={[
+    { from: 'ride', to: 'geo' },
+    { from: 'food', to: 'geo' },
+    { from: 'ride', to: 'sched' },
+    { from: 'feed', to: 'fan' },
+    { from: 'feed', to: 'hot' },
+    { from: 'geo', to: 'cells' },
+    { from: 'sched', to: 'queue' },
+    { from: 'fan', to: 'precompute' },
+    { from: 'hot', to: 'replicate' },
+  ]}
+  stages={[
+    {
+      label: 'What you are asked',
+      show: ['ride', 'food', 'feed'],
+      because:
+        'Three products with different names, different domains and, apparently, three different designs to memorise.',
+    },
+    {
+      label: 'What you are actually asked',
+      show: ['ride', 'food', 'feed', 'geo', 'sched', 'fan', 'hot'],
+      because:
+        'Two of the three prompts reduce to the same pair of primitives. The design work is the same; only the latency requirements differ.',
+    },
+    {
+      label: 'What you already know',
+      show: ['ride', 'food', 'feed', 'geo', 'sched', 'fan', 'hot', 'cells', 'queue', 'precompute', 'replicate'],
+      because:
+        'Each primitive has a small set of approaches with known trade-offs. Recognising the primitive gives you the approaches, which is what transfer means.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One primitive',
+      behaviour: 'The design is largely determined once you recognise it. Most junior-level prompts are here.',
+      firstToBreak: 'Nothing. This is the tractable case.',
+    },
+    {
+      scale: 'Two primitives, independent',
+      behaviour:
+        'Solve each separately and compose. A feed with images is fanout plus large objects, and the two barely interact.',
+      firstToBreak: 'Nothing structural, but the design is now long enough that time management matters.',
+    },
+    {
+      scale: 'Two primitives that interact',
+      behaviour:
+        'Fanout plus hot-key is harder than either alone, because the solution to one worsens the other: precomputing feeds is exactly what a celebrity account makes impossible.',
+      firstToBreak:
+        'The clean answer. This is where hybrids appear and where senior candidates are separated.',
+    },
+    {
+      scale: 'Three or more',
+      behaviour:
+        'The design cannot be complete in an interview. Scope becomes the skill: pick the two that matter and say why the others are out of scope.',
+      firstToBreak:
+        'Time. Candidates who try to cover everything cover nothing in depth.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Pattern-matching to a company instead of a primitive',
+      symptom:
+        'The candidate recites an architecture for "the Twitter question" and cannot adapt when the interviewer changes a requirement.',
+      cause:
+        'Memorising solutions rather than recognising problems. The recalled design has no derivation, so there is nothing to adjust.',
+      mitigation:
+        'Name the primitives out loud before designing. It forces a derivation, which is what makes the design adjustable.',
+    },
+    {
+      what: 'Missing the second primitive',
+      symptom:
+        'A clean design that collapses when the interviewer mentions a celebrity account or a flash sale.',
+      cause:
+        'The distribution was assumed uniform. Almost none are.',
+      mitigation:
+        'For any fanout or partitioning problem, ask about the distribution before designing. Heavy tails are the norm, not the exception.',
+    },
+    {
+      what: 'Solving a primitive that is not there',
+      symptom:
+        'A sharded database and a streaming platform for a workload one machine would serve.',
+      cause:
+        'Reaching for machinery associated with a category rather than with a constraint that has appeared.',
+      mitigation:
+        'Estimate first. If the numbers do not force a primitive, it is not in this problem.',
+    },
+    {
+      what: 'Treating the domain as the difficulty',
+      symptom:
+        'Twenty minutes on the business rules of ride matching and none on the geospatial index.',
+      cause: 'Confusing what the product does with what makes it hard to build.',
+      mitigation:
+        'Ask "what makes this hard?" explicitly, and answer in terms of load, distribution and failure rather than in terms of features.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Prepare by learning primitives rather than by memorising system architectures"
+  options={[
+    'Memorise architectures for the 40 most common prompts',
+    'Learn the 11 primitives and their approaches',
+    'Learn the underlying distributed systems theory and derive everything',
+  ]}
+  why="There are more prompts than you can memorise, and interviewers deliberately change requirements to see whether you can adapt. A memorised architecture has no derivation, so it cannot be adjusted; a primitive comes with its approaches and their costs."
+  gain="Unfamiliar prompts become tractable. You can adapt when requirements change, because you know why each component is there. Preparation time is bounded, because the number of primitives is small and stable."
+  sacrifice="Slower at the very start than recall. Someone who memorised the standard answer will produce a diagram faster in the first five minutes — and will lose the comparison over the following thirty."
+  failureModes={[
+    'Recognising the wrong primitive and designing for a problem that is not there',
+    'Knowing the primitives abstractly without having worked through a concrete instance',
+    'Missing a secondary primitive because the distribution was assumed uniform',
+  ]}
+  operationalBurden="Not applicable, but the study equivalent is real: each primitive needs at least one worked example, or the knowledge stays abstract and does not survive pressure."
+  cost="Weeks rather than days. Memorising ten architectures is faster and produces a much shallower result."
+  whenNot="If an interview is tomorrow and you have never seen a feed design, reading one worked example is a better use of the evening than building a taxonomy. The primitive approach is for people with time to prepare properly, which is most people most of the time."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="ddia">
+The recurring problems in data-intensive systems — partitioning, replication, fanout,
+deduplication, derived data — appear across products with very different domains, which is why a
+treatment organised by problem transfers better than one organised by product.
+</Claim>
+
+<Claim label="convention" source="hello-interview">
+Interview preparation material converges on a small set of recurring problem shapes rather than
+on an unbounded list of questions, and interview guidance consistently emphasises adaptability
+over recall.
+</Claim>
+
+<Claim label="recommendation">
+For each primitive, work one concrete example end to end, including the estimate and the failure
+walk. A primitive you have only read about will not survive an interviewer asking "why?" three
+times.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can classify an unfamiliar problem. Naming the primitives in the first two minutes is one of the strongest openings available, because it tells the interviewer the next thirty minutes have a plan."
+  depth="Be able to name the primitives in any prompt and state the standard approaches for each with their costs. Depth in two or three primitives beats shallow familiarity with all eleven."
+  followUps={[
+    'What makes this problem hard, in one sentence?',
+    'Which part of this have you seen before in another form?',
+    'The distribution is heavily skewed. Does your design still work?',
+    'Which of these primitives would you leave out of scope, and why?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'This is the Uber question, so I will draw the Uber architecture.',
+      why: 'You have recalled a diagram with no derivation. When the interviewer changes the latency requirement or the geography, there is nothing to adjust because you never established why any box was there.',
+      instead:
+        'Say what the problem is — a geospatial index plus a matching problem — then derive the design from the stated requirements. The result may look similar and it will be defensible.',
+    },
+    {
+      mistake: 'Every design gets a queue, a cache and a shard.',
+      why: 'Those are answers to specific constraints. Applying them regardless means you cannot say why they are there, and the interviewer will ask.',
+      instead:
+        'Let the estimate and the primitives determine what is needed. A design with three components and a clear justification beats one with eight and none.',
+    },
+    {
+      mistake: 'I have not seen this system before, so I cannot design it.',
+      why: 'Nobody has seen most systems before. The prompt is chosen to be unfamiliar, because familiarity would test recall rather than reasoning.',
+      instead:
+        'Decompose it into primitives out loud. "I have not built this, but it is a fanout problem with a large-object component, and here is how I would approach each" is a strong answer.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['fanout-on-write', 'hot-key', 'large-object']}
+  prompt="Design a photo-sharing app with a following model. Which primitives is this, and which two interact badly?"
+  options={[
+    {
+      id: 'a',
+      text: 'Fanout and large-object; they interact because images are big',
+      implies: 'You identified two primitives and proposed an interaction between them.',
+      why: 'Both primitives are correctly identified. But they barely interact: feeds contain references, not image bytes, so the large-object problem is solved separately with presigned uploads and CDN delivery and never touches the fanout path.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Fanout, hot-key and large-object; fanout and hot-key interact badly, because precomputing feeds is exactly what an account with 50 million followers makes impossible',
+      implies: 'You found all three and identified the pair whose solutions conflict.',
+      why: 'Fanout-on-write makes reads cheap by doing work per follower. A celebrity account turns one post into tens of millions of writes, so the technique that solves the first primitive is defeated by the second. That conflict is why every large feed system described publicly uses a hybrid.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Large-object only; the feed is straightforward',
+      implies: 'You are treating the feed as a solved problem.',
+      why: 'The feed is the hard part. Large-object handling is well-understood and largely mechanical: presigned upload, CDN delivery, metadata in the database. Fanout under a heavy-tailed follower distribution is where the design decisions are.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer states the resolution as well as the conflict: fan out for ordinary accounts, exclude accounts above a threshold and merge their posts at read time. It also notes that the threshold is a tuning parameter with a real cost — too low and you do too much read-time merging, too high and a single post can saturate the fanout pipeline."
+/>
+
+<Check
+  concepts={['requirement-clarification', 'coordination-cost']}
+  prompt="You are asked to design a system for coordinating warehouse robots. You have never thought about this. What is the first useful thing to say?"
+  options={[
+    {
+      id: 'a',
+      text: 'I have not worked on robotics, so I would need to research the domain first',
+      implies: 'You are treating unfamiliarity with the domain as a blocker.',
+      why: 'The prompt is unfamiliar by design. Declining to engage forfeits the exercise, and the domain is rarely where the difficulty lives.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Let me work out what makes it hard: this looks like a geo-index problem for positions, a scheduling problem for task assignment, and an exactly-once problem so two robots are not sent to the same item',
+      implies: 'You decomposed an unfamiliar prompt into familiar primitives before designing anything.',
+      why: 'None of these require robotics knowledge. Positions queried by proximity, work assigned exactly once, and tasks that must not be duplicated are all problems with known approaches — and naming them gives you a plan and gives the interviewer confidence.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'I would start with the data model for robots and tasks',
+      implies: 'You are beginning with entities.',
+      why: 'Not wrong, and it starts with the least informative part. Entities are similar across many systems; the access patterns and the difficulties are what differ, and those come from the primitives.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer follows the decomposition with the clarifying questions each primitive implies: how many robots and how often do they report position (sizes the geo-index), what latency is acceptable for task assignment (decides whether coordination is affordable), and what happens if a robot fails mid-task (the exactly-once and compensation question). The primitives generate the questions."
+/>
+
+<TransferCheck
+  concepts={['idempotency', 'exactly-once', 'hot-key', 'partition-key']}
+  system="A hospital runs a system for medication administration. A nurse scans a patient wristband and a drug barcode, and the system records that the dose was given. Handheld scanners lose network coverage in parts of the building and queue their scans until they reconnect. The same nurse may scan the same dose twice if the screen does not update quickly. Ward rounds mean most scans in the building happen in two twenty-minute windows a day."
+  prompt="You have never designed this. Which problems that you have already seen is it made of?"
+  options={[
+    {
+      id: 'a',
+      text: 'Effect-once under at-least-once delivery, plus a concentrated load window. Offline scanners replay queued scans, so the same administration can arrive more than once and must be deduplicated by a natural key rather than by a delivery guarantee.',
+      implies: 'You are matching on the mechanics rather than on the domain.',
+      why: 'Queued-then-replayed scans are at-least-once delivery, and a double scan is a client-side duplicate: the same shape as a retried payment with a worse consequence. The natural key is patient, drug and scheduled dose time, which makes recording twice a no-op. And two twenty-minute windows a day is the same concentration a ticket sale has, so capacity follows the peak rather than the daily average.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'It is a write-heavy time-series ingest problem, since every scan is an event with a timestamp.',
+      implies: 'You are matching on the shape of the data rather than on what makes it hard.',
+      why: 'Every scan is a timestamped event, and the volume is tiny: a few thousand a day in a large hospital. Time-series ingest is a problem about volume and cardinality, neither of which binds here. Recording the event is not the difficulty; recording it exactly once is.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'It is a consistency problem: the record must be immediately visible to every device so a second nurse does not repeat the dose.',
+      implies: 'You are identifying a real requirement in the system.',
+      why: 'Genuinely part of it, and both read-your-writes for the scanning nurse and prompt visibility to others matter. But a device that has been offline cannot be made consistent with anything, so visibility cannot be the primary defence. The duplicate must be harmless when it arrives late, which puts idempotency ahead of consistency in the ordering of concerns.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer says what it would clarify before committing, because the primitives change with the answer. If an offline scan can be hours late, the system must decide whether a late record is applied or quarantined for a human, which is the same late-data policy question a windowed stream join has. It also names the asymmetry that should drive the design: recording a dose that was not given is far more dangerous than failing to record one that was, so wherever the design must guess it should refuse and escalate rather than assume."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'Work a full example: the URL shortener',
+      href: '/case-studies/url-shortener',
+      note: 'id-generation and hot-key, derived from scratch with pressure rounds.',
+    },
+    { label: 'Browse case studies by primitive signature', href: '/case-studies' },
+    { label: 'Problems organised by difficulty rather than by product', sourceId: 'ddia' },
+    { label: 'The method for attacking an unfamiliar prompt', href: '/method' },
+  ]}
+/>

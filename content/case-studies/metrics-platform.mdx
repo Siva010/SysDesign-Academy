@@ -1,0 +1,478 @@
+---
+id: metrics-platform
+title: Metrics Platform
+ask: Design a system that collects metrics from a hundred thousand machines and answers dashboard and alerting queries over them.
+difficulty: advanced
+minutes: 55
+signatures: [time-series-ingest]
+concepts: [time-series-storage, cardinality, downsampling, retention, lsm-tree, compaction, columnar-storage, batching, backpressure, log-based-messaging, consumer-group, offset, replay, watermark, sampling, metrics, coordinated-omission, percentiles, partition-key, hot-partition, load-shedding, graceful-degradation, idempotency, cost-optimisation, tenant-isolation, rate-limiting, blast-radius]
+patterns: [token-bucket, cache-aside, cell-based-architecture]
+prerequisites: [how-a-database-stores-things, other-shapes-of-store]
+sources: [ddia, database-internals, clickhouse-docs, kafka-docs, sre-book, sre-workbook, datadog-eng]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a system that collects metrics from a hundred thousand machines and answers
+> dashboard and alerting queries over them.&rdquo;
+
+Most systems have a peak and a trough. This one does not. Metric emission is a constant rate set
+by the size of your own fleet, and it runs at that rate at four in the morning on a public
+holiday.
+
+Worse, it goes **up during an incident**. Errors emit metrics. Retries emit metrics. Autoscaling
+adds hosts, and every new host emits a full series set. The system you use to understand an outage
+is loaded by the outage. That property shapes almost every decision below.
+
+And the thing that actually kills metrics platforms is not volume. It is **cardinality**.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| What resolution, and what retention? | Ten-second samples for fifteen days and one-minute samples for five years are different systems, not different settings. |
+| Counters, gauges, or histograms? | A histogram is a dozen or more series wearing one name. It changes the estimate by an order of magnitude. |
+| Who chooses label values, and is anything user-controlled? | A label whose values come from user input has unbounded cardinality. This is the single most destructive answer available. |
+| Interactive dashboards, scheduled alerts, or both? | Different latency requirements, different fan-in, and a priority ordering you will need under load. |
+| Is losing a sample acceptable? | For a graph, yes. For anything the finance team reconciles, no — and that changes the durability of the write path. |
+| Multi-tenant? | Decides whether one team can take the platform down for everyone. |
+
+**Assumed answers:** ten-second resolution; thirteen months of retention with rollups; counters,
+gauges and histograms; labels are chosen by engineers and not validated; both dashboards and
+alerts; occasional sample loss is acceptable; internally multi-tenant across many teams.
+
+## Requirements
+
+**Functional:** agents push samples; the system stores them; queries select series by label and
+aggregate over a time range; alert rules are evaluated on a schedule; old data expires.
+
+**Non-functional**
+
+- Ingest must not lose data during an incident, which is exactly when it is most loaded.
+- Dashboard queries over a 24-hour window at p95 under about one second.
+- Alert evaluation completes within its evaluation interval, always.
+- Storage cost is bounded and predictable. This system is a cost centre and will be asked to
+  justify itself.
+- Under overload it degrades in a defined order, preserving alerting over dashboards.
+
+**Out of scope:** distributed tracing, log search, the agent's collection logic, anomaly
+detection, incident management.
+
+## Estimate
+
+- **100,000 hosts**, each exporting about **500 series** — a modest number once you count a web
+  server, a runtime, and one application.
+- **50,000,000 active series.**
+- At ten-second resolution: **5,000,000 samples per second.**
+
+A sample is a timestamp and a value: sixteen bytes stored naively.
+
+- At 16 bytes: 432 billion samples a day, about **7 TB per day**. Untenable.
+- Timestamps in a series are regularly spaced and values usually change slowly, so
+  delta-of-delta timestamps and XOR-encoded values compress to roughly **1 to 2 bytes per
+  sample** amortised. That is about **650 GB per day**.
+
+<Claim label="inference">
+Compression is not a tuning exercise here. The difference between 16 bytes and 1.5 bytes per
+sample is the difference between a design that is affordable and one that is not, and it changes
+what hardware the query path needs. This is one of the few systems where an encoding choice is
+genuinely architectural.
+</Claim>
+
+Then the part that is easy to miss. The **series index** — the label sets themselves — is
+50,000,000 entries of perhaps 200 bytes, so about 10 GB, and it must be searchable by arbitrary
+label combinations. It is small in bytes and it is where the hard queries land.
+
+<Estimator preset="storage" />
+
+Set writes per day to 432 billion and bytes per record to 2, and watch the retention row. Then set
+bytes per record to 16 and watch it again. The ratio between those two numbers is the entire
+argument for a purpose-built time-series encoding.
+
+<Callout kind="warn" title="Cardinality is multiplicative">
+Series count is the product of the distinct values of every label. A metric with 1,000 series
+gains a label with 10,000 distinct values — a container id that changes on every deploy, a
+customer id, a request id — and becomes 10,000,000 series. Nothing in the ingest path is unusually
+loaded when this happens; the index simply stops fitting, queries that scan it slow down, and the
+platform degrades for everyone. One engineer, one line of code, one afternoon.
+</Callout>
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Series | metric name plus sorted label set, hashed to a series id | The identity. The hash must be stable across processes. |
+| Sample | series id plus timestamp | Append-only, time-ordered within a series. |
+| Label index | label and value, to a set of series ids | An inverted index. The same structure a search engine uses. |
+| Rollup | series id, resolution and bucket | Derived. Rebuildable by definition. |
+
+Three access patterns, and each forces a decision:
+
+1. **One series over a time range.** A contiguous range scan, so samples for one series must be
+   stored together and in time order. This is why the data is laid out by series first and time
+   second, not the other way round.
+2. **All series matching a label selector.** A set intersection over the label index. This is
+   literally the search-index problem, and the same techniques apply.
+3. **An aggregate over millions of series for thirty days.** This is the query that will time out,
+   and it is the entire reason rollups exist.
+
+**Partitioning.** The obvious key is time, and it is wrong on its own: every write in the system
+targets the current time, so one partition takes all of it while the rest sit idle. Partition by
+**series id hash and time window**. The hash spreads the write load evenly; the time window makes
+retention a matter of dropping whole partitions instead of deleting billions of rows.
+
+<Callout kind="info" title="Retention is a storage-engine decision, not a cron job">
+Deleting expired samples row by row on an LSM-based store creates tombstones, which must then be
+compacted away, which reads and rewrites data you were trying to delete. Time-partitioned storage
+turns retention into dropping a file. If you take one thing from this section, it is that the
+partition key decided how expensive your retention policy would be, months before anyone wrote
+the policy.
+</Callout>
+
+## Design v1
+
+<Arch
+  caption="A buffer between ingest and storage is what turns a storage outage into a delay."
+  columns={[
+    { title: 'Sources', nodes: [{ id: 'agent', label: 'Agents', note: '100k hosts' }] },
+    { title: 'Ingest', nodes: [{ id: 'gw', label: 'Ingest gateway', note: 'quota, cardinality limit', tone: 'accent' }] },
+    { title: 'Buffer', nodes: [{ id: 'log', label: 'Partitioned log', note: 'durable, replayable' }] },
+    { title: 'Write', nodes: [{ id: 'writer', label: 'Writers' }, { id: 'roll', label: 'Rollup jobs' }] },
+    { title: 'Storage', nodes: [{ id: 'hot', label: 'Recent blocks', note: 'memory + local disk' }, { id: 'cold', label: 'Historical blocks', note: 'object storage' }] },
+    { title: 'Read', nodes: [{ id: 'q', label: 'Query engine' }] },
+    { title: 'Consumers', nodes: [{ id: 'dash', label: 'Dashboards' }, { id: 'alert', label: 'Alert evaluator' }] },
+  ]}
+  edges={[
+    { from: 'agent', to: 'gw' },
+    { from: 'gw', to: 'log' },
+    { from: 'log', to: 'writer' },
+    { from: 'writer', to: 'hot' },
+    { from: 'hot', to: 'roll' },
+    { from: 'roll', to: 'cold' },
+    { from: 'hot', to: 'q' },
+    { from: 'cold', to: 'q' },
+    { from: 'q', to: 'dash' },
+    { from: 'q', to: 'alert' },
+  ]}
+  stages={[
+    {
+      label: 'Write straight through',
+      show: ['agent', 'gw', 'writer', 'hot', 'q', 'dash'],
+      because:
+        'Agents push, the writer stores, dashboards read. At one thousand hosts this is correct and anything more is over-engineering. It breaks the first time storage is unavailable, because the agents have nowhere to put what they have already collected.',
+    },
+    {
+      label: 'Buffer the writes',
+      show: ['agent', 'gw', 'log', 'writer', 'hot', 'q', 'dash', 'alert'],
+      because:
+        'A durable partitioned log between ingest and storage converts a storage outage from data loss into consumer lag. Ingest acknowledges as soon as the log accepts, which also decouples ingest latency from storage latency.',
+    },
+    {
+      label: 'Tier and roll up',
+      show: ['agent', 'gw', 'log', 'writer', 'roll', 'hot', 'cold', 'q', 'dash', 'alert'],
+      because:
+        'Recent data is queried constantly and must be fast; year-old data is queried rarely and must be cheap. Rollups make long-range queries possible at all, and tiering makes retention affordable.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;An engineer adds a label containing the request id.&rdquo;
+
+Cardinality explodes. The index stops fitting in memory, every label lookup slows, and the
+platform degrades for every team at once.
+
+The fix is a **budget enforced at the ingest edge**:
+
+- Each tenant and each metric name has a maximum series count.
+- Exceeding it **rejects new series** and keeps serving existing ones.
+- The rejection is reported with the metric name and the owning team attached.
+
+Two details matter more than the limit itself. It must be enforced **at ingest**, because once the
+sample reaches storage the index entry has already been written and the damage is done. And the
+correct failure is a **refusal**, not a slowdown: rejecting one team's new series is a small,
+attributable, fixable problem, while accepting them and degrading is a large, diffuse one that
+nobody owns.
+
+**New cost:** a legitimate new deployment that adds series can be refused. The budget therefore
+needs a visible, fast path to being raised, or engineers will route around the platform.
+
+### Round 2 — &ldquo;Storage is unavailable for twenty minutes.&rdquo;
+
+Agents cannot buffer indefinitely. They run on the machines being monitored, and a monitoring
+agent that consumes memory until the host dies has caused the outage it exists to report.
+
+Put a **durable partitioned log** between ingest and storage. Ingest writes to the log and
+acknowledges; writers consume from it. A storage outage becomes consumer lag, and the writers
+catch up afterwards.
+
+**State the survivable outage as a number.** The log's retention *is* your tolerance: with six
+hours of retention you survive a six-hour storage outage and lose everything beyond it. That is a
+capacity decision with a directly computable cost, and it should be written down rather than
+discovered.
+
+### Round 3 — &ldquo;Ingest volume rises forty percent during an incident.&rdquo;
+
+The defining property of this system: **its load is correlated with its own failure**.
+
+Two consequences.
+
+**Capacity is planned for incident load, not steady state.** Headroom sized against the quiet
+Sunday baseline is not headroom. If your worst hour is 1.4 times your median hour, the platform
+must run at well under 70% of capacity at the median or it has no margin exactly when it is
+needed.
+
+**Shedding must be ordered, and the order must be known in advance.** Under overload, drop in this
+sequence:
+
+1. Debug-level and very-high-cardinality series.
+2. Dashboard-only series.
+3. Series that no alert rule depends on.
+
+The last requires the platform to know **which series alerting depends on** — a real coupling
+between the alerting configuration and the ingest path, and one worth building deliberately. The
+alternative is uniform shedding, which drops the series that pages someone with exactly the same
+probability as one nobody has looked at in a year.
+
+### Round 4 — &ldquo;A thirty-day query over two million series times out.&rdquo;
+
+At ten-second resolution, thirty days is 259,200 points per series. Two million series is half a
+trillion points, and no query engine reads that interactively.
+
+**Rollups.** Precompute one-minute, five-minute and one-hour aggregates. A query picks the
+coarsest resolution whose step still satisfies what was asked for. A thirty-day graph 1,000 pixels
+wide cannot show more than 1,000 points, so serving it from raw samples reads 500 times more data
+than can possibly be displayed.
+
+Two costs, and the second is the one people get wrong.
+
+Rollups are **derived data** and will drift — from a bug, a backfill, a late arrival. They must be
+rebuildable from raw data, and the rebuild must be tested rather than theoretical.
+
+<Callout kind="danger" title="You cannot average percentiles">
+Rolling up a mean is a weighted mean. Rolling up a maximum is a maximum. Rolling up a **p99 is not
+any function of the p99s** you started with.
+
+Take two one-minute buckets, each with 100 requests. In the first, 99 take 10 ms and one takes
+1,000 ms, so p99 is roughly 10 ms. In the second, identical. Average the p99s and you get 10 ms.
+But the combined 200 requests contain **two** at 1,000 ms, so the true p99 of the merged bucket is
+1,000 ms — a hundredfold error, and it always errs toward saying the system is healthy.
+
+The fix is structural: store histograms as bucket counts and roll them up by **adding the
+buckets**, computing the quantile at query time. A platform that stores precomputed quantiles has
+made accurate long-range latency analysis impossible, and no amount of query-side cleverness
+recovers it.
+</Callout>
+
+### Round 5 — &ldquo;Samples arrive twenty minutes late.&rdquo;
+
+A host with clock skew, or one that was partitioned and is now flushing its buffer, sends samples
+for a window already rolled up and possibly already tiered.
+
+Two honest options, and the right one differs by metric class:
+
+- **Reject beyond a watermark.** Simple and predictable. The rollup stays wrong forever, and the
+  gap is invisible unless you record the rejection.
+- **Accept and re-run the affected rollups.** Correct, and it means every rollup window can be
+  reopened, which complicates tiering and costs compute.
+
+Decide by asking who will look. For **alerting**, late data is worthless: the alert has already
+fired or already failed to. For anything reconciled against another system — capacity billing,
+usage-based charges — it matters and the reprocessing cost is justified. Making this a
+per-metric-class policy rather than a global setting is the judgment call.
+
+### Round 6 — &ldquo;Storage cost grows fifteen percent a month.&rdquo;
+
+Three levers, in increasing order of how uncomfortable they are:
+
+1. **Retention tiers.** Raw for seven days, one-minute rollups for ninety, one-hour for thirteen
+   months. Most of the bytes are old and coarse, so this is the largest technical win.
+2. **Cold tiering.** Move old blocks to object storage. Queries over them are slower, which is
+   acceptable because they are rare — but the query engine must handle the two tiers transparently
+   or every long query becomes a support ticket.
+3. **Delete series nobody reads.** Instrument which series are actually touched by a query or an
+   alert rule over ninety days. In most installations a large fraction have never been read.
+
+The third is the biggest win and the hardest, because it is a governance problem wearing an
+engineering costume. Nobody wants to be the person who deleted the metric that would have
+explained the next outage. It needs an owner, a policy, and a grace period — and if it does not
+get them, the cost conversation returns every quarter forever.
+
+### Round 7 — &ldquo;Alert evaluation now takes longer than the evaluation interval.&rdquo;
+
+Alert rules are queries on a schedule, and they compete with dashboards for the same query
+capacity. As rules accumulate, evaluation stretches past its interval, which means alerts fire
+late — the failure mode that makes the entire platform pointless.
+
+- **Separate the paths.** Alerting gets its own query capacity and strict priority. A dashboard is
+  a convenience; an alert is the reason the system exists.
+- **Stagger evaluation.** Rules scheduled on the minute all run on the minute. Spread them across
+  the interval deterministically by rule id.
+- **Share subexpressions.** Many rules select the same series with different thresholds. Evaluate
+  the selector once.
+- **Alert on the evaluation delay itself**, through the independent watchdog in Round 9. A
+  silently late alerting pipeline looks exactly like a healthy system.
+
+### Round 8 — &ldquo;One team's traffic starves everyone else.&rdquo;
+
+Multi-tenancy without isolation means the noisiest tenant sets everyone's experience.
+
+- **Ingest quota** per tenant, as a token bucket, so a burst is absorbed and a sustained excess is
+  refused.
+- **Log partitions** per tenant, so one tenant's backlog is one tenant's lag.
+- **Query concurrency limits** per tenant, so one expensive dashboard cannot occupy the engine.
+
+And the part that is usually forgotten: **quota exhaustion must be visible to the tenant whose
+quota it is.** Otherwise the failure presents to them as missing data with no explanation, they
+file a bug against the platform, and the platform team spends its week explaining rate limits one
+conversation at a time.
+
+### Round 9 — &ldquo;The metrics platform is down, and we cannot tell why.&rdquo;
+
+The platform cannot be its own monitoring. If ingest is failing, the metric that would say so
+never arrives, and every dashboard shows a flat line that looks indistinguishable from a quiet
+period.
+
+Build a **small independent watchdog**: separate infrastructure, separate alert delivery, and a
+scope narrow enough to be obviously correct. It writes a synthetic series, reads it back, and
+answers one question — is ingest accepting and is query answering? Anything more sophisticated
+becomes a second platform that also needs monitoring.
+
+The other half of the rule is a prohibition: **nothing on the serving path may hard-depend on the
+metrics platform.** If a service refuses requests when it cannot emit metrics, an observability
+outage has become a product outage, and the system built to reduce incidents is now causing them.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Cardinality explosion',
+      symptom: 'Every query slows across all tenants; the series index no longer fits in memory. Ingest volume looks normal.',
+      cause: 'A label with unbounded values — request id, container id, customer id — multiplied the series count.',
+      mitigation: 'Per-tenant and per-metric series budgets enforced at the ingest edge, rejecting new series and attributing the rejection to a team.',
+    },
+    {
+      what: 'Silent ingest loss during an incident',
+      symptom: 'Graphs have gaps for exactly the period everyone needs to understand.',
+      cause: 'Ingest capacity was sized for median load, and incident load is higher than median by design.',
+      mitigation: 'Size for incident load, buffer in a durable log, and shed in a defined order that preserves alert-bearing series.',
+    },
+    {
+      what: 'Rolled-up percentiles are wrong',
+      symptom: 'Long-range latency graphs look healthy while users complain, and the raw view disagrees with the rollup.',
+      cause: 'Quantiles were aggregated by averaging, which is not a valid operation on quantiles.',
+      mitigation: 'Store histogram bucket counts, merge buckets on rollup, compute quantiles at query time.',
+    },
+    {
+      what: 'Alerts fire late',
+      symptom: 'Pages arrive several minutes after the incident starts, and the dashboards were fine.',
+      cause: 'Alert evaluation shares query capacity with dashboards and has drifted past its interval.',
+      mitigation: 'Dedicated capacity and strict priority for alerting, staggered evaluation, and an independent alarm on evaluation delay.',
+    },
+    {
+      what: 'Retention deletes overwhelm the storage engine',
+      symptom: 'Nightly write latency spikes and compaction never catches up.',
+      cause: 'Expired samples are deleted row by row, creating tombstones that compaction must then rewrite.',
+      mitigation: 'Partition by time so retention drops whole blocks. This is decided by the partition key, long before the retention policy is written.',
+    },
+    {
+      what: 'The monitoring system is its own monitoring',
+      symptom: 'A total ingest failure appears as a quiet period. No alert fires because no data arrives to breach a threshold.',
+      cause: 'Liveness was inferred from the presence of data rather than asserted independently.',
+      mitigation: 'An independent watchdog on separate infrastructure that writes and reads a synthetic series, plus alerts on absence rather than only on thresholds.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Purpose-built time-series encoding | Roughly tenfold storage reduction | General-purpose queryability of the raw blocks | The data were not regularly spaced |
+| Durable log between ingest and storage | Storage outages become lag | One more system to run, and a bounded outage tolerance | Sample loss were genuinely free |
+| Partition by series hash and time | Even writes, cheap retention | Cross-series queries fan out | Retention were unlimited |
+| Rollups | Long-range queries are possible at all | Derived data that can drift, and a rebuild procedure | Retention were days rather than months |
+| Histogram buckets, not stored quantiles | Correct aggregation over time | More storage per latency metric | Only short-range latency mattered |
+| Reject new series past budget | One team's mistake stays theirs | Legitimate growth is occasionally blocked | Cardinality could be bounded at the source |
+| Alerting prioritised over dashboards | The system keeps its core promise under load | Dashboards degrade first, visibly | Dashboards were the product |
+
+## Cost
+
+The cost profile is unusual: nearly flat, entirely predictable, and dominated by data nobody
+reads.
+
+1. **Storage at full retention**, which is mostly cold rollups. The largest line, and the one that
+   grows without anyone deciding to grow it.
+2. **Ingest compute**, proportional to fleet size rather than to user traffic. It does not fall
+   when the business is quiet.
+3. **The log**, sized by retention rather than by throughput.
+4. **Query compute**, spiky, and dominated by a small number of expensive dashboards.
+
+A materially cheaper design lowers resolution — thirty-second samples instead of ten — and
+shortens raw retention. What that sacrifices is the ability to see short spikes at all: a
+four-second stall is invisible at thirty-second resolution, and no amount of querying recovers
+what was never recorded. That is a genuine trade, and it should be made against the shortest
+incident the organisation actually needs to be able to explain.
+
+## What we did NOT build
+
+- **Exactly-once ingest.** A sample is keyed by series and timestamp, so writing it twice
+  overwrites it with the same value. At-least-once delivery is effectively-once here **for free**,
+  because of the natural key — not because anyone built a deduplication mechanism. This is the
+  cheapest kind of correctness, and it comes from the data model rather than from machinery.
+- **A general-purpose analytical database.** Time-series data is regularly spaced, append-only and
+  queried by time range. Every one of those properties is an optimisation opportunity a
+  general-purpose engine cannot take.
+- **Logs and traces in the same store.** They share a vocabulary and nothing else. A trace is
+  high-cardinality by nature — every request is unique — which is precisely the property this
+  system refuses to accept.
+- **Anomaly detection.** A statistical layer on top of a platform whose data has gaps produces
+  confident nonsense. The dependency runs the wrong way: fix ingest completeness first.
+- **Per-sample durability guarantees.** Losing a sample loses a pixel. Paying for durable
+  acknowledgement on five million writes per second to protect a pixel is a bad trade, and saying
+  so explicitly is better than leaving it implied.
+
+## Evidence
+
+<Claim label="fact" source="database-internals">
+LSM-based storage suits append-heavy, write-dominated workloads because writes are sequential;
+the cost is deferred to compaction, and deletions become tombstones that compaction must later
+process.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage with time-based partitioning allows an entire partition to be dropped when
+it expires, which is far cheaper than deleting rows, and allows a scan to read only the columns a
+query references.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+A partitioned, retained log allows consumers to fall behind and catch up by replaying from a
+stored offset. The retention configuration bounds how far behind a consumer may fall before data
+is lost.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Monitoring systems are recommended to be simple and to have as few dependencies as possible, on
+the grounds that a paging system which depends on the infrastructure it monitors cannot be relied
+on during an incident.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Alerting on symptoms that users experience, rather than on every underlying cause, is standard
+practice, and it directly reduces the number of series that alerting must depend on.
+</Claim>
+
+<Claim label="convention" source="datadog-eng">
+Published engineering writing on metrics platforms identifies cardinality — the number of distinct
+label combinations — as the dominant scaling constraint, ahead of raw sample volume.
+</Claim>
+
+<Claim label="speculation">
+The host counts, series-per-host figures, compression ratios, retention tiers and quota
+mechanisms here are pedagogical choices derived from the stated requirements. They describe no
+particular product.
+</Claim>

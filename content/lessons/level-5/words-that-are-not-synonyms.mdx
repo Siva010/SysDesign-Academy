@@ -1,0 +1,433 @@
+---
+id: words-that-are-not-synonyms
+title: Words That Are Not Synonyms
+level: 5
+module: l5-targets
+order: 2
+summary: Available, durable, reliable, fault-tolerant, scalable, correct. Six properties, six mechanisms, and some are bought by giving up others.
+difficulty: core
+minutes: 24
+prerequisites: [how-reliable-is-reliable-enough]
+concepts: [availability, durability, reliability, fault-tolerance, scalability, correctness]
+unlocks: [sla, slo, error-budget, rpo, rto, blast-radius, cap]
+sources: [sre-book, sre-workbook, ddia, gilbert-lynch, aws-well-architected, release-it]
+status: reviewed
+---
+
+## The problem
+
+&ldquo;It needs to be more reliable.&rdquo;
+
+Three engineers hear that and start three different projects. One adds a second region. One turns
+on synchronous replication. One adds retries everywhere.
+
+Six weeks later the system fails again, in a way that none of the three changes addressed, and the
+review concludes that reliability is hard.
+
+It is not that the work was bad. It is that the sentence did not contain an instruction. Six
+different properties travel under that vocabulary, they are achieved by different mechanisms, and
+at least three pairs of them are in direct opposition — so a team told to improve &ldquo;it&rdquo;
+can improve one while damaging another and honestly report success.
+
+## Intuition
+
+Imagine a library.
+
+**Can you get in right now?** Doors open, staff present. That is availability, and it says nothing
+about whether the book you want is on the shelf.
+
+**If you deposit a manuscript, will it still exist in fifty years?** Fireproof storage, several
+copies in several buildings. That is durability, and a vault that is only open on Tuesdays is
+extremely durable and mostly unavailable.
+
+**Does the catalogue tell the truth about where books are?** That is correctness, and a library can
+be open every day and consistently direct you to the wrong shelf.
+
+**Does it keep working when a librarian is ill, or the heating fails?** That is fault tolerance —
+and only with respect to the faults you planned for. Illness, yes. Flood, perhaps not.
+
+**Can it serve ten times as many readers without ten times the building?** That is scalability, and
+a small library that is perfect for its town is not therefore unscalable — it has simply never been
+asked.
+
+**Does it consistently do all of the above?** That is reliability, which is not a sixth mechanism
+but a summary of the other five holding over time.
+
+The reason this matters is that these are not layers of one quality. **Some are bought by giving up
+others**, and if you cannot name which one you are being asked for, you cannot know what you are
+allowed to trade.
+
+## Concretely
+
+<Example title="Four systems, each strong in one dimension and weak in another">
+
+**A backup archive.** Data written to it survives fires, decades and neglect. Reading it takes
+hours and it is unreachable during maintenance windows. Extremely durable, poorly available. Nobody
+considers that a defect — it is the design.
+
+**A cache.** Answers in under a millisecond, replicated across a fleet, essentially always
+reachable. Every value in it is a copy that can vanish without warning. Highly available, not
+durable at all, and this is also fine, because nothing is stored there that exists only there.
+
+**A payment ledger.** Refuses the transaction when it cannot confirm the balance. Correct
+absolutely, available conditionally — and the refusal is a feature. A ledger that guessed in order
+to stay available would be worse in every way that matters.
+
+**A social feed.** Serves something instantly, always. What it serves may be stale, out of order,
+or missing a post from thirty seconds ago. Highly available, deliberately not strictly correct, and
+users are entirely satisfied.
+
+Every one of these is well designed. Each chose which property to hold and which to release, and
+none of them could have been improved by being told to be &ldquo;more reliable&rdquo;.
+
+</Example>
+
+## Formal explanation
+
+**<C id="availability" />** — is it answering now? Measured as the fraction of requests served
+successfully over a window, and the window matters: 99.9% over a year and 99.9% over each hour are
+very different promises. Achieved by redundancy and failover. It makes no claim about the answer
+being right.
+
+**<C id="durability" />** — once a write is acknowledged, does it survive? Achieved by writing to
+stable storage, replicating to independent failure domains, and keeping backups. Its measurement is
+usually a probability of loss per year, and its real test is **restore**, not backup. An untested
+restore is a hypothesis.
+
+**<C id="correctness" />** — does the system produce the answer its specification requires?
+Independent of everything above. A system can be available five nines of the time and consistently
+wrong, and its dashboards will be green throughout, because availability instrumentation counts
+responses rather than truths.
+
+**<C id="fault-tolerance" />** — does it keep working in the presence of faults? The load-bearing
+word is **which**. Tolerance is always relative to an enumerated set: one machine, one zone, one
+disk, one slow dependency. A claim of fault tolerance without a fault list is not a property, it is
+a mood. The faults not on the list are the ones that cause the outage — a correlated failure across
+what were assumed to be independent domains, or a configuration error that reaches every replica
+simultaneously.
+
+**<C id="scalability" />** — does cost grow acceptably as load grows? It is a **derivative, not a
+level**. A system handling a million requests per second is not thereby scalable; a system handling
+a hundred whose cost doubles when load doubles is. The interesting failures are super-linear: an
+algorithm that becomes quadratic, a coordination step whose cost grows with the number of nodes, a
+join whose cost grows with the product of two growing tables.
+
+**<C id="reliability" />** — does it do the right thing consistently over time? This is the
+umbrella: correctness, availability and acceptable performance, held together, under real
+conditions. That is exactly why &ldquo;make it more reliable&rdquo; is not an instruction, and why
+the useful practice is to express it as measurable objectives on specific properties
+(<Cite id="sre-book" />).
+
+And the part that makes this a lesson rather than a glossary — **the tensions**:
+
+- **Durability against availability.** Synchronous replication means a write is not acknowledged
+  until a second copy exists. That is stronger durability and *lower* availability, because the
+  write now fails when the replica is unreachable. Choosing asynchronous replication reverses both.
+- **Correctness against availability.** During a partition you may answer with possibly-stale data
+  or refuse to answer. There is no third option (<Cite id="gilbert-lynch" />).
+- **Scalability against correctness.** Partitioning data across machines is how throughput grows,
+  and it is also what makes a transaction spanning two partitions expensive or unavailable.
+- **Fault tolerance against cost, and against simplicity.** Every tolerated fault is a mechanism,
+  and every mechanism is a thing that can itself fail — a failover that triggers spuriously is a
+  new outage source added in the name of reliability.
+
+<Callout kind="info" title="Turning a request into a requirement">
+When someone asks for reliability, four questions convert it into something you can build:
+
+1. **Which property?** Availability, durability, correctness, or a latency target.
+2. **Measured how, and from where?** Server-side success rate and user-perceived success rate
+   routinely disagree, and only one of them is the product.
+3. **Over what window, and for whom?** Monthly aggregate hides an hour of total failure. A number
+   that holds overall may not hold for the largest customer.
+4. **What may be given up to get it?** If the answer is nothing, the requirement is not yet real,
+   because every one of these is bought with something.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="The same write path, with the acknowledgement point deciding which property you get."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Service' }] },
+    { title: 'Primary', nodes: [{ id: 'p', label: 'Primary', note: 'writes here', tone: 'accent' }] },
+    { title: 'Same zone', nodes: [{ id: 'r1', label: 'Replica', note: 'sync or async' }] },
+    { title: 'Other region', nodes: [{ id: 'r2', label: 'Remote replica' }, { id: 'bk', label: 'Backup', note: 'restore tested' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'app' },
+    { from: 'app', to: 'p' },
+    { from: 'p', to: 'r1' },
+    { from: 'r1', to: 'r2' },
+    { from: 'r2', to: 'bk' },
+  ]}
+  stages={[
+    {
+      label: 'Acknowledge at the primary',
+      show: ['client', 'app', 'p'],
+      because:
+        'Fastest and most available: the write succeeds whenever one machine is up. It is also the least durable — everything not yet copied is lost with that machine, and the amount lost is your recovery point objective whether or not anyone wrote it down.',
+    },
+    {
+      label: 'Acknowledge after a second copy',
+      show: ['client', 'app', 'p', 'r1'],
+      because:
+        'Durability improves and availability falls, in the same change. The write now depends on two machines instead of one, so it fails in strictly more situations. This is the trade in its clearest form.',
+    },
+    {
+      label: 'Survive losing the building',
+      show: ['client', 'app', 'p', 'r1', 'r2', 'bk'],
+      because:
+        'A remote replica tolerates a different class of fault, and backups tolerate the fault replication cannot — a bad write or a deletion, faithfully replicated everywhere. These are different properties, and having one does not give you the other.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One machine',
+      behaviour:
+        'Correctness is easy, availability is whatever that machine offers, durability is whatever its disk offers.',
+      firstToBreak: 'Availability, on the first restart. Everything else is fine and stays fine.',
+    },
+    {
+      scale: 'Redundant within a zone',
+      behaviour:
+        'Availability improves markedly. Durability improves only if writes are acknowledged after replication.',
+      firstToBreak:
+        'The assumption of independence. Machines in one zone share power, network and a control plane, and fail together more often than the arithmetic predicts.',
+    },
+    {
+      scale: 'Multi-zone',
+      behaviour:
+        'Tolerates the loss of a zone. Cross-zone latency now appears in the write path if replication is synchronous.',
+      firstToBreak:
+        'Correctness expectations, once replication is asynchronous and reads can be served from behind.',
+    },
+    {
+      scale: 'Multi-region',
+      behaviour:
+        'Tolerates the loss of a region. Speed-of-light latency makes synchronous replication a serious cost.',
+      firstToBreak:
+        'Everything shared across regions: the deployment pipeline, the configuration, and the code. A bad config reaches every region as reliably as a good one.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Available and wrong',
+      symptom: 'Every dashboard is green and customers report incorrect data.',
+      cause: 'Availability was measured by counting responses, and a response with the wrong content is still a response.',
+      mitigation: 'Measure correctness separately — reconciliation checks, invariant assertions, comparison against an authority. Success rate is not a truth rate.',
+    },
+    {
+      what: 'Fault tolerance to the wrong faults',
+      symptom: 'A carefully engineered redundant system is taken down by a single event.',
+      cause: 'The fault list contained machine and disk failure, and the event was a configuration change applied everywhere at once.',
+      mitigation: 'Write the fault list down and include correlated faults: bad config, bad deploy, expired certificate, poisoned cache. Then test that the list is complete by causing them.',
+    },
+    {
+      what: 'Durability never verified',
+      symptom: 'A restore is attempted during an incident and the backups are unusable or incomplete.',
+      cause: 'Backup success was monitored; restore was never exercised.',
+      mitigation: 'Restore on a schedule, into a real environment, and measure how long it takes. The recovery time you have not measured is the one you do not have.',
+    },
+    {
+      what: 'Scales up but not down',
+      symptom: 'Cost grows with peak load and never recedes, so an unusual day permanently raises the bill.',
+      cause: 'Scalability was treated as a capability to add capacity rather than as a cost curve in both directions.',
+      mitigation: 'State scalability as cost per unit of load, and check it at a tenth of peak as well as at ten times.',
+    },
+    {
+      what: 'Availability measured in the wrong place',
+      symptom: 'Internal availability reads 99.99% while users report frequent failures.',
+      cause: 'Measurement happens behind the layer that is failing — a load balancer, a DNS record, a mobile network path — so failed requests are never counted.',
+      mitigation: 'Measure as close to the user as possible, and treat a request that never reached you as a failure rather than as absent data.',
+    },
+    {
+      what: 'Redundancy that is not independent',
+      symptom: 'Two replicas fail simultaneously, far more often than the multiplied probabilities suggest.',
+      cause: 'They shared a rack, a power supply, a network path, a certificate, or a deployment.',
+      mitigation: 'Enumerate what the copies share. Independence is the load-bearing assumption in every availability calculation, and it is almost always weaker than assumed.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Acknowledge a write only after it exists on a second machine"
+  options={[
+    'Acknowledge at the primary; replicate asynchronously',
+    'Acknowledge after one replica confirms',
+    'Acknowledge after a quorum of replicas confirms',
+    'Acknowledge at the primary, and reconcile losses from an upstream log',
+  ]}
+  why="Acknowledging before a second copy exists means the window between acknowledgement and replication is a window of silent data loss. Whether that matters is a product question, and it is answered by asking what one lost minute of writes costs."
+  gain="Data survives the loss of the machine that accepted it. The recovery point objective becomes zero for acknowledged writes rather than an unknown quantity nobody has measured."
+  sacrifice="Write latency includes a network round trip to the replica. Write availability falls, because the write now requires two machines rather than one, and it fails in strictly more circumstances than before."
+  failureModes={[
+    'Writes failing whenever a replica is briefly unreachable, which is more often than the replica is down',
+    'Latency spikes propagating from the replica into every write',
+    'Silent fallback to asynchronous mode under pressure, giving up the guarantee exactly when it was needed',
+  ]}
+  operationalBurden="Moderate. Replica health becomes part of the write path, so replica maintenance is now user-visible and must be scheduled and drained rather than simply performed."
+  cost="Extra machines and cross-zone traffic, plus the latency on every write forever. The saving is entirely on the day you lose a machine."
+  whenNot="When the data can be reconstructed from somewhere else — a derived view, a cache, a projection of an upstream log — durability at write time buys nothing you do not already have. When write availability matters more than the last few seconds of data, as for telemetry or analytics events, asynchronous is correct. And never adopt it as a default across every store: the right answer differs per dataset, and applying one policy everywhere means paying ledger-grade durability for metrics and accepting metrics-grade durability for ledgers."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="sre-book">
+Reliability is expressed as measurable service level objectives on specific indicators rather than
+as a general aspiration, precisely so that trade-offs can be made explicitly and so that teams know
+when they have enough.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Service level indicators should be measured as close to the user as practical, because measurement
+taken inside the system misses failures in the layers between the system and the user.
+</Claim>
+
+<Claim label="fact" source="gilbert-lynch">
+In the presence of a network partition, a system must choose between remaining available and
+maintaining linearizable consistency. It cannot provide both, so the choice is between two named
+properties rather than a matter of engineering quality.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Synchronous replication guarantees that an acknowledged write exists on a follower, at the cost of
+the write failing when that follower is unavailable. Asynchronous replication reverses both
+properties, and the difference is a durability decision rather than a performance tuning option.
+</Claim>
+
+<Claim label="recommendation" source="aws-well-architected">
+Recovery objectives should be stated as explicit targets for how much data may be lost and how long
+recovery may take, and recovery procedures should be tested rather than assumed to work.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Mechanisms added to improve stability are themselves failure sources, so each one must be justified
+against a specific fault rather than added because it is generally associated with robustness.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can say which property a requirement is about, and what you would trade for it. Candidates who use these words interchangeably cannot make a trade-off, because they cannot see two sides."
+  depth="Know that availability and durability are opposed at the acknowledgement point. Know that fault tolerance requires an enumerated fault list. Be able to say how you would measure the property you are claiming."
+  followUps={[
+    'You say it is highly available. Available to do what, measured where?',
+    'Which faults does this tolerate, and which does it not?',
+    'You acknowledge writes at the primary. How much data can you lose?',
+    'How would you know if the system were available and wrong?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Using reliability as a requirement.',
+      why: 'It names an umbrella rather than a property, so different engineers optimise different things and some of those things oppose each other. Success is unmeasurable and the work is unbounded.',
+      instead:
+        'Name the property, the measurement point, the window and the target. "99.9% of checkout requests succeed within 2 seconds, measured at the client, per hour" is buildable and testable.',
+    },
+    {
+      mistake: 'Claiming fault tolerance without listing the faults.',
+      why: 'Tolerance is always relative to something. Systems that survive machine failure routinely fail on a bad configuration applied to every machine at once, and that fault was never on anyone list.',
+      instead:
+        'Write the list, include correlated faults such as deploys and configuration, and test the ones you claim. A fault you have not caused deliberately is a fault you do not know you tolerate.',
+    },
+    {
+      mistake: 'Treating backups as durability.',
+      why: 'A backup you have never restored is a hypothesis. Backup jobs succeed while producing unusable output — incomplete, unreadable, missing the one table nobody thought to include.',
+      instead:
+        'Restore on a schedule into a real environment and time it. The number you get is your actual recovery time objective, and it is usually a surprise the first time.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['durability', 'availability']}
+  prompt="A team switches from asynchronous to synchronous replication to improve reliability. What actually changed?"
+  options={[
+    {
+      id: 'a',
+      text: 'Durability improved and availability decreased, because the write now requires two machines instead of one',
+      implies: 'You see the two properties moving in opposite directions in one change.',
+      why: 'An acknowledged write is now guaranteed to exist on a second machine, so the loss window closes — that is strictly better durability. And the write fails whenever the replica is unreachable, which happens more often than the replica is actually down, so availability is strictly worse. One change, two properties, opposite directions.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Both improved, since the data is now in two places',
+      implies: 'You are treating replication as uniformly beneficial.',
+      why: 'Having the data in two places does improve durability. But the acknowledgement now depends on both machines, so the set of circumstances in which a write fails grew. Adding a dependency to the critical path cannot increase availability, whatever it does for the data.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Write latency increased and the rest is unchanged',
+      implies: 'You noticed the performance cost.',
+      why: 'True — a round trip to the replica is now on the write path. But latency is the visible cost and not the decisive one: the important change is that the failure modes moved, and that is what determines whether this was the right decision.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer asks the product question that resolves it: what does losing the last few seconds of writes cost? For a ledger, unbounded, so the availability price is obviously worth paying. For telemetry, almost nothing, and the same change would be a bad trade. It also names the mode to guard against — a system that silently falls back to asynchronous replication when the replica is slow gives up the guarantee at precisely the moment it was being relied on, while continuing to report success."
+/>
+
+<Check
+  concepts={['fault-tolerance', 'scalability']}
+  prompt="A design is described as fault-tolerant and scalable. What should you ask before accepting either claim?"
+  options={[
+    {
+      id: 'a',
+      text: 'Which faults it tolerates, and how cost grows with load',
+      implies: 'You are converting two adjectives into two measurable statements.',
+      why: 'Fault tolerance is relative to an enumerated set: one machine, one zone, a slow dependency, a bad deploy. Scalability is a cost curve, not a capacity: the question is what happens to cost when load doubles, and whether anything in the design is super-linear. Both adjectives are unfalsifiable until they are turned into these questions.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'How many nines of availability it targets',
+      implies: 'You are asking for a target, which is a good question about a different property.',
+      why: 'Worth asking, and it does not test either claim. A system can meet an availability target while tolerating none of the faults that actually threaten it, and availability says nothing about how cost behaves as load grows.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'What the peak throughput is',
+      implies: 'You are equating scale with scalability.',
+      why: 'Peak throughput is a level, and scalability is a derivative. A system serving a million requests per second may be at its ceiling with no way past it, while one serving a hundred may double cleanly forever. The number does not answer the question.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer presses on independence and on the shape of the curve. For fault tolerance: what do the redundant copies share — a rack, a certificate, a configuration, a deployment pipeline — since every availability calculation assumes independence and that assumption is usually the weakest part of it. For scalability: which component is super-linear, because there is always one, and knowing which it is tells you the actual ceiling long before you reach it."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Objectives, indicators and why targets replace aspirations', sourceId: 'sre-book' },
+    { label: 'Choosing indicators and measuring them near the user', sourceId: 'sre-workbook' },
+    { label: 'Availability versus consistency under partition', sourceId: 'gilbert-lynch' },
+    { label: 'Synchronous and asynchronous replication, stated as a durability decision', sourceId: 'ddia' },
+    { label: 'Next: how one slow dependency becomes an outage', href: '/lessons/how-failures-spread' },
+  ]}
+/>

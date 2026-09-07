@@ -1,0 +1,176 @@
+---
+id: cqrs
+title: CQRS
+problem: One data model cannot serve both the writes that enforce your invariants and the reads that answer your queries.
+category: data
+concepts: [cqrs, denormalisation, eventual-consistency, cdc, event-sourcing, olap, inverted-index, staleness, operational-burden]
+relatedPatterns: [transactional-outbox, cache-aside]
+alsoKnownAs: [command query responsibility segregation, read model separation]
+seenIn: [Reporting views, search indexes, materialised feeds]
+sources: [martin-fowler, ddia, elasticsearch-docs]
+status: reviewed
+---
+
+## Problem
+
+A normalised model is excellent for writes: each fact lives in one place, so invariants are easy
+to enforce and updates cannot contradict each other.
+
+The same model is often poor for reads. Answering &ldquo;show me this customer's order history
+with product names, shipping status and current price&rdquo; means joining six tables, and the
+query gets slower as each of them grows.
+
+Optimising the model for reads — denormalising, duplicating — makes writes harder and invariants
+easier to violate. The two goals genuinely conflict, and tuning cannot resolve a conflict of
+shape.
+
+## Pattern
+
+Stop using one model for both.
+
+- **The write model** stays normalised and enforces invariants. It is the source of truth.
+- **One or more read models** are shaped for specific queries: denormalised, pre-joined,
+  pre-aggregated.
+- Read models are **derived** from the write model, asynchronously — through an event stream, a
+  transactional outbox, or change data capture.
+
+Each read model can use a different technology: a search index for text, a columnar store for
+analytics, a key-value store for a precomputed feed.
+
+**Read models are eventually consistent with the write model, by construction.** That is the
+central cost, and it must be acceptable to the product before you start.
+
+<Callout kind="info" title="CQRS does not require event sourcing">
+The two are frequently discussed together and are independent. CQRS separates read models from
+the write model. Event sourcing stores changes rather than current state. You can do either
+alone, and adopting both at once is a large increase in complexity that should be two separate
+decisions.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="One authority, several derived views, each shaped for one query."
+  columns={[
+    { title: 'Writes', nodes: [{ id: 'cmd', label: 'Commands' }] },
+    { title: 'Authority', nodes: [{ id: 'write', label: 'Write model', note: 'normalised', tone: 'accent' }] },
+    { title: 'Propagation', nodes: [{ id: 'stream', label: 'Change stream', note: 'outbox or CDC' }] },
+    { title: 'Read models', nodes: [{ id: 'r1', label: 'Reporting view' }, { id: 'r2', label: 'Search index' }, { id: 'r3', label: 'Feed cache' }] },
+    { title: 'Reads', nodes: [{ id: 'query', label: 'Queries' }] },
+  ]}
+  edges={[
+    { from: 'cmd', to: 'write' },
+    { from: 'write', to: 'stream' },
+    { from: 'stream', to: 'r1' },
+    { from: 'stream', to: 'r2' },
+    { from: 'stream', to: 'r3' },
+    { from: 'r1', to: 'query' },
+    { from: 'r2', to: 'query' },
+    { from: 'r3', to: 'query' },
+  ]}
+  stages={[
+    {
+      label: 'One model',
+      show: ['cmd', 'write', 'query'],
+      because:
+        'The right default. One model, strong consistency, no synchronisation. Most systems should stay here.',
+    },
+    {
+      label: 'Separate the reads',
+      show: ['cmd', 'write', 'stream', 'r1', 'r2', 'r3', 'query'],
+      because:
+        'Each read model is shaped for one query and can use a different technology. The cost is that all of them lag the write model and all of them can drift.',
+    },
+  ]}
+/>
+
+## Advantages
+
+- **Each side is optimised for its job.** Writes keep invariants; reads are fast and shaped for
+  the question.
+- **Read and write scale independently.** A read-heavy system can add read models without touching
+  the write path.
+- **Technology per query.** Search, analytics and key-value lookups each get an appropriate store.
+- **Read models are disposable.** Because they are derived, a broken one can be rebuilt from the
+  source of truth rather than repaired.
+
+## Costs
+
+- **Eventual consistency**, visible to users. A write followed immediately by a read of a derived
+  model may not reflect it.
+- **A synchronisation pipeline** to build, monitor and operate, with its own lag and failure modes.
+- **More stores to run.** Each read model is a system with backups, upgrades and capacity.
+- **Rebuild procedures are mandatory** and must be tested, because read models will drift.
+- **Debugging is harder.** &ldquo;Which model is wrong?&rdquo; becomes a routine question.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'User does not see their own write',
+      symptom: 'Someone updates a record and the list still shows the old value.',
+      cause: 'The read model lags the write model, and the user read from it immediately after writing.',
+      mitigation: 'Read from the write model for that user briefly after they write, or return the new value directly from the command response.',
+    },
+    {
+      what: 'Read model drifts',
+      symptom: 'The derived view disagrees with the source of truth, and nobody knows for how long.',
+      cause: 'A dropped event, a consumer bug, or a schema change applied to one side only.',
+      mitigation: 'Reconcile periodically — compare counts and checksums — and keep a tested rebuild procedure.',
+    },
+    {
+      what: 'Rebuild is impossible',
+      symptom: 'A read model is corrupted and cannot be regenerated.',
+      cause: 'It accumulated state that exists nowhere else, so it became a source of truth by accident.',
+      mitigation: 'Derived means derived. If a read model holds anything not reconstructible from the write model, that is a design defect.',
+    },
+    {
+      what: 'Adopted without a real driver',
+      symptom: 'Two models, a pipeline, and consistency bugs, for a system whose queries a single database served fine.',
+      cause: 'CQRS applied as an architectural style rather than in response to a measured conflict.',
+      mitigation: 'Introduce a read model when a specific query cannot be served acceptably by the write model. One at a time.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- Read and write workloads have genuinely different shapes, and one model cannot serve both.
+- The read/write ratio is high enough that optimising reads is worth real complexity.
+- Eventual consistency on the affected queries is acceptable to the product.
+- A specific query is measurably poorly served by the write model — not hypothetically.
+
+## When NOT to use it
+
+- **When one model serves both adequately.** This is most systems. A well-indexed relational
+  database answers a wide range of queries, and adding a derived model buys staleness, a pipeline
+  and a second store for no benefit.
+- **When the query must reflect the latest write.** A balance check, a permission check, or
+  inventory at the point of sale must read the authority.
+- **As a whole-system architecture.** CQRS is best applied per query, to the specific reads that
+  need it. Applying it globally means every read is eventually consistent, including those that
+  should not be.
+- **Together with event sourcing, adopted at the same time, without a driver for either.** Two
+  large increases in complexity taken simultaneously is how teams end up with a system nobody can
+  operate or explain.
+
+## Example systems
+
+<Claim label="convention" source="martin-fowler">
+CQRS is described as separating the model used for updates from the model used for queries, with
+explicit warnings that it adds significant complexity and should be applied to specific parts of
+a system rather than universally.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Deriving specialised views from an authoritative store, asynchronously, is a standard approach to
+giving several access patterns their own optimised representation without compromising the source
+of truth.
+</Claim>
+
+<Claim label="fact" source="elasticsearch-docs">
+Search indexes are near-real-time rather than immediately consistent: documents become searchable
+after a refresh interval, which is a configurable trade between indexing throughput and freshness.
+A search index is a read model, and this is its consistency window.
+</Claim>

@@ -1,0 +1,149 @@
+---
+id: idempotency-key
+title: Idempotency Key
+problem: A request that changes something must be safe to retry, but the network cannot tell you whether the first attempt took effect.
+category: consistency
+concepts: [idempotency, idempotency-key, at-least-once, retry, duplicate-processing, effectively-once, atomicity]
+relatedPatterns: [transactional-outbox, saga]
+alsoKnownAs: [request deduplication, client-supplied request id]
+seenIn: [Payment APIs, order creation endpoints, message consumers]
+sources: [stripe-eng, rfc9110, kafka-docs]
+status: reviewed
+---
+
+## Problem
+
+A client sends a request that creates something — an order, a charge, a transfer. The connection
+drops before the response arrives.
+
+The client cannot tell whether the request took effect. Neither can you, from the client's side.
+The two available options are both wrong:
+
+- **Retry** and risk doing it twice.
+- **Do not retry** and risk it never having happened.
+
+Making the operation naturally idempotent is not always possible: creating a new order is
+inherently not repeatable, because a second identical order is a legitimate thing a user might
+want.
+
+## Pattern
+
+Let the client name the intent.
+
+1. The client generates a unique key **before the first attempt** — a UUID is fine — and sends it
+   with the request, typically in an `Idempotency-Key` header.
+2. The server records the key together with the result of the operation, **in the same
+   transaction as the operation itself**.
+3. A request arriving with a key that has already been recorded returns the stored result
+   instead of performing the operation again.
+4. Keys expire after a window comfortably longer than any client retry policy.
+
+The key identifies **the intent**, not the attempt. All retries of one user action carry the same
+key; a genuinely new action carries a new one. That distinction is the whole pattern, and it is
+information only the client has.
+
+## Architecture
+
+<Arch
+  caption="The key travels with the intent, and is recorded atomically with the effect."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client', note: 'generates key once', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'api', label: 'API' }] },
+    { title: 'State', nodes: [{ id: 'keys', label: 'Key + result' }, { id: 'effect', label: 'The effect', note: 'same transaction' }] },
+    { title: 'External', nodes: [{ id: 'ext', label: 'Third party', note: 'gets the key too' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'api', label: 'key in header' },
+    { from: 'api', to: 'keys', label: 'seen before?' },
+    { from: 'api', to: 'effect' },
+    { from: 'api', to: 'ext', label: 'forward the key' },
+  ]}
+/>
+
+## Advantages
+
+- **Retries become safe at every layer** — client, SDK, load balancer, service mesh. That in turn
+  makes aggressive retry policies safe, which is what you need for reliability on unreliable
+  networks.
+- **The original result is returned**, so the client sees a consistent answer rather than a
+  conflict error.
+- **It composes across services.** Forward the key to a downstream provider and the guarantee
+  extends with it.
+
+## Costs
+
+- **Every client must participate.** A caller that omits the header gets no protection, so the
+  guarantee is only as good as your client library and documentation.
+- **A key store on the write path**, which is a new dependency with its own availability.
+- **Retention must be managed.** A row per mutation, forever, is not viable.
+- **The atomicity requirement is subtle** and easy to get wrong when the effect is external.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Key recorded after the effect',
+      symptom: 'Duplicates still occur, rarely, and usually under load or during deploys.',
+      cause: 'A crash in the window between performing the effect and recording the key.',
+      mitigation: 'Record the key in the same transaction as the effect. Where the effect is external, record intent first, act, then record the outcome, and reconcile attempts stuck in between.',
+    },
+    {
+      what: 'Key generated server-side',
+      symptom: 'Deduplication appears correct in tests and does nothing in production.',
+      cause: 'A key derived at processing time differs on every attempt, so no repeat is ever recognised.',
+      mitigation: 'The key must originate with the intent, on the client, before the first attempt.',
+    },
+    {
+      what: 'Key derived from request contents',
+      symptom: 'Two legitimate identical actions are silently collapsed into one.',
+      cause: 'Hashing the payload cannot distinguish a retry from a deliberate repeat.',
+      mitigation: 'Use a randomly generated key per user action rather than a content hash.',
+    },
+    {
+      what: 'Concurrent requests with the same key',
+      symptom: 'Two simultaneous retries both find no record and both proceed.',
+      cause: 'A check-then-write race on the key store.',
+      mitigation: 'A unique constraint on the key, so the second insert fails rather than a lookup returning empty.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The operation has an effect that cannot be undone or is expensive to undo: money, messages,
+  inventory, provisioning.
+- The client may retry, whether deliberately or through a library you do not control.
+- The operation is not naturally idempotent — it creates something new rather than setting a
+  value.
+
+## When NOT to use it
+
+- **When the operation is already idempotent.** A `PUT` to a client-chosen path, or setting a
+  field to an absolute value, is safe to repeat by construction. Adding a key store buys nothing.
+- **When a duplicate is genuinely harmless and cheap to clean up.** An internal cache-warm or a
+  metrics ping does not justify a store, a constraint and a retention job.
+- **When the caller cannot be changed.** If a legacy client will never send a header, the
+  deduplication must be built from something else — a natural business key, or reconciliation
+  after the fact.
+- **As a substitute for reconciliation on external effects.** The key makes retries safe; it does
+  not tell you the outcome of an attempt that timed out. You still need a process that asks the
+  provider what happened.
+
+## Example systems
+
+<Claim label="convention" source="stripe-eng">
+Client-supplied idempotency keys on mutating API requests are established practice in payment
+APIs, with the result stored against the key so a repeated request returns the original outcome.
+</Claim>
+
+<Claim label="fact" source="rfc9110">
+HTTP defines PUT and DELETE as idempotent and POST as not, which is why POST endpoints that
+create resources require an explicit key to be safely retryable.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Message delivery is at-least-once in practice, so consumers performing side effects need a
+stable identifier and a record of what has been processed. The idempotency key is the same
+pattern applied to messages rather than to HTTP requests.
+</Claim>

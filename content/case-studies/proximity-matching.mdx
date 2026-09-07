@@ -1,0 +1,443 @@
+---
+id: proximity-matching
+title: Proximity Matching
+ask: Design the service that finds nearby drivers for a rider and dispatches one to them.
+difficulty: advanced
+minutes: 50
+signatures: [geo-index, hot-key]
+concepts: [geospatial-index, hot-partition, partition-key, sharding, staleness, distributed-cache, back-of-envelope, throughput, load-shedding, graceful-degradation, push-vs-pull, eventual-consistency, cell-architecture, optimistic-concurrency, lease, ttl, tail-latency, hedged-request, data-residency]
+patterns: [key-splitting, cache-aside, cell-based-architecture]
+prerequisites: [splitting-the-data, when-load-is-not-even]
+sources: [ddia, database-internals, redis-docs, postgres-docs, uber-eng, tail-at-scale]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design the service that finds nearby drivers for a rider and dispatches one to
+> them.&rdquo;
+
+Two problems are glued together here, and separating them is most of the work.
+
+The first is a **spatial read**: given a point, find the objects near it. The second is
+**contention**: a driver offered to two riders is a broken product.
+
+What makes the spatial half unusual is that the index is not mostly read. Every driver reports a
+new position every few seconds, so the index is being rewritten continuously while it is being
+queried. Almost every intuition from static point-of-interest search — build the index once, read
+it forever — is inverted.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| How often do drivers report position? | This sets the write rate, and the write rate decides whether the index can be durable at all. |
+| Is &ldquo;nearby&rdquo; straight-line or road distance? | Straight-line is arithmetic. Road distance is a routing service, and you cannot afford to call it for every candidate. |
+| Is the assignment exclusive? | If one driver may be offered to several riders at once, this is a search problem. If not, there is a correctness problem hiding underneath. |
+| How stale may a position be? | Seconds of staleness is a different system from a live view. |
+| How does driver density vary? | Manhattan and a rural county cannot both be served well by one fixed cell size. |
+| Is the result the answer, or a candidate set for ranking? | A candidate set may be incomplete. An answer may not. This changes what you are allowed to drop under load. |
+
+**Assumed answers:** a position report every 4 seconds; straight-line candidates followed by real
+routing for a shortlist; exclusive assignment; up to 5 seconds of position staleness is
+acceptable; density varies by three orders of magnitude; the search returns candidates, which are
+then ranked.
+
+## Requirements
+
+**Functional:** drivers report position; a rider requests a ride; the system produces ranked
+nearby candidates; it offers the ride to one driver at a time; a driver accepts; the assignment is
+exclusive.
+
+**Non-functional**
+
+- Candidate search at p99 under about 100 ms, because a routing call happens after it inside the
+  same user-visible wait.
+- A driver is never assigned to two rides at once.
+- Positions may be stale. Assignments may not be wrong.
+- A demand spike concentrated in a few square kilometres must degrade, not fail.
+
+**Out of scope:** pricing, the routing algorithm itself, payments, driver onboarding, trip
+tracking after pickup.
+
+## Estimate
+
+- **1,000,000 drivers online** at global peak.
+- Position report every 4 seconds → **250,000 writes per second**.
+- Ride requests at peak: 100,000 per minute → **about 1,700 searches per second**.
+- Each search reads a neighbourhood of roughly 50 to 200 candidates.
+
+<Claim label="inference">
+The write rate is roughly 150 times the read rate. That single ratio decides the architecture. Any
+design that durably persists each position update — write-ahead log, replication, fsync — is
+paying full database prices for data that is worthless four seconds later.
+</Claim>
+
+Storage is not the constraint. One million drivers at about 100 bytes each is 100 MB, which fits
+in memory on a single machine. What forces distribution is write throughput and the requirement to
+survive the loss of a machine, not size.
+
+<Estimator preset="traffic" />
+
+The estimator's default is a read-dominated consumer product. Push the write share up and watch
+which numbers move: this system is unusual, and knowing *why* it is unusual is the point.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Driver position | driver id | Latest only. No history on this path. |
+| Cell membership | cell id | The set of drivers currently inside one cell. |
+| Driver state | driver id | available / offered / assigned. The contended entity. |
+| Ride request | ride id | Durable. The record of intent. |
+
+The whole spatial design is one question: how do you get from a point to a candidate set?
+
+**Two ordinary indexes, one on latitude and one on longitude.** This does not work, and
+understanding why is the foundation for everything else. Each index narrows one dimension. A
+5 km box around a point in a large city might contain 0.05 degrees of latitude and 0.05 of
+longitude — but the *latitude* range alone contains every driver in a band that stretches across
+the continent. The planner intersects two very wide ranges and reads far more rows than match.
+
+**A spatial tree.** An R-tree or a GiST index handles bounding-box queries properly. It is the
+right answer for data that changes rarely. Here it would be restructured 250,000 times per second.
+
+**A cell index.** Quantise the world into cells and give each one an id. Membership is a set:
+
+    position update:  remove driver from old cell, add to new cell
+    search:           read the cells covering the radius
+
+Both operations are set operations on a key. No tree is rebalanced, nothing is sorted, and the
+work per update is constant.
+
+<Callout kind="info" title="What geohash, quadtree and S2 actually give you">
+They are all ways of *numbering* cells so that cells near each other in space have keys near each
+other in sort order. That is what makes &ldquo;read the neighbourhood&rdquo; a small number of
+range reads rather than an arbitrary scatter. They differ in how they handle the shape of the
+Earth and in how neighbours are computed, not in the idea.
+</Callout>
+
+The subtlety is **cell size**, and it is where fixed grids fail:
+
+- Cells too large: a search in a dense city reads thousands of drivers to find the nearest ten.
+- Cells too small: a search in a rural area reads hundreds of empty cells before finding anyone.
+
+No single size serves both. Hierarchical schemes let cell size vary with density, which is the
+actual reason to prefer them over a plain grid.
+
+## Design v1
+
+<Arch
+  caption="The index is a hint. The state machine is the truth."
+  columns={[
+    { title: 'Actors', nodes: [{ id: 'driver', label: 'Driver app', note: 'ping every 4 s' }, { id: 'rider', label: 'Rider app' }] },
+    { title: 'Ingest', nodes: [{ id: 'loc', label: 'Location service' }] },
+    { title: 'Index', nodes: [{ id: 'cells', label: 'Cell index', note: 'in memory, sharded', tone: 'accent' }] },
+    { title: 'Match', nodes: [{ id: 'search', label: 'Candidate search' }, { id: 'rank', label: 'Ranking', note: 'real ETA' }] },
+    { title: 'Assign', nodes: [{ id: 'state', label: 'Driver state', note: 'conditional update', tone: 'accent' }, { id: 'ride', label: 'Ride record' }] },
+  ]}
+  edges={[
+    { from: 'driver', to: 'loc' },
+    { from: 'loc', to: 'cells', label: 'move' },
+    { from: 'rider', to: 'search', label: 'request' },
+    { from: 'cells', to: 'search', label: 'candidates' },
+    { from: 'search', to: 'rank' },
+    { from: 'rank', to: 'state', label: 'offer' },
+    { from: 'state', to: 'ride', label: 'confirm' },
+  ]}
+  stages={[
+    {
+      label: 'One index',
+      show: ['driver', 'rider', 'loc', 'cells', 'search'],
+      because:
+        'A single in-memory cell index answers "who is near this point". At one city and a few thousand drivers this is genuinely all you need, and it fits on one machine.',
+    },
+    {
+      label: 'Rank before offering',
+      show: ['driver', 'rider', 'loc', 'cells', 'search', 'rank'],
+      because:
+        'Straight-line distance is a poor proxy for arrival time across a river or a motorway. Routing is expensive, so it runs on a shortlist of candidates rather than on everything the index returned.',
+    },
+    {
+      label: 'Make the assignment exclusive',
+      show: ['driver', 'rider', 'loc', 'cells', 'search', 'rank', 'state', 'ride'],
+      because:
+        'The candidate list is stale by construction, so it cannot decide who gets the driver. A conditional transition on driver state is the only thing that sees both riders.',
+    },
+  ]}
+/>
+
+The offer is one atomic transition, and the whole correctness argument rests on it:
+
+    UPDATE drivers SET state = 'offered', ride_id = ?, offer_expires = ?
+    WHERE driver_id = ? AND state = 'available'
+
+Check the affected row count. Zero means another rider reached that driver first, and the
+dispatcher moves to the next candidate.
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Two hundred and fifty thousand writes per second into a database.&rdquo;
+
+Do not put them in a database.
+
+Positions are **ephemeral state with a four-second half-life**. Replicate the index for
+availability, not for durability: no write-ahead log, no fsync, no cross-region acknowledgement on
+the write path.
+
+**What this gives up:** there is no position history in this store. If the business needs trip
+traces — and it does — that is a separate pipeline with a separate signature (`time-series-ingest`),
+different retention and different latency requirements. Fusing them is how a 250,000-writes-per-second
+cache accidentally becomes a 250,000-writes-per-second database.
+
+**What it costs:** losing an index shard loses every position it held. That is survivable only
+because of a property established in Round 8, and it has to be designed for deliberately.
+
+### Round 2 — &ldquo;Manhattan returns 4,000 candidates; a rural county returns none.&rdquo;
+
+Both are failures of a fixed cell size.
+
+Use a **hierarchical cell scheme** and pick the level by local density: fine cells where drivers
+are dense, coarse cells where they are sparse. Then search by **expanding rings**:
+
+1. Read the cell containing the rider.
+2. If fewer than *k* candidates, read the ring of neighbours around it.
+3. Repeat until *k* candidates or a maximum radius.
+
+Both stopping rules matter. Without *k*, a dense-city search returns thousands of rows nobody will
+use. Without the maximum radius, a rural search walks outward forever and produces a driver forty
+minutes away, which is worse than an honest &ldquo;no drivers nearby&rdquo;.
+
+### Round 3 — &ldquo;A stadium empties and 3,000 drivers are in one cell.&rdquo;
+
+A hot partition, and the two available fixes work at different layers.
+
+**Split the cell.** Hierarchical ids make this natural: subdivide to a finer level where density is
+high. This is the better fix because it keeps reads proportional to what they actually need.
+
+**Split the key.** If a single cell is still too hot at the finest useful level, store its
+membership under *K* sub-keys and have updates pick one at random. Reads must then fan out to all
+*K*, so *K* is a cost paid on every read to relieve pressure on writes — track density rather than
+setting it once.
+
+Both are the same idea the pattern library calls key splitting, applied to a key that the physical
+world chose for you rather than one you picked.
+
+### Round 4 — &ldquo;Two riders are offered the same driver.&rdquo;
+
+This is not a geospatial problem, and trying to fix it in the index is the trap.
+
+The candidate list is **stale by construction**: it was assembled from positions up to four seconds
+old, and by the time it is ranked the world has moved on. It is a hint. Making it authoritative
+would mean putting every position update on a linearizable path, at 250,000 writes per second, to
+protect an operation that happens 1,700 times per second.
+
+The exclusivity lives entirely in the conditional transition on driver state. One dispatcher
+updates a row; the other updates none and moves to its next candidate. It is exactly the primitive
+that decides seat contention in the ticket booking study — a limited resource and concurrent
+claimants — wearing different nouns.
+
+### Round 5 — &ldquo;A driver accepts and their phone dies before confirming.&rdquo;
+
+The offer carries a **lease**: `offer_expires`, a few seconds out. If confirmation does not arrive,
+the driver returns to available and the rider is offered someone else.
+
+Evaluate expiry **in the transition query**, not in a sweeper:
+
+    WHERE driver_id = ? AND (state = 'available'
+                             OR (state = 'offered' AND offer_expires < now()))
+
+A background job that releases expired offers is fine for tidiness. If correctness depends on it,
+then a job that has quietly stopped strands drivers as unavailable, and nobody notices until the
+supply numbers look wrong.
+
+### Round 6 — &ldquo;Search p99 is 400 ms, and every shard is fast.&rdquo;
+
+An expanding-ring search reads nine cells, which may sit on nine shards. The p99 of the whole
+search is not the p99 of one shard read — it is roughly the p99 of the *slowest of nine*. With
+shards at a 1% chance of being slow, a nine-shard read is slow about 9% of the time.
+
+Three moves, in order of how much they buy:
+
+1. **Read the cells in parallel.** Sequential ring reads multiply latency by the ring size for no
+   reason.
+2. **Set a deadline and return partial results.** A candidate set is allowed to be incomplete. This
+   is unusual and worth naming: most systems cannot answer with three-quarters of the data, and
+   this one can, because ranking and the exclusive transition happen afterwards anyway.
+3. **Hedge the slow reads.** Send a duplicate read to another replica after the p95, take whichever
+   returns first.
+
+### Round 7 — &ldquo;New Year's Eve. Request rate is ten times normal in three cities.&rdquo;
+
+Regional isolation first: a cell of infrastructure per region, so a surge in one city cannot
+consume the capacity another city depends on. The blast radius of an overload becomes one region.
+
+Then degrade the search itself rather than dropping requests:
+
+- Reduce *k*, the candidate count. Fewer candidates, slightly worse matches.
+- Reduce the maximum radius. Nearby-only matching under load.
+- Reduce ranking depth. Route the top three rather than the top ten.
+
+Each is a real product statement — *slightly worse matches instead of no matches* — which makes
+this a degradation the business can actually agree to in advance, rather than an engineering
+decision made at 2 a.m.
+
+Admission control on new ride requests is the last resort, and it should be applied to *new*
+requests only. Abandoning a rider who has already been promised a driver is far worse than making
+the next rider wait.
+
+### Round 8 — &ldquo;An index shard restarts and every search in that region returns nothing.&rdquo;
+
+The index holds no durable state, so a restarted shard is empty. It refills as drivers report —
+but only if drivers report **on a timer rather than only when they move**.
+
+That is a real design constraint, and it belongs in the client contract: a stationary driver
+waiting at an airport rank must still ping, precisely so the index can be rebuilt from nothing in
+one ping interval. It is worth stating explicitly, because an obvious client-side optimisation —
+skip the ping when the position has not changed — silently removes the property the entire
+durability argument depends on.
+
+Two consequences follow:
+
+- **Never restart a whole cell range at once.** Roll one replica at a time, or an entire region
+  goes dark for a ping interval.
+- **Warm before serving.** A restarted shard should not enter the read path until it has been
+  accepting writes for at least one ping interval, or it will answer &ldquo;no drivers nearby&rdquo;
+  with total confidence.
+
+### Round 9 — &ldquo;Regulators require driver location data to stay in-region.&rdquo;
+
+Almost free, because the work was already done for a different reason: the regional cells from
+Round 7 already keep a region's position data inside that region.
+
+This is worth pausing on. A structure adopted to bound the blast radius of an overload turned out
+to satisfy a legal constraint nobody mentioned at design time. That is the usual shape of a good
+boundary — it holds for more than one reason.
+
+What remains is the border case: a rider standing near a regional boundary whose nearest driver is
+in the neighbouring region. Handle it as an **explicit, narrow exception** — a cross-region query
+for boundary cells only, with its own latency budget and its own legal review — rather than by
+weakening the default. A boundary that is crossed by default is not a boundary.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Hot cell',
+      symptom: 'One shard saturates while the rest of the fleet is idle. Searches in one district time out.',
+      cause: 'A dense event puts thousands of drivers under a single cell key.',
+      mitigation: 'Subdivide to a finer cell level where density is high, and split membership across K sub-keys if a single cell is still too hot.',
+    },
+    {
+      what: 'Double assignment',
+      symptom: 'Two riders are told the same driver is coming.',
+      cause: 'The candidate list was treated as authoritative rather than as a stale hint.',
+      mitigation: 'A conditional transition on driver state, with the affected row count checked. The index never decides exclusivity.',
+    },
+    {
+      what: 'Region goes dark after a deploy',
+      symptom: 'Every search in a region returns no drivers for several seconds, then recovers on its own.',
+      cause: 'All index shards for that region restarted together and served reads before refilling.',
+      mitigation: 'Roll one replica at a time, and keep a restarted shard out of the read path for at least one ping interval.',
+    },
+    {
+      what: 'Drivers stuck unavailable',
+      symptom: 'Supply appears to drop while drivers report themselves as online and idle.',
+      cause: 'Offers expire via a background job that stopped running.',
+      mitigation: 'Evaluate offer expiry inside the transition query so correctness never depends on a job.',
+    },
+    {
+      what: 'Search latency grows with distance',
+      symptom: 'Requests from sparse areas are slow and sometimes match an absurdly distant driver.',
+      cause: 'Ring expansion with no maximum radius or candidate cap.',
+      mitigation: 'Cap both. Returning "no drivers nearby" quickly is a better product than a driver forty minutes away.',
+    },
+    {
+      what: 'Position history quietly becomes a requirement',
+      symptom: 'The ephemeral index acquires durability requirements, replication lag alarms and a backup schedule.',
+      cause: 'A second use case — trip replay, analytics, disputes — was served from the dispatch index because it was already there.',
+      mitigation: 'Emit positions to a separate stream for history. Two access patterns with different durability needs are two systems.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Ephemeral in-memory index | 250k writes/s at low cost | Any durability of position | Positions had to be replayable from this store |
+| Hierarchical cells | One scheme serves dense and sparse | More complex neighbour logic than a grid | Density were uniform across the service area |
+| Candidates from geometry, ranking from routing | Routing cost is bounded by shortlist size | Occasionally a closer-by-road driver is not shortlisted | Routing were cheap enough to run on everything |
+| Conditional state transition | Exclusive assignment, no locks | Nothing meaningful | — |
+| Partial results under deadline | Bounded search latency | Occasionally a smaller candidate set | The result had to be complete |
+| Regional cells | Bounded blast radius, and residency for free | Cross-border matching is a special case | The service area were one jurisdiction |
+| Ping on a timer | The index self-heals in one interval | Battery and bandwidth on idle devices | Rebuild from a durable store were acceptable |
+
+## Cost
+
+The dominant cost is the write path, and it is mostly network and CPU rather than storage:
+
+1. **Position ingest** — 250,000 requests per second, every second, all day. This is the largest
+   line item and it scales with online drivers, not with rides.
+2. **Index memory** — small in absolute terms, but replicated per region for availability.
+3. **Routing calls** — expensive per call, which is exactly why they run on a shortlist. Ranking
+   every candidate rather than the top ten would multiply this by twenty.
+
+The obvious lever is the ping interval: at 8 seconds instead of 4, ingest halves. What it buys is
+staleness, and staleness shows up as a driver icon that jumps on the map and an occasional
+assignment to someone who has already left. That is a product decision about perceived quality,
+not an engineering one, and it should be made by the people who own that.
+
+## What we did NOT build
+
+- **A durable database of positions on the hot path.** Four-second-lived data does not need a
+  write-ahead log. The history pipeline is separate, and deliberately so.
+- **Road-network distance inside the candidate search.** Geometry for candidates, routing for the
+  shortlist. Calling a router for four thousand candidates is the most common way this design
+  fails.
+- **A globally consistent view of driver availability.** Consistency is required for one row at
+  the moment of assignment. Everywhere else it is a hint, and paying for it everywhere would buy
+  nothing.
+- **A single global index.** The cells exist for isolation. One index that every region depends on
+  reintroduces the blast radius that regional isolation removed.
+- **Predictive positioning.** Estimating where a driver will be in ten seconds is a real technique
+  and a real research area. It does not change any of the structure above, and adopting it before
+  the structure exists would be optimising a system that has not been built.
+
+## Evidence
+
+<Claim label="fact" source="database-internals">
+Multi-dimensional queries are commonly served by mapping several dimensions onto a single ordered
+value, so that points near each other in space are near each other in the index and a proximity
+query becomes a range scan.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL documents GiST as an index framework for data types that lack a natural linear
+ordering, including geometric types, where B-tree operators do not apply. That is the general
+answer for spatial data whose write rate is ordinary.
+</Claim>
+
+<Claim label="fact" source="redis-docs">
+Redis implements geospatial queries on top of sorted sets by encoding a coordinate pair into a
+single score, and provides commands to query by radius. It is a working demonstration that the
+whole spatial problem reduces to one ordered key.
+</Claim>
+
+<Claim label="fact" source="tail-at-scale">
+When one request fans out to many servers, overall latency is governed by the slowest response,
+so a service whose individual responses are usually fast can still have a poor tail. Hedged
+requests are described as an effective mitigation.
+</Claim>
+
+<Claim label="convention" source="uber-eng">
+Published engineering writing on large-scale real-time marketplaces describes hierarchical cell
+identifiers rather than fixed grids for indexing moving objects, for the density reason above.
+</Claim>
+
+<Claim label="speculation">
+The ping interval, driver counts, candidate caps, cell levels and radius limits here are
+pedagogical choices derived from the stated requirements. They are not descriptions of any
+company's production system.
+</Claim>

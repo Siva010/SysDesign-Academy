@@ -1,0 +1,395 @@
+---
+id: finding-the-ceiling
+title: Finding the Ceiling
+level: 1
+module: l1-ceiling
+order: 1
+summary: One machine goes further than people assume. Knowing how far, and which resource runs out first, makes distributing a decision rather than a reflex.
+difficulty: core
+minutes: 24
+prerequisites: [littles-law, bottleneck]
+concepts: [vertical-scaling, bottleneck, capacity-headroom, throughput, maintainability]
+unlocks: [horizontal-scaling, capacity-planning, autoscaling]
+failures: [pool-exhaustion]
+sources: [brendan-gregg, sre-book, ddia]
+status: reviewed
+---
+
+## The problem
+
+A team is designing a new service. Expected load: 500 requests per second, growing to maybe
+2,000 within two years. The design document proposes a sharded database, a message queue, a
+cache tier, and four microservices.
+
+Nobody in the room asks the question that would collapse the whole thing: **what can one
+machine do?**
+
+It is not a rhetorical question with a flattering answer. It has a number, the number is
+usually larger than people expect, and finding it is the cheapest architectural work
+available.
+
+## Intuition
+
+Distribution is not a free upgrade. It is a trade: you give up simplicity, transactions,
+easy debugging and cheap operations, and you get past a limit you had actually reached.
+
+If you have not reached the limit, you paid the price and got nothing.
+
+So the first job is to find the ceiling. Not to guess it, and certainly not to infer it from
+the fact that a large company built something complicated — they had a different limit and a
+different number of engineers.
+
+There is a second, subtler point. A machine does not have *one* ceiling. It has several, and
+they are hit in an order that depends on your workload:
+
+- **CPU**, if you compute per request.
+- **Memory**, if your working set is large or per-connection state is heavy.
+- **Disk I/O**, if the working set does not fit in memory.
+- **Network**, if you move large payloads.
+- **Concurrency limits** — connections, descriptors, pool slots — which usually arrive first.
+
+Finding the ceiling means finding which of these you hit, at what load, and what the graph
+looks like as you approach it.
+
+## Concretely
+
+<Example title="What a single machine can plausibly do">
+
+The honest answer to &ldquo;how many requests per second can one server handle&rdquo; is
+&ldquo;measure it&rdquo;, because it depends entirely on what a request does. But the range is
+worth internalising, because intuition is usually off by an order of magnitude in the
+pessimistic direction.
+
+<Claim label="recommendation">
+Rather than memorising figures that go stale, derive your own once and keep it. Take one
+machine, run your real workload against it, and record: requests per second at your latency
+objective, which resource saturated first, and how latency behaved as you approached it. That
+single measurement is worth more than any table, and it is the number every capacity
+conversation for the next two years will reference.
+</Claim>
+
+Two things reliably surprise teams that do this:
+
+1. The number is higher than expected, often by a lot. Modern hardware is very fast and
+   modern databases are very good.
+2. The resource that runs out first is rarely CPU. It is usually a bounded pool, a
+   connection limit, or the working set no longer fitting in memory.
+
+</Example>
+
+## Formal explanation
+
+The ceiling is set by the first resource to saturate, which is the definition of a
+<C id="bottleneck" />. Two things follow.
+
+**Optimising anything else is wasted.** If disk I/O is the constraint, a faster CPU changes
+nothing. This is why the USE method — for each resource, examine utilisation, saturation and
+errors — is the standard investigation order: it forces you to look at every resource rather
+than the one you suspect.
+
+**Fixing the bottleneck moves it.** Removing the disk constraint reveals the CPU constraint.
+Capacity work is iterative by nature, and knowing that keeps expectations honest.
+
+The second concept is <C id="capacity-headroom" />: the distance between normal load and the
+point where latency stops being acceptable. It matters because that gap is the only thing
+absorbing a spike. Autoscaling reacts in minutes; a traffic spike arrives in seconds. Headroom
+is what carries you until capacity arrives, and it is why a system running at 90% utilisation
+is not efficient but fragile.
+
+<Deeper title="Why vertical scaling is underrated">
+
+<C id="vertical-scaling">Vertical scaling</C> has a reputation as the amateur option. The
+reputation is undeserved, and the case for it is specific:
+
+- **It preserves everything.** Transactions, joins, single-node consistency, one place to look
+  during an incident. Every one of those is expensive to give up.
+- **It is instant and reversible.** Resizing is a maintenance window. Sharding is a project
+  measured in quarters, and it is very hard to undo.
+- **The hardware has moved.** Machines available today have core counts and memory sizes that
+  make many "we must distribute" arguments from a decade ago simply obsolete.
+
+The genuine limits are real and worth naming: there is a largest machine, a single machine is
+a single failure domain, and cost per unit of capacity rises at the top of the range.
+
+<Claim label="recommendation">
+The useful sequence is: measure, optimise the bottleneck, scale vertically, add read replicas,
+and only then partition. Most systems never reach the last step, and the ones that do arrive
+there with a much better understanding of their workload than they would have had at the start.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The order in which resources run out is a property of your workload, not of the machine."
+  columns={[
+    { title: 'Load', nodes: [{ id: 'load', label: 'Arriving requests' }] },
+    { title: 'Concurrency limits', nodes: [{ id: 'conn', label: 'Connections', note: 'usually first' }, { id: 'pool', label: 'Pools' }] },
+    { title: 'Compute', nodes: [{ id: 'cpu', label: 'CPU' }, { id: 'mem', label: 'Memory' }] },
+    { title: 'Storage', nodes: [{ id: 'io', label: 'Disk I/O' }, { id: 'net', label: 'Network' }] },
+  ]}
+  edges={[
+    { from: 'load', to: 'conn' },
+    { from: 'conn', to: 'pool' },
+    { from: 'pool', to: 'cpu' },
+    { from: 'cpu', to: 'mem' },
+    { from: 'mem', to: 'io' },
+    { from: 'cpu', to: 'net' },
+  ]}
+  stages={[
+    {
+      label: 'The assumed ceiling',
+      show: ['load', 'cpu'],
+      because:
+        'Most capacity conversations begin and end with CPU, because it is the resource everyone monitors by default.',
+    },
+    {
+      label: 'The real candidates',
+      show: ['load', 'conn', 'pool', 'cpu', 'mem', 'io', 'net'],
+      because:
+        'Six candidates, and the winner depends on the workload. A service doing large payloads hits network; one with a big working set hits memory then disk; most hit a bounded pool before any of them.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '1x current load',
+      behaviour: 'Comfortable. Every resource well below saturation.',
+      firstToBreak: 'Nothing, and nobody has measured what would.',
+    },
+    {
+      scale: '3x',
+      behaviour:
+        'One resource approaches its knee. p99 latency starts rising before p50 does.',
+      firstToBreak:
+        'Usually a bounded pool or connection limit, and usually invisible unless instrumented.',
+    },
+    {
+      scale: '10x',
+      behaviour:
+        'The first bottleneck is hit. Vertical scaling and configuration tuning are still available and usually sufficient.',
+      firstToBreak: 'Whichever resource your workload leans on hardest.',
+    },
+    {
+      scale: '100x',
+      behaviour:
+        'Now genuinely beyond one machine for most workloads. The distribution decision has an actual justification.',
+      firstToBreak:
+        'The single-machine assumption itself, which is the point at which the trade becomes worth making.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Distributing before measuring',
+      symptom:
+        'A complex architecture with modest traffic, slow feature delivery, and incidents nobody can debug quickly.',
+      cause:
+        'The distribution decision was made from anticipated scale that never arrived, or from imitation of a much larger company.',
+      mitigation:
+        'Measure the single-machine ceiling first. Write the number down. Revisit the decision when you are within a factor of three of it.',
+    },
+    {
+      what: 'Load testing an unrealistic workload',
+      symptom:
+        'The load test says 20,000 requests per second; production falls over at 3,000.',
+      cause:
+        'The test used a uniform key distribution, a warm cache, small payloads, or no think-time between requests. Real traffic is skewed and bursty.',
+      mitigation:
+        'Replay real traffic shapes, including the skew. Test with a cold cache too, because that is the state you will be in during an incident.',
+    },
+    {
+      what: 'Running at the knee to save money',
+      symptom:
+        'Latency is acceptable on average and terrible whenever anything varies: a deploy, a backup, a traffic burst.',
+      cause: 'No headroom, so ordinary variability has nowhere to go.',
+      mitigation:
+        'Choose a target utilisation deliberately, informed by how bursty your traffic is, and treat sustained operation above it as a capacity problem rather than a monitoring nuisance.',
+    },
+    {
+      what: 'Single machine as a single failure domain',
+      symptom: 'Total outage from one hardware fault or one bad process.',
+      cause:
+        'Vertical scaling improves capacity and does nothing for availability.',
+      mitigation:
+        'Run at least two, even if one could serve all the traffic. Redundancy and capacity are separate reasons to add a machine, and conflating them leads to designs that are fast and fragile.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Scale vertically until measurement shows a single machine cannot meet the requirement"
+  options={[
+    'Design for horizontal scale from day one',
+    'Scale vertically, add read replicas, partition only when measurement demands it',
+    'Serverless or managed services that abstract the machine entirely',
+  ]}
+  why="Distribution costs consistency, debuggability and operational simplicity. Those are worth paying for when you have hit a real limit, and pure loss when you have not. Measurement is what distinguishes the two cases."
+  gain="Transactions across your whole dataset, joins, one place to look during an incident, and a much smaller surface area for a small team. Feature delivery is faster because there is less coordination."
+  sacrifice="A hard ceiling exists, and you will hit it eventually if you grow enough. Migration at that point is a real project, and it lands when you are busy."
+  failureModes={[
+    'The ceiling arrives faster than expected and the migration is done under pressure',
+    'A single machine is a single failure domain, so availability needs a separate answer',
+    'Some workloads have no vertical answer at all: petabyte datasets, or genuinely global latency requirements',
+  ]}
+  operationalBurden="Much lower than any distributed alternative. One system to back up, upgrade, monitor and reason about. This is the largest and least-quantified benefit."
+  cost="Cost per unit of capacity rises at the top of the machine range, so the largest instances are poor value per core. Below that range it is typically far cheaper than a distributed equivalent, once engineering time is counted."
+  whenNot="When the dataset genuinely does not fit, when write throughput genuinely exceeds one node, when regulation requires data in multiple jurisdictions, or when availability requirements cannot tolerate a single failure domain and the failover story needs a distributed design anyway. Also when the growth curve is steep and known: migrating at 10x is much harder than designing for it at 1x, and that argument is legitimate when the growth is real rather than aspirational."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="brendan-gregg">
+The USE method — utilisation, saturation and errors for every resource — is standard practice
+for capacity investigation because it prevents the common failure of examining only the
+resource you already suspect.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Capacity planning based on measured per-unit cost, with deliberate headroom for variability,
+is standard reliability practice. The alternative — provisioning from intuition and reacting
+to incidents — produces systems that are simultaneously over-provisioned and fragile.
+</Claim>
+
+<Claim label="recommendation">
+Run the single-machine measurement before the architecture review, not after. It is a day of
+work and it frequently changes the decision, because the number is usually larger than the
+room assumed.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can justify complexity rather than reaching for it. An interviewer who asks 'do we need this?' is testing whether you know the difference between a design decision and an imitation."
+  depth="Be able to say what you would measure, which resource you expect to saturate for this workload, and what number would change your mind about distributing."
+  followUps={[
+    'What would make you shard this?',
+    'You estimated 200 writes per second. Does that need a distributed database?',
+    'How would you find out what one machine can do?',
+    'The dataset is 400 GB. Is that a problem?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We designed for scale from the start.',
+      why: 'Designing for scale you do not have means paying its costs — distributed transactions, eventual consistency, harder debugging, slower delivery — for a benefit that is entirely hypothetical. Meanwhile the actual constraint is usually delivery speed.',
+      instead:
+        'Design so that scaling is possible later: clean boundaries, no assumptions about single-node ordering, an identifier scheme that survives partitioning. Then build the simple thing.',
+    },
+    {
+      mistake: 'A single database will not handle this.',
+      why: 'Usually stated without a number. Modern single-node databases handle workloads that would have needed a cluster a decade ago, and the person saying this rarely knows the current figure.',
+      instead:
+        'Give the number you expect and the number you believe a machine can do. If they are within a factor of three, that is a real argument; if they are two orders apart, the conversation should stop.',
+    },
+    {
+      mistake: 'We run at 90% utilisation, which is efficient.',
+      why: 'It is efficient in the sense that a car with no crumple zone is light. Queueing delay rises steeply near saturation, so ordinary variability now produces user-visible latency, and there is nothing left to absorb a spike.',
+      instead:
+        'Choose a target utilisation from your traffic burstiness, and treat the gap as bought insurance rather than waste.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['vertical-scaling', 'bottleneck']}
+  prompt="A new service expects 300 writes per second and 8,000 reads per second, with a dataset reaching 200 GB in two years. What should the first architecture be?"
+  options={[
+    {
+      id: 'a',
+      text: 'A sharded database with a cache tier and asynchronous workers',
+      implies: 'You are treating these numbers as large.',
+      why: 'Three hundred writes per second is modest for a single well-indexed database, and 200 GB fits comfortably on one machine. This design buys distributed-systems costs — no cross-shard transactions, a harder migration path, more operational surface — for a limit that is not being approached.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'A single primary with a read replica, sized so the working set fits in memory, with the ceiling measured before launch',
+      implies: 'You are matching the architecture to the measured requirement and leaving room to grow.',
+      why: 'The write rate is well within a single primary. The read rate is high relative to writes, so a replica handles read growth. The important part is the last clause: measuring the ceiling means the decision to change later will be evidence-based rather than a panic.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'A single machine with no replica, since one can clearly handle it',
+      implies: 'You have the capacity argument right and the availability argument missing.',
+      why: 'Capacity-wise this is correct. But one machine is one failure domain, and capacity and redundancy are separate reasons to add a machine. A replica also gives you a restore path and somewhere to run expensive reads.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the specific number that would change the decision: for example, 'if writes exceed what one primary sustains at our latency target, or the working set stops fitting in memory, we revisit'. It also notes that the read/write ratio of roughly 27:1 makes caching and replicas the natural next steps, well before partitioning."
+/>
+
+<BottleneckCheck
+  concepts={['bottleneck', 'littles-law', 'connection-pooling']}
+  prompt="A service returns 800 ms at p50 under load. Every component reports the figures below. Which one is the ceiling?"
+  resources={[
+    { component: 'Application CPU', measured: '38% average across 12 instances', capacity: '12 cores each', note: 'Even across instances' },
+    { component: 'Application memory', measured: '4.1 GB of 8 GB', capacity: '8 GB per instance', note: 'Flat, no growth' },
+    { component: 'Database CPU', measured: '22%', capacity: '32 cores', note: 'No slow query log entries' },
+    { component: 'Connection pool', measured: '20 of 20 in use, 140 waiting', capacity: '20 per instance', note: 'Wait time 760 ms at p50' },
+    { component: 'Network', measured: '210 Mbps', capacity: '10 Gbps', note: 'Nowhere near saturation' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'The connection pool. It is fully occupied with a long queue, and the wait accounts for almost all the latency.',
+      implies: 'You are reading utilisation against capacity rather than looking for the largest absolute number.',
+      why: 'Every other resource has enormous headroom, and the pool is the only one at 100% with a queue behind it. The 760 ms wait is almost the entire 800 ms response, which both identifies the constraint and quantifies it. Adding application instances would add more pools and might help; adding CPU would not, because CPU was never the limit.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The database, because 140 requests are waiting on it.',
+      implies: 'You are following the queue to the thing behind it.',
+      why: 'Reasonable instinct, and the database is at 22% with no slow queries, so it is not being asked to do enough work to be slow. The requests are waiting for permission to talk to it, not for it to answer. The distinction matters, because scaling up the database is a common and expensive non-fix here.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Application CPU, since 38% across twelve instances is a lot of aggregate compute.',
+      implies: 'You are reading the largest absolute number rather than the one closest to its limit.',
+      why: 'Aggregate compute is not a constraint; the ratio to capacity is. At 38% there is nearly three times the current load available before CPU becomes relevant, and adding cores would leave the pool exactly as full as it is now.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer checks the number with Little's law rather than eyeballing it: with a pool of 20 and a database call of about 5 ms, one instance sustains roughly 4,000 calls per second, so a queue of 140 means arrivals are far above that. It also asks the question behind the question, because a pool this small is usually sized deliberately to protect the database. Raising it may move the bottleneck onto the database rather than remove it, so the right next step is finding out why it was set to 20."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'The USE method: finding the bottleneck systematically', sourceId: 'brendan-gregg' },
+    { label: 'Capacity planning and deliberate headroom', sourceId: 'sre-book' },
+    {
+      label: 'Scaling: what you actually give up when you distribute',
+      sourceId: 'ddia',
+    },
+    {
+      label: 'Next: what changes the moment there is more than one machine',
+      href: '/levels/2',
+    },
+  ]}
+/>

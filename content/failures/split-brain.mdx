@@ -1,0 +1,131 @@
+---
+id: split-brain
+title: Two Leaders, One Dataset
+symptom: After a network problem resolves, two nodes have both been accepting writes and the data no longer agrees with itself.
+category: coordination
+concepts: [split-brain, leader-election, quorum, fencing-token, lease, failure-detector, network-partition, consensus, conflict-resolution]
+sources: [raft, chubby, ddia, mit-6584]
+status: reviewed
+---
+
+## What you see
+
+**02:14** — A network fault isolates one rack. The primary database node is in that rack.
+
+**02:14:35** — The failure detector, having seen no heartbeat for 30 seconds, declares the
+primary dead. A replica is promoted. Writes resume against the new primary.
+
+**02:19** — The network fault clears. The old primary is reachable again and **has never stopped
+believing it is the primary.** From its point of view, nothing happened; it simply could not
+reach anyone for five minutes.
+
+**02:19–02:31** — Some clients still hold connections to the old primary. Those writes go to a
+node that is no longer authoritative. Other clients write to the new one.
+
+**02:31** — Someone notices that the two nodes have diverged. Both have accepted writes that the
+other does not have. There is no correct merge, because both told clients their writes had
+succeeded.
+
+## The mechanism
+
+The root cause is not the network fault. It is that **you cannot distinguish a dead node from an
+unreachable one.**
+
+From the failure detector's position, these are identical:
+
+- The primary crashed.
+- The primary is alive and the network to it is broken.
+- The primary is alive and paused — garbage collection, disk stall, hypervisor migration.
+
+The detector must decide anyway. Whichever it decides, it will sometimes be wrong, and this time
+it was wrong in the direction that produces two leaders.
+
+<Claim label="inference">
+No timeout value fixes this. A longer timeout reduces the frequency and lengthens every genuine
+failover; a shorter one does the opposite. The trade is between two kinds of mistake, and safety
+cannot come from tuning it.
+</Claim>
+
+The second mechanism is that the old primary had no way to learn it had been deposed. It was
+partitioned; it received no messages. A node cannot detect its own isolation from the inside.
+
+## Why the obvious fixes make it worse
+
+**Longer failure detection timeout.** Every real failure now takes longer to recover from, and
+a sufficiently long pause still produces the same divergence.
+
+**The old primary should check whether it is still primary.** It cannot: during the partition
+there is nobody to ask, and a paused process does not know time has passed. Any check has a
+window between the check and the write.
+
+**Manual failover only.** Slower, still susceptible — a human can be wrong about whether a node
+is dead, and now recovery waits for a human at 02:14.
+
+## What actually works
+
+**Quorum for the decision.** A node may only act as leader if a majority agrees. Since two
+majorities of the same set must overlap, and the shared member cannot vote twice, at most one
+leader can be elected per term. The minority side cannot elect anyone, so it stops rather than
+diverging.
+
+This is why consensus systems become unavailable during a partition. That unavailability is the
+guarantee working.
+
+**Fencing tokens for the resource.** Quorum makes the cluster agree. It does not stop a deposed
+leader writing to shared storage, which knows nothing about your consensus protocol.
+
+Each leadership term carries a monotonically increasing number. Every write to the protected
+resource includes it, and **the resource rejects any token lower than the highest it has seen.**
+The old primary's write is refused with no detection required anywhere.
+
+<Claim label="fact" source="raft">
+Raft guarantees at most one leader per term, because each node votes at most once per term and a
+candidate requires a majority. Messages from an earlier term are rejected, which neutralises a
+returning leader without needing to detect its return.
+</Claim>
+
+**Leases as a secondary defence.** Leadership is granted for a bounded period and must be
+renewed. A leader that has been unreachable knows its lease may have expired and must not act
+without renewing. This depends on bounded clock drift, which fencing does not — so fencing is the
+stronger mechanism and leases are the convenient one.
+
+## How to prevent it
+
+- **Never build leader election on a simple timeout.** Use a quorum-based mechanism, and use an
+  existing implementation rather than writing one.
+- **Require fencing at the protected resource.** If the storage layer cannot reject stale tokens,
+  the guarantee does not exist regardless of how good the election is.
+- **Odd-numbered clusters of three or five.** Six nodes tolerate the same failures as five and
+  cost more latency per commit.
+- **Know what happens when quorum is lost.** The correct behaviour is to stop. Confirm that your
+  system does, and that stopping is survivable for the rest of the product.
+
+## How to detect it early
+
+- **Alert on leadership changes.** Frequent elections indicate the failure detector is
+  mis-tuned, and a mis-tuned detector is the precondition for this failure.
+- **Alert on any node claiming leadership for an old term**, which means a deposed node is still
+  active.
+- **Monitor divergence directly** where feasible: compare row counts or checksums between nodes
+  that should be identical. Divergence discovered by reconciliation is far cheaper than
+  divergence discovered by a customer.
+
+## Related
+
+<Claim label="fact" source="chubby">
+A coarse-grained lock service built on consensus can issue sequence numbers so that protected
+resources are able to reject requests from stale holders. Clients commonly use such a service for
+leader election rather than for fine-grained locking.
+</Claim>
+
+<Claim label="convention" source="mit-6584">
+The impossibility of distinguishing a failed node from a slow one is foundational, and it is why
+practical systems rely on majority agreement plus fencing rather than on accurate failure
+detection.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Fencing tokens are described as the mechanism that makes distributed locking safe, because they
+place enforcement at the resource rather than relying on the client to have correct beliefs about
+its own state.
+</Claim>

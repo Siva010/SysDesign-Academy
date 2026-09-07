@@ -1,0 +1,364 @@
+---
+id: names-addresses-and-routes
+title: Names, Addresses, and Why DNS Is Slow to Change
+level: 0
+module: l0-naming
+order: 1
+summary: DNS is a globally distributed cache with no invalidation. That single fact decides how you move traffic, and how you cannot.
+difficulty: intro
+minutes: 22
+prerequisites: [ip, dns]
+concepts: [dns, dns-ttl, anycast, geo-routing, service-discovery]
+unlocks: [failover, multi-region, load-balancer]
+sources: [rfc1035, cloudflare-blog, mdn-http]
+status: reviewed
+---
+
+## The problem
+
+Your primary region is failing. You have a healthy standby in another region. The runbook says
+&ldquo;update DNS to point at the standby&rdquo;, which you do, with a 60-second TTL.
+
+Ten minutes later, a quarter of your traffic is still arriving at the dead region.
+
+Nothing is broken. This is exactly how DNS is designed to behave, and if your failover plan
+depends on it behaving otherwise, the plan does not work.
+
+## Intuition
+
+DNS is a phone book that everybody photocopies.
+
+When you look up a name, you rarely ask the authoritative source. You ask your resolver, which
+probably has a copy. Your operating system also kept a copy. So did your browser. So did the
+runtime your application is written in. Each copy has a note saying how long it may be
+considered current — but that note is advice, and not every holder of a copy takes it.
+
+So when you change the phone book, you are not changing what people read. You are starting a
+slow process of copies expiring, at a rate you only partly control.
+
+The design consequence is blunt: **DNS is excellent for saying where something lives, and poor
+for saying where something has just moved to.**
+
+## Concretely
+
+<Example title="Counting the caches between a user and your record">
+
+A user types your domain. Before any query reaches your nameservers:
+
+1. The **browser** checks its own DNS cache.
+2. The **operating system** checks its resolver cache.
+3. The **recursive resolver** — the user's ISP, or a public resolver — checks its cache.
+4. Only if all three miss does anything reach your **authoritative nameservers**.
+
+Each of those layers has its own expiry behaviour. Some honour your TTL exactly. Some enforce
+a minimum of their own. Some applications resolve a name once at startup and hold the answer
+for the lifetime of the process, which may be weeks.
+
+<Claim label="fact" source="rfc1035">
+DNS records carry a TTL that specifies how long a record may be cached before it should be
+discarded. The TTL is set by the zone's operator.
+</Claim>
+
+<Claim label="inference">
+Because caching happens at several layers, and because some resolvers apply their own minimum
+TTLs, the observed convergence time after a change is a long tail rather than a deadline. The
+practical consequence is that the old endpoint must keep working correctly for considerably
+longer than the TTL you published.
+</Claim>
+
+</Example>
+
+## Formal explanation
+
+<C id="dns" /> resolves a hierarchical name to an address by walking a delegation chain: the
+root servers know who is authoritative for `.com`, those servers know who is authoritative for
+`example.com`, and those servers hold the record. Caching at every level is what keeps this
+usable at internet scale.
+
+Three mechanisms move traffic, and they operate at different speeds:
+
+- **DNS-based routing** returns different answers to different resolvers, often based on the
+  resolver's apparent location. Cheap, flexible, and rate-limited by cache expiry.
+- <C id="anycast" /> announces the same address from many locations, and the network's own
+  routing sends each user to a topologically near one. Failover happens in the routing layer,
+  in seconds, with no cache to wait for.
+- **Load balancing** moves traffic behind a single stable address. Fastest of all, because
+  nothing outside your control has to change its mind.
+
+The general rule that follows: **the further from your infrastructure a routing decision is
+cached, the slower you can change it.**
+
+<Deeper title="Why a very short TTL is not the answer">
+
+The obvious response to slow propagation is a 30-second TTL on everything. It has costs.
+
+Every expiry forces a fresh lookup, which adds latency for the user — a full resolution can
+take several round trips if the chain is cold — and load on your nameservers, which are now
+a dependency on your critical path with a much higher request rate.
+
+It also does not buy what you wanted. Resolvers that enforce minimum TTLs ignore you, and
+applications that resolve once at startup ignore you completely. You pay the cost across
+every user, every day, to shorten a tail you do not actually control.
+
+<Claim label="recommendation">
+Use a moderate TTL — minutes rather than seconds — and get fast traffic movement from a layer
+you control: anycast, or a load balancer behind a stable address. Keep the old endpoint
+serving correctly during and after any DNS change, and treat DNS as traffic management rather
+than as failover.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Three ways to move traffic, at three different speeds."
+  columns={[
+    { title: 'User', nodes: [{ id: 'user', label: 'User' }] },
+    { title: 'Naming', nodes: [{ id: 'resolver', label: 'Resolver cache', note: 'minutes to hours' }, { id: 'auth', label: 'Authoritative DNS' }] },
+    { title: 'Routing', nodes: [{ id: 'anycast', label: 'Anycast address', note: 'seconds' }] },
+    { title: 'Balancing', nodes: [{ id: 'lb', label: 'Load balancer', note: 'immediate', tone: 'accent' }] },
+    { title: 'Origin', nodes: [{ id: 'a', label: 'Region A' }, { id: 'b', label: 'Region B', tone: 'muted' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'resolver', label: 'name?' },
+    { from: 'resolver', to: 'auth', label: 'on miss' },
+    { from: 'user', to: 'anycast', label: 'connect' },
+    { from: 'anycast', to: 'lb' },
+    { from: 'lb', to: 'a' },
+    { from: 'lb', to: 'b', dashed: true },
+  ]}
+  stages={[
+    {
+      label: 'Naming only',
+      show: ['user', 'resolver', 'auth', 'a'],
+      because:
+        'The minimal path: a name resolves to an address, and the user connects to it. Changing where traffic goes means changing the record, and waiting for caches.',
+    },
+    {
+      label: 'Add anycast',
+      show: ['user', 'resolver', 'auth', 'anycast', 'a', 'b'],
+      because:
+        'One address announced from many places. The network chooses; withdrawing an announcement moves traffic in seconds without any cache expiring.',
+    },
+    {
+      label: 'Add a balancer',
+      show: ['user', 'resolver', 'auth', 'anycast', 'lb', 'a', 'b'],
+      because:
+        'Behind a stable address, instance-level decisions are yours alone and take effect immediately. Each layer inward is faster to change than the one outside it.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One region, one address',
+      behaviour: 'DNS resolves once and rarely changes. Nobody thinks about it.',
+      firstToBreak: 'Nothing, until you need to move traffic in a hurry.',
+    },
+    {
+      scale: 'Users worldwide',
+      behaviour:
+        'Distance dominates latency. Geographic routing starts to matter more than server speed.',
+      firstToBreak:
+        'User experience at the far end of the world, not any component you monitor.',
+    },
+    {
+      scale: 'Two regions with failover',
+      behaviour:
+        'The failover mechanism becomes the critical design decision. DNS-based failover leaves a long tail on the dead region.',
+      firstToBreak:
+        'The failover itself, in the way that is hardest to test: partially, for some users, for an unpredictable duration.',
+    },
+    {
+      scale: 'Many services calling each other',
+      behaviour:
+        'Internal naming needs to change far faster than DNS can, because instances come and go continuously.',
+      firstToBreak:
+        'Any internal dependency that resolves a name once at startup. This is where service discovery becomes necessary.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'DNS failover leaves a long tail on the failed endpoint',
+      symptom:
+        'After a failover, a declining but stubborn fraction of traffic still hits the old address, sometimes for hours.',
+      cause:
+        'Layered caching, resolver minimum TTLs, and long-lived processes that resolved once at startup.',
+      mitigation:
+        'Keep the old endpoint serving — proxying to the new one if necessary — and use anycast or a load balancer for movement that must be quick.',
+    },
+    {
+      what: 'Application resolves a name once and caches forever',
+      symptom:
+        'One service keeps talking to instances that no longer exist, while everything else recovers.',
+      cause:
+        'Some runtimes cache DNS results for the process lifetime by default, regardless of TTL.',
+      mitigation:
+        'Configure the runtime resolver cache explicitly, or use a service discovery mechanism that pushes changes rather than relying on expiry.',
+    },
+    {
+      what: 'Nameservers become a single point of failure',
+      symptom:
+        'The whole service is unreachable although every server is healthy. Nothing in application monitoring shows a problem.',
+      cause:
+        'All authoritative nameservers unreachable, or an expired domain registration, or a bad zone deploy.',
+      mitigation:
+        'Use nameservers in multiple independent networks, monitor resolution from outside your own infrastructure, and alert on domain and certificate expiry dates rather than on failures.',
+    },
+    {
+      what: 'Split-horizon confusion between internal and external names',
+      symptom:
+        'A service works from inside the network and fails from outside, or vice versa, with no code difference.',
+      cause:
+        'The same name resolves differently depending on which resolver answers.',
+      mitigation:
+        'Keep internal and external names distinct rather than overloading one name with two meanings, and make the difference obvious in the name itself.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use anycast rather than DNS-based routing for regional failover"
+  options={[
+    'DNS-based failover with health checks and a short TTL',
+    'Anycast: one address announced from several locations',
+    'A single global load balancer address with regional backends',
+  ]}
+  why="Failover speed is bounded by the slowest cache between you and the user. Anycast moves the decision into network routing, where you can withdraw an announcement and see traffic move in seconds, with nothing outside your control needing to expire."
+  gain="Failover in seconds rather than an indefinite tail. Users are routed to a topologically near location automatically, which also improves latency in normal operation. It is also the standard mechanism for absorbing volumetric attacks, because the traffic spreads across many locations."
+  sacrifice="Operational complexity and a hard dependency on network-layer capability, which usually means a provider. You have less fine-grained control than DNS gives you: you can withdraw a location, not steer 10% of users."
+  failureModes={[
+    'A routing change mid-connection can move a user to a different location; long-lived connections may reset',
+    'A misconfigured announcement can attract traffic to a location that cannot serve it',
+    'Debugging is harder because which location a user reaches depends on network topology you cannot see',
+  ]}
+  operationalBurden="Moderate to high if self-operated: it requires network expertise most application teams do not have. Low if consumed as a provider feature, which is how most organisations use it."
+  cost="Typically bundled with a CDN or edge provider and billed per request and per gigabyte. Self-operating it requires network presence in multiple locations, which is a different order of expense."
+  whenNot="When users are concentrated in one region and a few minutes of failover time is acceptable, DNS failover is far simpler and adequate. It is also the wrong tool where you need percentage-based traffic steering for a gradual migration, because anycast gives you presence or absence, not proportions."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc1035">
+The DNS delegation hierarchy and TTL-based caching are specified behaviour, not implementation
+choices. Caching is what makes global name resolution feasible at all.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Anycast is standard practice for edge networks and public DNS resolvers, both for latency and
+for absorbing volumetric denial-of-service traffic across many locations rather than
+concentrating it at one.
+</Claim>
+
+<Claim label="recommendation">
+Monitor DNS resolution from outside your own network. A zone problem is invisible from inside,
+because internal resolvers often have their own view, and this class of outage is total from
+the user's perspective while every internal dashboard stays green.
+</Claim>
+
+Inside a data centre the same problem reappears at a different timescale.
+<C id="service-discovery">Service discovery</C> exists because instances appear and disappear
+faster than any DNS TTL can track, so the mechanism has to push changes rather than wait for
+expiry.
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know that failover is a mechanism with a speed, not a switch. Proposing DNS failover without mentioning propagation is a reliable sign that the candidate has not run one."
+  depth="Know the caching layers, know that TTL is advisory in practice, and know at least one faster alternative and what it costs. Nothing deeper is expected outside network-focused roles."
+  followUps={[
+    'Your region is down. Walk me through the failover, with timings.',
+    'Why not just set a 10-second TTL?',
+    'How do services inside your network find each other, and why is that different?',
+    'How would you move 5% of traffic to a new stack for a canary?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will fail over by updating DNS.',
+      why: 'It works, eventually, for most users. During an incident, "eventually, for most" is the difference between a five-minute event and an hour-long one with a confusing partial-failure signature.',
+      instead:
+        'Say what the mechanism is and how fast it moves. If DNS is genuinely the mechanism, state that the old endpoint must keep serving, and that recovery has a long tail.',
+    },
+    {
+      mistake: 'DNS is just an implementation detail.',
+      why: 'It is a dependency in the request path with its own availability, and one of the few whose failure makes everything unreachable while every internal dashboard stays green.',
+      instead:
+        'Treat resolution as a monitored dependency, measured from outside, with redundant nameservers in independent networks.',
+    },
+    {
+      mistake: 'A short TTL gives us fast failover.',
+      why: 'It shortens one cache in a chain of several, at the cost of extra latency and nameserver load for every user in normal operation, which is 99.9% of the time.',
+      instead:
+        'Accept that DNS moves traffic in minutes, and put the fast mechanism somewhere you control.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['dns', 'dns-ttl', 'failover']}
+  prompt="You need to be able to move all traffic away from a region within 30 seconds. Which mechanism can actually deliver that?"
+  options={[
+    {
+      id: 'a',
+      text: 'A DNS record with a 15-second TTL',
+      implies: 'You expect resolvers to honour the published TTL closely.',
+      why: 'Some will. Operating systems, browsers, application runtimes and resolvers with minimum TTLs will not, and a long-lived process that resolved at startup never will. You get most traffic moved and an unpredictable tail that can last far longer than 30 seconds.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Withdrawing an anycast announcement from that region',
+      implies: 'You are moving the decision into a layer whose state you control directly.',
+      why: 'Routing convergence happens in seconds and requires nothing outside your control to expire. This is why edge networks use it for failover rather than relying on DNS.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Health checks on the load balancer',
+      implies: 'You are thinking about instance-level failure rather than regional.',
+      why: 'Correct mechanism, wrong scope. A load balancer moves traffic between backends it fronts. If the whole region including the balancer is gone, something outside the region must redirect users, which is the DNS-or-anycast question again.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer states the general principle rather than just the mechanism: the further out a routing decision is cached, the slower you can change it. It then notes that regardless of mechanism, the failed region's endpoint should keep returning something sensible for as long as any client might still reach it."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'DNS: record types, delegation and TTL semantics', sourceId: 'rfc1035' },
+    {
+      label: 'Anycast, edge routing and DDoS absorption in practice',
+      sourceId: 'cloudflare-blog',
+      note: 'Read for how anycast behaves operationally rather than for a specific architecture.',
+    },
+    {
+      label: 'Next: service discovery, the same problem at a much shorter timescale',
+      href: '/concepts/service-discovery',
+    },
+    { label: 'Where failover fits in a reliability strategy', href: '/concepts/failover' },
+  ]}
+/>

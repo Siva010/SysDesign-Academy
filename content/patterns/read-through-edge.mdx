@@ -1,0 +1,155 @@
+---
+id: read-through-edge
+title: Edge Caching
+problem: Many users request identical content, and serving each one from your origin costs latency you cannot remove and capacity you cannot spare.
+category: caching
+concepts: [cdn, http-caching, cache-invalidation, hot-key, rtt, anycast, ddos, staleness]
+relatedPatterns: [cache-aside, key-splitting]
+alsoKnownAs: [CDN caching, content delivery, edge offload]
+seenIn: [Static assets, media delivery, public API responses, redirects]
+sources: [rfc9111, cloudflare-blog, mdn-http]
+status: reviewed
+---
+
+## Problem
+
+Two costs, and they are different problems that happen to have one solution.
+
+**Distance.** A user 15,000 km away pays roughly 150 ms per round trip, and no amount of server
+optimisation changes that. It is set by the speed of light in fibre.
+
+**Repetition.** The same public content is requested millions of times. Your origin computes or
+fetches an identical answer for every one of them, consuming capacity that could serve requests
+which are actually different.
+
+## Pattern
+
+Put copies of the response in many locations near users, and let those locations answer.
+
+1. The response carries cache directives saying who may store it and for how long.
+2. An edge network stores it at each of its locations.
+3. Subsequent requests for that content are answered locally. The origin never sees them.
+4. On a miss, the edge fetches from the origin and stores the result.
+
+Because the content is identical for everyone, one origin fetch per location per TTL serves an
+unbounded number of users. The origin's load becomes proportional to the number of edge
+locations and the TTL, not to the number of users.
+
+<Claim label="fact" source="rfc9111">
+HTTP defines freshness and validation semantics that let any cache in the path store and reuse a
+response, including directives distinguishing responses that may be shared between users from
+those that may not.
+</Claim>
+
+## Architecture
+
+<Arch
+  caption="Requests answered near the user never reach the origin at all."
+  columns={[
+    { title: 'Users', nodes: [{ id: 'u1', label: 'Users, region A' }, { id: 'u2', label: 'Users, region B' }] },
+    { title: 'Edge', nodes: [{ id: 'e1', label: 'Edge, region A', note: 'local copy', tone: 'accent' }, { id: 'e2', label: 'Edge, region B', note: 'local copy' }] },
+    { title: 'Origin', nodes: [{ id: 'origin', label: 'Origin', note: 'one fetch per TTL' }] },
+  ]}
+  edges={[
+    { from: 'u1', to: 'e1', label: 'short RTT' },
+    { from: 'u2', to: 'e2', label: 'short RTT' },
+    { from: 'e1', to: 'origin', label: 'on miss' },
+    { from: 'e2', to: 'origin', label: 'on miss' },
+  ]}
+/>
+
+## Advantages
+
+- **Distance is removed** for cached content. The response comes from a nearby location rather
+  than from across an ocean.
+- **Origin load becomes almost independent of user count.** This is the only mechanism that
+  handles a genuinely viral single item, because it scales with edge locations rather than with
+  demand.
+- **Connection setup is short.** Even for uncacheable responses, terminating TLS at the edge
+  converts two long handshake round trips into short ones, with a warm connection onward.
+- **Volumetric attacks are absorbed** across many locations rather than concentrating at your
+  origin.
+
+## Costs
+
+- **Invalidation is weak.** A purge propagates with delay, and content already delivered to a
+  browser cannot be recalled at all. Your control over what users see degrades the further out
+  you cache.
+- **Only shareable content qualifies.** Anything personalised must be explicitly excluded, and
+  getting that wrong is a serious incident rather than a performance regression.
+- **A third party holds your content** and sits in your trust boundary.
+- **Billing is per request and per gigabyte**, so at high volume it becomes a major line item —
+  frequently larger than the origin it protects.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Personalised content cached and served to the wrong user',
+      symptom: 'A user sees another user’s name, basket, or account page.',
+      cause: 'A response containing user-specific data was marked cacheable, or the cache key omitted the distinguishing header.',
+      mitigation: 'Default to not caching authenticated responses. Mark private responses explicitly, and include any header that varies the content in the cache key. Test with two accounts.',
+    },
+    {
+      what: 'Stale content after an update',
+      symptom: 'A price or a policy changes and users continue to see the old value.',
+      cause: 'A long TTL with no purge, or a purge that has not propagated to every location.',
+      mitigation: 'Versioned URLs so a change produces a new key, or shorter TTLs where control matters more than offload.',
+    },
+    {
+      what: 'Origin overwhelmed on a global purge',
+      symptom: 'Purging everything causes every edge location to miss simultaneously and stampede the origin.',
+      cause: 'A cold edge across all locations at once, with the origin sized for the miss rate.',
+      mitigation: 'Purge selectively, stagger invalidation, and use origin shielding so one intermediate layer absorbs misses on behalf of many locations.',
+    },
+    {
+      what: 'Cache key too broad or too narrow',
+      symptom: 'Either wrong content is shared, or the hit rate is near zero.',
+      cause: 'Query parameters, cookies or headers included in or excluded from the key incorrectly.',
+      mitigation: 'Normalise the key deliberately: strip tracking parameters, include only headers that genuinely vary the response.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The content is **identical for many users** — assets, media, public pages, public API responses.
+- Users are geographically distributed and latency matters.
+- The content is large, so bandwidth savings are significant.
+- A single item may become extremely popular, and no partitioning scheme can help.
+
+## When NOT to use it
+
+- **For personalised or authenticated responses.** These are not shareable, so the hit rate is
+  near zero and the risk of serving one user's data to another is real. The exception is using
+  the edge purely for TLS termination and connection reuse, which is valuable and is a different
+  benefit from caching.
+- **When content must be immediately correct everywhere.** Takedown, price changes and permission
+  changes all propagate with delay. If the requirement is sub-second, the edge is the wrong place
+  for that decision, and you need a check on the origin path.
+- **When traffic is concentrated near your origin.** If most users are one region away, the
+  latency saving is small and the added dependency may not be worth it.
+- **When egress cost exceeds origin cost.** At high volume of large objects, edge billing can
+  exceed what serving directly would have cost. It is worth doing the arithmetic rather than
+  assuming the edge is cheaper.
+
+## Example systems
+
+<Claim label="fact" source="mdn-http">
+Cache directives distinguish responses that may be stored by shared caches from those that may
+only be stored by the user's own browser. Getting this distinction wrong is what causes one
+user's data to be served to another.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Distributing traffic across many locations, typically via anycast, is standard practice both for
+latency and for absorbing volumetric attacks, because an attack large enough to saturate an
+origin's connectivity cannot be filtered by that origin.
+</Claim>
+
+<Claim label="fact" source="rfc9111">
+The stale-while-revalidate directive allows a cache to serve a stale response while refreshing it
+in the background, which is a standards-level answer to the stampede problem for cacheable
+content.
+</Claim>

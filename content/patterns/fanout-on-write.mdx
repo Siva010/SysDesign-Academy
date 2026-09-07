@@ -1,0 +1,148 @@
+---
+id: fanout-on-write
+title: Fanout on Write
+problem: One write must be visible to many readers, and assembling the answer at read time is too slow or too expensive.
+category: scaling
+concepts: [fanout-on-write, fanout-on-read, write-amplification, hot-key, queue, denormalisation, cross-shard-query]
+relatedPatterns: [key-splitting, cache-aside]
+alsoKnownAs: [push model, precomputed feed, materialised timeline]
+seenIn: [Social feeds, notification systems, activity streams]
+sources: [ddia, meta-eng, linkedin-eng]
+status: reviewed
+---
+
+## Problem
+
+A user posts. Everyone who follows them should see it in their feed.
+
+The obvious approach is to assemble each feed when it is requested: find who this user follows,
+fetch recent posts from each, merge, sort, return. This is **fanout on read**, and it is correct
+and simple.
+
+It is also a scatter-gather across many partitions on every feed view. With 500 followees, one
+feed request becomes 500 lookups, and the response waits for the slowest of them. Feeds are
+viewed far more often than posts are written, so the expensive operation is happening on the
+common path.
+
+## Pattern
+
+Do the work once, at write time.
+
+When a user posts, write a reference into each follower's precomputed feed. A feed view then
+becomes a single sequential read of a prepared list.
+
+You have moved the cost from the frequent operation to the infrequent one, and turned a
+scatter-gather into a lookup.
+
+The write is normally asynchronous: the post is stored synchronously, and a queue drives the
+distribution. The author sees their post immediately; followers see it within seconds.
+
+## Architecture
+
+<Arch
+  caption="Cost moves from read time to write time, via a queue."
+  columns={[
+    { title: 'Author', nodes: [{ id: 'author', label: 'Author posts' }] },
+    { title: 'Store', nodes: [{ id: 'posts', label: 'Posts table', note: 'source of truth' }] },
+    { title: 'Distribution', nodes: [{ id: 'queue', label: 'Fanout queue', tone: 'accent' }, { id: 'worker', label: 'Fanout workers' }] },
+    { title: 'Feeds', nodes: [{ id: 'feeds', label: 'Per-user feeds', note: 'precomputed' }] },
+    { title: 'Reader', nodes: [{ id: 'reader', label: 'Feed view', note: 'one read' }] },
+  ]}
+  edges={[
+    { from: 'author', to: 'posts', label: 'synchronous' },
+    { from: 'posts', to: 'queue', label: 'async' },
+    { from: 'queue', to: 'worker' },
+    { from: 'worker', to: 'feeds', label: 'N writes' },
+    { from: 'reader', to: 'feeds', label: 'sequential read' },
+  ]}
+/>
+
+## Advantages
+
+- **Feed reads become trivial**: one sequential read of a prepared list, with latency independent
+  of how many accounts the user follows.
+- **Read latency is predictable**, because it no longer depends on the slowest of many
+  partitions.
+- **Read capacity scales cheaply**, since the expensive work happens once rather than per view.
+
+## Costs
+
+- **Write amplification.** One post becomes N writes, where N is the follower count. For an
+  account with 50 million followers, that is 50 million writes for one action.
+- **Wasted work.** You write into the feeds of inactive users who will never read them.
+- **Storage multiplies.** The same post reference is stored once per follower.
+- **Deletion and edits fan out too.** Removing a post means removing it from every feed it was
+  copied into.
+- **Follower changes are complicated.** A new follow either backfills history or starts from now,
+  and both need a decision.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Celebrity account overwhelms the fanout',
+      symptom: 'Publishing latency is fine for almost everyone and minutes long for a handful of accounts. Queue depth spikes on individual posts.',
+      cause: 'Follower counts are heavy-tailed; a single post can require tens of millions of writes.',
+      mitigation: 'Hybrid: exclude accounts above a follower threshold from fanout and merge their posts at read time.',
+    },
+    {
+      what: 'Fanout queue falls behind',
+      symptom: 'Posts appear in followers’ feeds minutes after publication. No errors anywhere.',
+      cause: 'Write volume exceeds fanout worker throughput, often after a spike in posting.',
+      mitigation: 'Alert on the age of the oldest unprocessed fanout job. Scale workers, and shed or defer fanout for inactive users.',
+    },
+    {
+      what: 'Deletion does not propagate',
+      symptom: 'A deleted post remains visible in feeds, sometimes for a long time.',
+      cause: 'Deletion must fan out exactly as creation did, and is easy to implement as an afterthought.',
+      mitigation: 'Filter on read against the source of truth, or fan out deletions with the same reliability as creations.',
+    },
+    {
+      what: 'Storage growth from inactive users',
+      symptom: 'Feed storage grows far faster than active usage.',
+      cause: 'Feeds are materialised for everyone, including users who have not logged in for years.',
+      mitigation: 'Fan out only to recently active users; rebuild on demand for returning users.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- Reads greatly outnumber writes for the same content.
+- Follower or subscriber counts are bounded and reasonably uniform.
+- Read latency matters more than write latency, which is usually true for feeds.
+- A few seconds of delay before content appears is acceptable.
+
+## When NOT to use it
+
+- **When the distribution is heavy-tailed.** A small number of accounts with enormous follower
+  counts will dominate total write load. The answer is a hybrid, not a pure strategy — which is
+  why every large feed system in public writing describes one.
+- **When feeds are read rarely relative to writes.** Precomputing feeds nobody opens is pure
+  waste. A notification digest read once a week is better assembled on demand.
+- **When the feed is highly personalised or ranked at request time.** If ranking depends on
+  signals known only at read time — recency, current context, a model score — the precomputed
+  list is only a candidate set, and you still pay read-time work.
+- **When content is frequently edited or deleted.** Every mutation fans out too, and the
+  amplification applies to corrections as much as to creations.
+
+## Example systems
+
+<Claim label="convention" source="meta-eng">
+Public engineering writing about large social platforms consistently describes hybrid
+approaches rather than a single fanout strategy, because follower distributions are heavy-tailed
+and neither pure strategy handles both ends of the distribution.
+</Claim>
+
+<Claim label="convention" source="ddia">
+The trade-off between fanout on write and fanout on read is presented as a canonical example of
+moving work between the write path and the read path, with the correct choice depending on the
+read/write ratio and on the distribution of follower counts.
+</Claim>
+
+<Claim label="speculation">
+Specific thresholds — the follower count above which an account is excluded from fanout — are
+implementation details that depend on the workload. Any particular number quoted for a real
+system should be treated as unverified unless it is published by that system's engineers.
+</Claim>

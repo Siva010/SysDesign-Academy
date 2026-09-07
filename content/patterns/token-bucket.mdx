@@ -1,0 +1,148 @@
+---
+id: token-bucket
+title: Token Bucket
+problem: One caller must be limited to a fair share of a shared resource, while still being allowed the bursts that real clients produce.
+category: resilience
+concepts: [rate-limiting, token-bucket, admission-control, noisy-neighbour, tenant-isolation, load-shedding, ddos, backpressure]
+relatedPatterns: [bulkhead, cell-based-architecture]
+alsoKnownAs: [rate limiter, quota bucket, leaky bucket variant]
+seenIn: [API gateways, per-tenant quotas, client SDK throttling]
+sources: [aws-load-shedding, cloudflare-blog, sre-book]
+status: reviewed
+---
+
+## Problem
+
+One caller sends 40,000 requests a second. Everyone else's latency triples.
+
+They are not malicious — a retry loop has a bug. A global rate limit does not trigger, because
+the total is within capacity. The problem is the **distribution**, not the volume.
+
+A naive fix — a fixed cap of N requests per second per caller — breaks legitimate clients, because
+real traffic is bursty. A client that sends 100 requests in one second and nothing for the next
+ten is well-behaved on average and is rejected by a per-second cap.
+
+## Pattern
+
+Model the allowance as a bucket of tokens.
+
+- The bucket holds up to **B** tokens and refills at **R** tokens per second.
+- Each request consumes one token. If the bucket is empty, the request is rejected.
+- Tokens accumulate while the caller is idle, up to the bucket size.
+
+Two parameters with two distinct meanings:
+
+- **R** is the sustained rate. Over any long period, the caller cannot exceed it.
+- **B** is the burst allowance. A caller who has been quiet can spend up to B immediately.
+
+That separation is what makes the pattern work: real clients are bursty, and a limiter that
+forbids bursts rejects legitimate traffic while a limiter with no sustained cap does not limit
+anything.
+
+The **leaky bucket** is the sibling: requests drain at a fixed rate with no burst allowance,
+enforcing a perfectly smooth output. Use it when the thing you are protecting cannot absorb
+bursts at all.
+
+## Architecture
+
+<Arch
+  caption="Per-identity buckets, checked at the edge before any expensive work."
+  columns={[
+    { title: 'Callers', nodes: [{ id: 'a', label: 'Caller A' }, { id: 'b', label: 'Caller B', note: 'bursting' }] },
+    { title: 'Limiter', nodes: [{ id: 'bucket', label: 'Token buckets', note: 'one per identity', tone: 'accent' }] },
+    { title: 'Outcome', nodes: [{ id: 'svc', label: 'Service' }, { id: 'reject', label: '429 + retry-after' }] },
+  ]}
+  edges={[
+    { from: 'a', to: 'bucket' },
+    { from: 'b', to: 'bucket' },
+    { from: 'bucket', to: 'svc', label: 'token available' },
+    { from: 'bucket', to: 'reject', label: 'empty', tone: 'danger' },
+  ]}
+/>
+
+## Advantages
+
+- **Bursts are allowed without allowing sustained overuse**, which matches how real clients behave.
+- **Two intuitive parameters**, both of which can be explained to a customer.
+- **Cheap to implement**: a timestamp and a count per identity, with tokens computed lazily rather
+  than refilled by a timer.
+- **Composable.** Different limits per tier, per endpoint, or per operation cost — an expensive
+  endpoint can consume several tokens.
+
+## Costs
+
+- **State per identity.** With millions of callers, that state must live somewhere and be
+  accessible on every request.
+- **Distributed enforcement is approximate or expensive.** Node-local buckets multiply the limit
+  by fleet size; shared buckets add a round trip to every request.
+- **Parameters need tuning** and are a customer-visible contract once published.
+- **Rejection must be cheap**, or the limiter consumes the capacity it was protecting.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Node-local buckets on a fleet',
+      symptom: 'A caller exceeds their limit by roughly the number of nodes.',
+      cause: 'Each node counts only what it sees, so the caller gets a full allowance on every node.',
+      mitigation: 'Divide the per-node allowance by fleet size as an approximation, or use shared state for the largest consumers where exactness matters.',
+    },
+    {
+      what: 'Rejection is expensive',
+      symptom: 'The service sheds heavily and still saturates.',
+      cause: 'The limit is checked after authentication and a database lookup, so a rejected request costs nearly as much as a served one.',
+      mitigation: 'Check as early as possible, before any I/O, and keep the rejection path deliberately cheap.',
+    },
+    {
+      what: 'Clients retry immediately on rejection',
+      symptom: 'Rate limiting increases load rather than reducing it.',
+      cause: 'The rejection carried no retry-after hint, so clients hammer the endpoint.',
+      mitigation: 'Return a clear status with a retry-after value, and document backoff expectations for API clients.',
+    },
+    {
+      what: 'Burst size too large for the protected resource',
+      symptom: 'The limiter is configured correctly and the downstream still falls over.',
+      cause: 'Many callers spending their full burst simultaneously exceeds downstream capacity, even though each is within its limit.',
+      mitigation: 'Size the aggregate: sum of bursts across active callers must be survivable. Add a global limit behind the per-identity ones.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- A shared resource with many callers, where one caller can affect the others.
+- Callers are identifiable — API key, account, tenant, IP.
+- Traffic is naturally bursty, so a smooth cap would reject legitimate use.
+- You can enforce the limit before doing expensive work.
+
+## When NOT to use it
+
+- **When the protected resource cannot absorb bursts at all.** A leaky bucket, which enforces a
+  smooth rate, is the correct choice when passing a burst downstream is the failure you are
+  preventing.
+- **When callers cannot be identified.** Limiting by IP alone punishes shared networks and is
+  trivially evaded. Authentication has to come first.
+- **When the real problem is total capacity rather than distribution.** If every caller is within
+  their limit and the system is still overloaded, you need load shedding and admission control,
+  not a per-caller limit.
+- **As a substitute for isolation.** A limit stops one caller consuming everything; it does not
+  stop their traffic from competing with everyone else's for the same pool. Bulkheads do that.
+
+## Example systems
+
+<Claim label="convention" source="cloudflare-blog">
+Rate limiting per identity at the edge, before requests reach the origin, is standard practice
+for public APIs, because rejection at the origin still consumes origin capacity.
+</Claim>
+
+<Claim label="convention" source="aws-load-shedding">
+Admission control that rejects work early and cheaply, prioritising by caller or request type, is
+described as the mechanism for maximising completed useful work during overload.
+</Claim>
+
+<Claim label="recommendation" source="sre-book">
+Published limits become a contract with your users. Changing them is a customer-facing change,
+so choose the initial values with that in mind rather than treating them as tunable
+configuration.
+</Claim>

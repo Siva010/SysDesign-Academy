@@ -1,0 +1,396 @@
+---
+id: how-reliable-is-reliable-enough
+title: How Reliable Is Reliable Enough
+level: 5
+module: l5-targets
+order: 1
+summary: An unmeasured reliability target is a wish; one set at 100% is a refusal to ship. Error budgets turn both into a number people can argue about.
+difficulty: core
+minutes: 26
+prerequisites: [percentiles, availability]
+concepts: [sli, slo, sla, error-budget, availability-math, redundancy, percentiles, tail-latency, alerting]
+unlocks: [load-shedding, graceful-degradation, incident-response, capacity-planning]
+failures: [health-check-collapse]
+sources: [sre-book, sre-workbook, aws-well-architected]
+status: reviewed
+---
+
+## The problem
+
+&ldquo;The system should be highly available.&rdquo;
+
+Nobody disagrees, and nobody can act on it. Six months later two arguments are running in
+parallel: one team says reliability is unacceptable and must be fixed before any new features;
+another says the system has been fine and the work is a waste. Both are pointing at the same
+dashboard.
+
+They are arguing because there is no number. Without one, &ldquo;reliable enough&rdquo; is a
+matter of temperament, and the loudest person wins.
+
+## Intuition
+
+Reliability is not a property you maximise. It is a budget you allocate.
+
+Every additional nine costs more than the last, and the cost curve is steep:
+
+- 99% — about 3.65 days of downtime a year. Achievable with one machine and some luck.
+- 99.9% — about 8.8 hours. Needs redundancy, monitoring, and someone on call.
+- 99.99% — about 53 minutes. Needs automated failover, tested regularly, and a strong deploy
+  discipline.
+- 99.999% — about 5 minutes. Needs multiple regions, deep automation, and an organisation
+  structured around it.
+
+Two consequences that people find uncomfortable:
+
+**More reliability is not always better.** Going from three nines to four might cost several
+engineers for a year. If users cannot tell the difference — because their own network is less
+reliable than that — you have spent that year buying nothing.
+
+**A target of 100% is a decision not to ship.** Every change risks reliability. If the target
+admits no failure, the rational response is to stop changing anything, which is not what anyone
+actually wants.
+
+The <C id="error-budget" /> makes this explicit: **the allowed unreliability is a resource, and
+shipping spends it.** When it is gone, you stop shipping and fix things. When it is plentiful,
+you ship faster. It converts a values argument into a shared number.
+
+## Concretely
+
+<Example title="Building an SLO that means something">
+
+**Bad:** &ldquo;The API should have 99.9% uptime.&rdquo;
+
+Uptime measured how? By whom? Is a request that takes 30 seconds and succeeds &ldquo;up&rdquo;?
+Is a health check returning 200 while every real request fails &ldquo;up&rdquo;?
+
+**Better:** &ldquo;99.9% of `GET /orders` requests, measured at the load balancer, return a 2xx
+or 4xx status within 300 ms, evaluated over a rolling 28 days.&rdquo;
+
+That is actionable because it names five things:
+
+1. **What is measured** — a specific endpoint, not the system in the abstract.
+2. **Where** — at the load balancer, which is closer to the user than the application is.
+3. **What counts as success** — including 4xx, because a client sending a malformed request is
+   not the service failing.
+4. **The latency threshold** — because a slow success is a failure from the user's side.
+5. **The window** — a rolling 28 days, so one bad afternoon does not consume the year.
+
+The budget follows: 0.1% of 28 days is roughly 40 minutes of failure. That is a number a team
+can plan against, and a number a product manager can argue about.
+
+</Example>
+
+## Formal explanation
+
+Three terms, frequently conflated:
+
+- **<C id="sli" />** — a measurement of something a user feels. Success rate, latency at a
+  percentile, freshness of data. It must be measurable from the user's side of the system.
+- **<C id="slo" />** — the target for that indicator, chosen deliberately below 100%.
+- **<C id="sla" />** — a contractual promise with consequences. Always looser than the internal
+  SLO, so that you notice a problem before a customer can claim against it.
+
+<C id="availability-math">Availability arithmetic</C> is unforgiving in one direction:
+
+<Formula
+  expression="A_series = A₁ × A₂ × … × Aₙ     A_redundant = 1 − (1 − A)ᵏ"
+  where={[
+    { symbol: 'series', meaning: 'every component a request must pass through, multiplied together' },
+    { symbol: 'redundant', meaning: 'k independent copies; the failure probabilities multiply instead' },
+    { symbol: 'independent', meaning: 'the load-bearing word. Two instances in one rack are one failure domain.' },
+  ]}
+/>
+
+Five components at 99.9% in series give 0.999⁵ ≈ 99.5%, which is over 40 hours a year. **Every
+synchronous dependency you add multiplies your availability by theirs.** That single fact is the
+strongest argument available for removing things from the critical path.
+
+<Callout kind="warn" title="Alert on symptoms and burn rate, not on causes">
+An alert for every possible cause produces noise, and noise trains the on-call to ignore alerts.
+Alert on what users experience — error rate, latency — and on how fast the error budget is
+burning. A slow burn is a ticket; a fast burn is a page.
+</Callout>
+
+<Deeper title="Burn rate: one alert instead of many">
+
+The naive alert — &ldquo;error rate above 1%&rdquo; — is either too sensitive, firing for
+brief blips, or too slow, only firing after significant budget is gone.
+
+Burn-rate alerting reframes it: **how fast are we consuming the error budget relative to the
+window?**
+
+If the budget covers 28 days and you are consuming it at 14 times the sustainable rate, it will
+be gone in two days. That is worth waking someone for. If you are consuming at 1.5 times the
+rate, it is worth a ticket.
+
+<Claim label="convention" source="sre-workbook">
+Alerting on error budget burn rate, typically with multiple windows so that both fast and slow
+burns are detected, is standard practice. It ties alert severity to user impact rather than to
+an arbitrary threshold.
+</Claim>
+
+The practical benefit is that one well-constructed alert replaces a dozen threshold alerts, and
+its severity is automatically proportional to how much trouble you are in.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Where you measure determines what you can honestly claim."
+  columns={[
+    { title: 'User', nodes: [{ id: 'user', label: 'Real user', note: 'the only truth' }] },
+    { title: 'Edge', nodes: [{ id: 'lb', label: 'Load balancer', note: 'good enough', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Application', note: 'misses its own outages' }] },
+    { title: 'Dependencies', nodes: [{ id: 'db', label: 'Database' }, { id: 'dep', label: 'Third party' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'lb' },
+    { from: 'lb', to: 'app' },
+    { from: 'app', to: 'db', label: 'multiplies' },
+    { from: 'app', to: 'dep', label: 'multiplies' },
+  ]}
+  stages={[
+    {
+      label: 'Measuring inside',
+      show: ['app', 'db', 'dep'],
+      because:
+        'Application metrics cannot record requests the application never received. A total outage produces a beautifully flat error rate.',
+    },
+    {
+      label: 'Measuring at the edge',
+      show: ['user', 'lb', 'app', 'db', 'dep'],
+      because:
+        'The load balancer sees requests even when the application does not, which is the difference between an SLI you can trust and one that fails silently when it matters most.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '99%',
+      behaviour:
+        'One machine, backups, someone who notices eventually. 3.65 days of downtime a year.',
+      firstToBreak: 'Nothing structural. This is achievable almost by accident.',
+    },
+    {
+      scale: '99.9%',
+      behaviour:
+        'Redundancy, monitoring, on-call rotation, tested deploys. 8.8 hours a year, so one bad incident consumes most of it.',
+      firstToBreak: 'Deploys, which become the dominant cause of incidents at this level.',
+    },
+    {
+      scale: '99.99%',
+      behaviour:
+        'Automated failover, progressive rollout, load shedding, dependency isolation. 53 minutes a year.',
+      firstToBreak:
+        'Anything requiring a human to react. Manual mitigation cannot fit in the budget.',
+    },
+    {
+      scale: '99.999%',
+      behaviour:
+        'Multiple regions, deep automation, an organisation structured around reliability. 5 minutes a year.',
+      firstToBreak:
+        'The dependency chain. Five nines end to end requires nearly every component to exceed it, which few third parties offer.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Measuring from inside the system',
+      symptom:
+        'Dashboards are green during an outage. The service reports 100% success because it is receiving no requests.',
+      cause:
+        'The SLI is computed from application metrics, which cannot see requests that never arrived.',
+      mitigation:
+        'Measure at the load balancer or from external probes. If a component can fail without affecting the metric, the metric does not measure availability.',
+    },
+    {
+      what: 'An SLO nobody uses',
+      symptom:
+        'A number exists in a document. Prioritisation arguments continue exactly as before.',
+      cause:
+        'The SLO was written without agreement that it would change behaviour when breached.',
+      mitigation:
+        'Agree the consequence before you need it: exhausted budget means feature work pauses. An SLO with no consequence is documentation, not a control.',
+    },
+    {
+      what: 'Alert fatigue',
+      symptom:
+        'Dozens of alerts nightly, most requiring no action. Real incidents are missed among them.',
+      cause: 'Alerting on causes and on thresholds rather than on user-visible symptoms.',
+      mitigation:
+        'Every alert must be actionable and urgent. Move the rest to dashboards and tickets. Burn-rate alerting collapses many thresholds into one proportionate signal.',
+    },
+    {
+      what: 'Availability target that arithmetic forbids',
+      symptom:
+        'A four-nines target on a service with eight synchronous dependencies at three nines each.',
+      cause:
+        'The target was set without multiplying the dependency chain.',
+      mitigation:
+        'Do the arithmetic. Then either remove dependencies from the critical path, make them asynchronous, degrade without them, or change the target.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Set an SLO below 100% and treat the remainder as a budget that feature work may spend"
+  options={[
+    'No formal target: rely on judgment and incident response',
+    'A target with no consequence attached',
+    'An SLO with an error budget that gates feature work when exhausted',
+    'Maximise reliability continuously',
+  ]}
+  why="Reliability and change velocity are in direct tension, and pretending otherwise means the trade gets made implicitly by whoever is most persistent. A budget makes it explicit, shared, and arguable with evidence."
+  gain="Prioritisation stops being a personality contest. Reliability work is justified by data. Feature work proceeds without guilt while the budget is healthy, which is most of the time."
+  sacrifice="You are explicitly accepting that users will experience failures — and someone must be comfortable saying that out loud to a stakeholder who expected perfection."
+  failureModes={[
+    'The budget is exhausted and the agreement to pause feature work is quietly abandoned, which discredits the whole mechanism',
+    'The SLI does not reflect user experience, so the budget tracks the wrong thing',
+    'The target is set from what is currently achieved rather than from what users need',
+  ]}
+  operationalBurden="Low technically, meaningful organisationally. Instrumenting the SLI is straightforward; sustaining the agreement about what happens when the budget runs out is the hard part."
+  cost="Engineering time to measure properly. Repaid by the reliability work you do not do, because you can now show it is not needed."
+  whenNot="For a pre-product-market-fit system with few users, formal SLOs are premature: the constraint is finding out what to build, and the reliability conversation has no stakes yet. Also for genuinely safety-critical systems, where the framing is wrong — you do not spend a budget of patient harm."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="sre-book">
+Google's SRE practice defines SLIs as measurements of service behaviour, SLOs as targets for
+them, and error budgets as the difference between the target and 100%. The budget is used
+explicitly to balance reliability against release velocity.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Multi-window burn-rate alerting is the recommended approach: a fast burn over a short window
+pages, a slow burn over a long window creates a ticket. This ties alert urgency to the rate at
+which user impact is accumulating.
+</Claim>
+
+<Claim label="convention" source="aws-well-architected">
+Architecture review frameworks treat reliability targets as inputs to design rather than
+outputs of it. The target determines whether multi-AZ or multi-region redundancy is justified,
+not the other way around.
+</Claim>
+
+<Claim label="recommendation">
+Measure the SLI where the user is, or as close as you can get. An SLI computed inside the
+service will be at its most wrong during exactly the incident you most needed it for.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can turn a vague requirement into a measurable target and reason about dependency arithmetic. Candidates who claim high availability without multiplying their dependency chain are guessing."
+  depth="Know the SLI/SLO/SLA distinction, be able to compute series availability, and know that error budgets exist to trade reliability against velocity. Burn-rate alerting is a strong signal."
+  followUps={[
+    'What is your availability target and how would you measure it?',
+    'You have six synchronous dependencies at 99.9%. What is your ceiling?',
+    'What happens when the error budget is exhausted?',
+    'Why not aim for 100%?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We aim for five nines.',
+      why: 'Usually stated without arithmetic. Five nines is 5 minutes a year, which forbids any manual intervention and requires nearly every dependency to be better than that. Most third-party services do not offer it.',
+      instead:
+        'Multiply the dependency chain and state the achievable ceiling. Then say what you would remove from the critical path to raise it.',
+    },
+    {
+      mistake: 'Availability is measured by uptime.',
+      why: 'A service can be running and useless: returning errors, timing out, or serving stale data. Users experience successful requests, not processes.',
+      instead:
+        'Measure the fraction of requests that succeeded within the latency threshold, from as close to the user as possible.',
+    },
+    {
+      mistake: 'We alert on CPU, memory, disk, queue depth, error rate and latency.',
+      why: 'Most of those are causes, not symptoms. Alerting on causes means being woken for conditions that are not affecting anyone, which trains people to ignore alerts.',
+      instead:
+        'Page on user-visible symptoms and on budget burn rate. Keep cause metrics on dashboards for diagnosis once you are already awake.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<EstimateCheck
+  concepts={['availability-math']}
+  prompt="A request passes through six components in series, each independently available 99.9% of the time. What is the end-to-end availability, as a percentage?"
+  unit="%"
+  answer={99.4}
+  tolerance={0.01}
+  derivation={[
+    'Series availability multiplies: 0.999 raised to the power of 6.',
+    '0.999^6 ≈ 0.9940, so about 99.4%.',
+    'That is roughly 52 hours of downtime a year, from components that individually look excellent.',
+    'The design lesson: every synchronous dependency multiplies your availability by theirs.',
+  ]}
+  stronger="A stronger answer draws the conclusion rather than stopping at the number: the cheapest way to raise this is to remove a component from the critical path — make it asynchronous, or degrade gracefully without it — because that changes the number of terms in the product rather than trying to improve each one."
+/>
+
+<Check
+  concepts={['sli', 'slo']}
+  prompt="Your dashboard shows 99.99% availability. Users are complaining that the site is unusable. What is the most likely explanation?"
+  options={[
+    {
+      id: 'a',
+      text: 'The users are wrong or are experiencing local network problems',
+      implies: 'You are trusting the metric over the reports.',
+      why: 'Occasionally true, and a poor first hypothesis. When the metric and the users disagree, the metric is usually measuring the wrong thing — users are the ground truth by definition.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The SLI measures something users do not experience: internal success rate, or a health check, or success without a latency threshold',
+      implies: 'You treat a disagreement between metric and user as evidence about the metric.',
+      why: 'Common causes: measuring inside the application so failed connections are invisible; counting a 30-second success as a success; measuring a health endpoint rather than real traffic; or averaging away a tail that affects a specific segment of users.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The dashboard is stale',
+      implies: 'You suspect the monitoring pipeline.',
+      why: 'Worth checking quickly, and it would not explain a sustained disagreement. If the number has been wrong for a while, the definition is more likely at fault than the pipeline.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes the fix: move measurement to the load balancer or to external probes, include a latency threshold in the success definition, and break the SLI down by segment — region, client version, endpoint — because an aggregate number hides a subpopulation having a uniformly bad time."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'SLIs, SLOs and error budgets', sourceId: 'sre-book' },
+    {
+      label: 'Implementing SLOs and burn-rate alerting',
+      sourceId: 'sre-workbook',
+      note: 'The practical companion: how to choose windows and thresholds that page proportionately.',
+    },
+    { label: 'Reliability targets as design inputs', sourceId: 'aws-well-architected' },
+    {
+      label: 'Next: how one slow dependency becomes a total outage',
+      href: '/lessons/how-failures-spread',
+    },
+  ]}
+/>

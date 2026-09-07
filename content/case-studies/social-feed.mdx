@@ -1,0 +1,362 @@
+---
+id: social-feed
+title: A Social Feed
+ask: Design the timeline for a social network. Users follow other users and see their posts.
+difficulty: advanced
+minutes: 55
+signatures: [fanout, hot-key, large-object]
+concepts: [fanout-on-write, fanout-on-read, hot-key, back-of-envelope, partition-key, cross-shard-query, queue, eventual-consistency, cache-generic, large-object, object-storage, denormalisation, cdc, write-amplification, staleness]
+patterns: [fanout-on-write, cache-aside, key-splitting, read-through-edge]
+prerequisites: [when-load-is-not-even, splitting-the-data]
+sources: [ddia, meta-eng, linkedin-eng, aws-builders-library]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design the timeline for a social network. Users follow other users and see their
+> posts.&rdquo;
+
+This is the canonical fanout problem, and it is famous for a specific reason: **the obvious
+solution and the scalable solution are opposites, and neither works alone.**
+
+The interviewer is looking for whether you notice that follower counts are not uniform. Almost
+everything interesting follows from that one fact.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Chronological or ranked? | Ranking means read-time computation, so a precomputed list becomes a candidate set rather than the answer. |
+| How many users, how many posts, how many feed views? | Decides whether write amplification is survivable. |
+| What is the follower distribution? | **The critical question.** Uniform and heavy-tailed need different designs. |
+| How fresh must the feed be? | Seconds of delay makes asynchronous fanout viable. Real-time does not. |
+| Media in posts? | Adds a large-object problem, solved separately. |
+| Can posts be deleted or edited? | Every mutation fans out too, and this is usually forgotten. |
+
+**Assumed answers:** 500 million users, 200 million daily active, chronological with light
+ranking, 100 million posts a day, 5 billion feed views a day, a few seconds of delay acceptable,
+media supported, deletion required. Follower counts are heavy-tailed: the median user has a few
+hundred followers and the largest accounts have tens of millions.
+
+## Requirements
+
+**Functional:** post; follow and unfollow; view a reverse-chronological feed of followed
+accounts; delete a post.
+
+**Non-functional**
+
+- Feed load p99 under 200 ms.
+- Feed may be up to a few seconds stale.
+- A post must be visible to its author immediately.
+- Deletion must propagate within seconds.
+- Feed reads must remain available even when posting is degraded.
+
+**Out of scope:** ranking model details, ads, direct messages, notifications.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+With the assumed numbers:
+
+- **Posts:** 100 million a day ÷ 86,400 ≈ **1,200 per second**, perhaps 4,000 at peak.
+- **Feed views:** 5 billion a day ≈ **58,000 per second**, perhaps 200,000 at peak.
+- **Read/write ratio:** roughly **50:1.**
+
+Now the number that decides the architecture. If the average account has 500 followers and every
+post is fanned out:
+
+- Fanout writes: 1,200 posts/sec × 500 followers = **600,000 writes per second** average, and
+  2 million at peak.
+
+That is a large but tractable number for a partitioned key-value store. Then consider one account
+with 40 million followers:
+
+- One post = **40 million writes.**
+- At a sustained 500,000 writes per second for the fanout tier, that single post occupies the
+  entire fanout capacity for 80 seconds.
+
+<Claim label="inference">
+The estimate does not merely size the system; it disproves the pure strategy. Fanout-on-write is
+correct for the median account and catastrophic for the tail, and the tail is not an edge case —
+it is the accounts that generate the most engagement.
+</Claim>
+
+Storage:
+
+- Feed entries: 500 followers × 100 million posts a day = 50 billion entries a day. At 50 bytes
+  per entry, **2.5 TB a day** — before considering that this is per-follower duplication of
+  something already stored once.
+- This is why feeds are capped at a few hundred entries and old entries are trimmed.
+
+## Data model
+
+| Access pattern | Frequency | Implication |
+|---|---|---|
+| Read a user's feed | 200,000/sec peak | Must be one sequential read; partition by user |
+| Write a post | 4,000/sec peak | Cheap; partition by author |
+| Fan out to followers | 2 million/sec peak | Partition by recipient, so writes spread |
+| Read an account's followers | per post | Must be fast and can be large; partition by followee |
+| Delete a post | rare | Must reach every feed it was copied into |
+
+Three stores:
+
+- **Posts**, partitioned by post id, holding the content once.
+- **Follower lists**, partitioned by followee, holding who receives that account's posts.
+- **Feeds**, partitioned by user, holding a capped list of post references in time order.
+
+The feed holds **references, not content**. That keeps entries small, makes deletion a filter
+rather than a rewrite, and means editing a post does not require touching millions of feeds.
+
+## Design v1
+
+<Arch
+  caption="Post synchronously, fan out asynchronously, read one list."
+  columns={[
+    { title: 'Author', nodes: [{ id: 'author', label: 'Author' }] },
+    { title: 'Write path', nodes: [{ id: 'api', label: 'Post service', tone: 'accent' }, { id: 'posts', label: 'Posts store' }] },
+    { title: 'Distribution', nodes: [{ id: 'queue', label: 'Fanout queue' }, { id: 'worker', label: 'Fanout workers' }] },
+    { title: 'Feeds', nodes: [{ id: 'feeds', label: 'Feed store', note: 'capped lists' }] },
+    { title: 'Reader', nodes: [{ id: 'reader', label: 'Feed API', note: 'one read' }] },
+  ]}
+  edges={[
+    { from: 'author', to: 'api' },
+    { from: 'api', to: 'posts', label: 'synchronous' },
+    { from: 'posts', to: 'queue', label: 'async' },
+    { from: 'queue', to: 'worker' },
+    { from: 'worker', to: 'feeds', label: 'N writes' },
+    { from: 'reader', to: 'feeds', label: 'sequential' },
+    { from: 'reader', to: 'posts', label: 'hydrate', dashed: true },
+  ]}
+  stages={[
+    {
+      label: 'Fanout on read',
+      show: ['author', 'api', 'posts', 'reader'],
+      because:
+        'The simplest correct design: store the post, and assemble each feed at read time by querying every followee. Correct, and a scatter-gather across hundreds of partitions on the most frequent operation in the product.',
+    },
+    {
+      label: 'Fanout on write',
+      show: ['author', 'api', 'posts', 'queue', 'worker', 'feeds', 'reader'],
+      because:
+        'Move the work to write time. Feed reads become one sequential read of a prepared list, which is what the 50:1 read/write ratio calls for.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;An account with 40 million followers posts.&rdquo;
+
+Fanout-on-write requires 40 million writes for one action. At 500,000 writes per second the
+fanout tier is fully occupied for over a minute, delaying everyone else's posts.
+
+**The hybrid.** Accounts above a follower threshold are excluded from fanout. Their posts are
+stored once and merged into the feed at read time.
+
+A feed read becomes:
+
+1. Read the precomputed feed (one sequential read).
+2. Read recent posts from the small number of large accounts this user follows (a handful of
+   reads).
+3. Merge and sort.
+
+Because a user follows very few enormous accounts, step 2 is bounded and small.
+
+**New cost:** two code paths, and a threshold that must be tuned. Too low and read-time merging
+grows; too high and one post can still saturate fanout.
+
+### Round 2 — &ldquo;Feed reads are 200,000 per second at peak.&rdquo;
+
+Feeds are per-user, so they partition cleanly by user id — no hot partition from the read side.
+The feed store must sustain 200,000 reads per second, which a partitioned key-value store handles
+by adding partitions.
+
+Cache the assembled feed briefly — tens of seconds — keyed by user. Users refresh more often than
+their feed changes, so even a short TTL removes a large fraction of reads.
+
+**New cost:** a user's own new post must appear immediately, so the cache must be invalidated for
+that user on write, or bypassed for the author.
+
+### Round 3 — &ldquo;A user deletes a post.&rdquo;
+
+The post reference has been copied into millions of feeds. Deleting from each is another fanout,
+as expensive as the original.
+
+**The fix falls out of the data model:** feeds hold references, and the reader hydrates them from
+the posts store. Deleting the post means the hydration returns nothing, and the reader filters it
+out. No fanout required.
+
+The cost is that feeds contain dangling references, so the reader must fetch slightly more
+entries than it needs and filter. Trimming happens lazily.
+
+<Callout kind="info" title="Why the reference-not-content decision earns its keep here">
+Storing content in each feed entry would have made reads slightly faster and made deletion, edits
+and privacy changes into millions of writes each. This is a good example of a decision whose
+value only becomes visible three rounds later.
+</Callout>
+
+### Round 4 — &ldquo;A user follows someone new. Where are that account's old posts?&rdquo;
+
+Two options, and it is a product decision:
+
+- **Backfill:** insert the new followee's recent posts into the follower's feed. One-off work
+  proportional to how many posts you backfill.
+- **From now on:** the feed only contains posts made after the follow. Simpler, and the feed looks
+  sparse for a new user with few follows.
+
+Most systems do a bounded backfill — the last N posts — which caps the cost. A mass-follow
+operation, such as importing a contact list, must be rate limited or it becomes a fanout storm in
+the opposite direction.
+
+### Round 5 — &ldquo;The fanout queue is four hours behind.&rdquo;
+
+This is the silent backlog. Posts are being stored; they simply are not reaching feeds. Nothing
+errors.
+
+Diagnosis: is the bottleneck consumers, partitions, or the feed store? If the feed store is the
+constraint, adding consumers makes it worse.
+
+Mitigations, in order:
+
+1. **Shed by recipient value.** Fan out to recently active users first; rebuild feeds on demand
+   for users who return after a long absence. Most of the fanout work goes to feeds nobody reads.
+2. **Batch writes** to the feed store per partition rather than one at a time.
+3. **Raise the large-account threshold** temporarily, moving more accounts to read-time merge and
+   reducing fanout load immediately.
+
+**Alert on the age of the oldest unprocessed fanout job**, not on queue depth.
+
+### Round 6 — &ldquo;Add images and video.&rdquo;
+
+A separate primitive, and one that must not touch the fanout path.
+
+- Client uploads directly to object storage using a presigned URL. Bytes never pass through the
+  application.
+- The post stores a key and metadata.
+- Delivery is through a CDN.
+- Transcoding happens asynchronously; the post is visible before every rendition is ready.
+
+**New cost:** a media pipeline, and an orphan-cleanup job for uploads whose post was never
+created.
+
+### Round 7 — &ldquo;The feed store loses a partition.&rdquo;
+
+Feeds are **derived data**. The posts store and the follower lists are the source of truth.
+
+That means a lost feed partition is recoverable: rebuild those users' feeds from their follow
+lists and recent posts. It is expensive and it is not data loss.
+
+This is worth saying explicitly, because it changes the durability requirement for the largest
+store in the system. Feeds can use cheaper storage with weaker guarantees than the posts store.
+
+### Round 8 — &ldquo;Make it ranked rather than chronological.&rdquo;
+
+The precomputed feed stops being the answer and becomes a **candidate set**.
+
+- Fanout produces candidates.
+- At read time, a ranking model scores them using signals available now — recency, affinity,
+  engagement.
+- The feed API returns the top N.
+
+This adds read-time computation, which is what fanout-on-write was supposed to avoid. The
+resolution is to keep the candidate set small — a few hundred entries — so ranking is bounded.
+
+**New cost:** the ranking service is now on the read path, with its own latency and availability.
+It needs a fallback: if ranking is unavailable, serve chronological. That is a visibly worse
+product and a far better outcome than an error.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Fanout queue falls behind',
+      symptom: 'Posts appear in followers’ feeds minutes or hours late. No errors.',
+      cause: 'Fanout write rate exceeds feed store capacity, or a large account was not excluded.',
+      mitigation: 'Alert on oldest job age. Shed fanout to inactive users, batch writes, and raise the large-account threshold as an emergency lever.',
+    },
+    {
+      what: 'A single account crosses the threshold unnoticed',
+      symptom: 'One post consumes the fanout tier for minutes, delaying everyone.',
+      cause: 'Follower count grew past the threshold and nothing re-evaluated it.',
+      mitigation: 'Evaluate the threshold at post time from the current follower count, not from a periodically-updated flag.',
+    },
+    {
+      what: 'Feed cache serves a user their own stale feed',
+      symptom: 'A user posts and does not see it.',
+      cause: 'The assembled-feed cache was not invalidated for the author.',
+      mitigation: 'Invalidate on the author’s own write, or bypass the cache for a short window after posting.',
+    },
+    {
+      what: 'Media pipeline backs up',
+      symptom: 'Posts appear with missing images.',
+      cause: 'Transcoding is asynchronous and has fallen behind.',
+      mitigation: 'Show the original or a placeholder until renditions exist. Never block the post on transcoding.',
+    },
+    {
+      what: 'Ranking service unavailable',
+      symptom: 'Feed requests fail.',
+      cause: 'Ranking was placed on the read path with no fallback.',
+      mitigation: 'Fall back to chronological ordering of the candidate set. A worse feed is much better than no feed.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Hybrid fanout | Bounded write amplification | Two code paths, a tuned threshold | Follower counts were uniform |
+| Feeds hold references | Cheap deletion and edits | An extra hydration read per feed | Read latency were the binding constraint |
+| Asynchronous fanout | Fast posting, available reads | Seconds of staleness | Real-time delivery were required |
+| Feeds as derived data | Cheaper storage, rebuildable | Rebuild cost after loss | Rebuild were impossible from the sources |
+| Capped feed length | Bounded storage | Deep history in the feed | Users routinely scrolled back years |
+| Media via object storage and CDN | Bytes bypass the application | A separate pipeline and orphan cleanup | Media were small and rare |
+
+## Cost
+
+1. **Feed storage** is the largest line: billions of entries, duplicated per follower. Capping
+   feed length and trimming aggressively is the main lever.
+2. **CDN egress** for media, which typically exceeds all compute.
+3. **Fanout compute**, proportional to total follower relationships rather than to posts.
+4. **Posts storage**, small by comparison because each post is stored once.
+
+<Claim label="recommendation">
+The two decisions that dominate cost are the feed cap and whether you fan out to inactive users.
+Both are adjustable without redesigning anything, which makes them the right first levers when
+the bill becomes a problem.
+</Claim>
+
+## What we did NOT build
+
+- **Pure fanout-on-write.** Disproved by the estimate: one large account would consume the fanout
+  tier.
+- **Pure fanout-on-read.** A scatter-gather across hundreds of partitions on the most frequent
+  operation in the product.
+- **Strong consistency on feeds.** Nobody can tell whether a post arrived 200 ms or 3 seconds
+  ago, and paying coordination cost for it would be indefensible.
+- **Content stored in feed entries.** It would make deletion, editing and privacy changes into
+  millions of writes each.
+- **A separate service per component.** The fanout worker and the feed API are deployables, not
+  an excuse for eleven services.
+
+## Evidence
+
+<Claim label="convention" source="meta-eng">
+Public engineering writing about large social platforms consistently describes hybrid fanout
+strategies rather than a single approach, because follower distributions are heavy-tailed.
+</Claim>
+
+<Claim label="convention" source="ddia">
+The fanout-on-write versus fanout-on-read trade-off is presented as a canonical example of moving
+work between the write and read paths, with the correct choice depending on the read/write ratio
+and the distribution of follower counts.
+</Claim>
+
+<Claim label="speculation">
+Specific thresholds, feed lengths and storage layouts here are pedagogical choices derived from
+the stated requirements. They are not descriptions of any company's internal system, and any
+particular number should be treated as an assumption you can change.
+</Claim>

@@ -1,0 +1,463 @@
+---
+id: what-you-promise-a-reader
+title: What You Promise a Reader
+level: 4
+module: l4-models
+order: 1
+summary: CAP is not "pick two of three". Partitions are not optional, so the only choice is what to do during one, and what to pay every other day.
+difficulty: advanced
+minutes: 30
+prerequisites: [agreeing-anyway, replication-lag]
+concepts: [linearizability, eventual-consistency, causal-consistency, session-guarantees, monotonic-reads, cap, pacelc, staleness, bounded-staleness, serializability]
+unlocks: [strict-serializability, external-consistency, active-active, crdt]
+sources: [gilbert-lynch, abadi-pacelc, ddia, spanner, dynamo]
+status: reviewed
+---
+
+## The problem
+
+&ldquo;We need the system to be consistent.&rdquo;
+
+That sentence has been the start of more wasted architecture than almost any other. It could
+mean:
+
+- Every read returns the most recently written value, globally.
+- Transactions do not interleave in ways that break my invariants.
+- A user always sees their own changes.
+- Everyone eventually sees the same thing.
+- The data satisfies my foreign keys.
+
+Those are five different guarantees with five different costs, ranging from free to a
+cross-region round trip on every operation. Choosing the strongest one by default is expensive;
+choosing the weakest by accident produces bugs that look like magic.
+
+## Intuition
+
+Think about what a reader can be promised, from weakest to strongest.
+
+**&ldquo;You will see something.&rdquo;** Maybe stale, maybe from a replica that missed the last
+few writes. Fast, always available.
+
+**&ldquo;You will not see time run backwards.&rdquo;** Values may be stale, but you will not see
+a newer value and then an older one. A per-reader promise, and cheap.
+
+**&ldquo;You will see your own writes.&rdquo;** Other people's changes may lag, but yours are
+always visible to you. Also per-reader, also cheap, and it fixes the anomaly users actually
+notice.
+
+**&ldquo;You will never see an effect before its cause.&rdquo;** If a reply exists, the message
+it replies to exists. Causal consistency — the strongest guarantee that survives a network
+partition.
+
+**&ldquo;You will see the latest committed value, always, everywhere.&rdquo;** Linearizability.
+Requires coordination on every operation, and during a partition, the minority side must refuse
+to answer.
+
+The critical realisation: **the middle three are usually what people actually want when they say
+&ldquo;consistent&rdquo;**, and they are dramatically cheaper than the last one.
+
+## Concretely
+
+<Example title="Choosing per operation, not per system">
+
+One e-commerce system, four operations, four different answers:
+
+| Operation | Guarantee needed | Why |
+|---|---|---|
+| Product page view count | Eventual | Nobody can tell, and nobody would care if they could. |
+| Product description | Bounded staleness, minutes | A stale description is a minor annoyance, and cheap edge caching is worth far more. |
+| Shopping basket | Read-your-writes | Users must see their own additions. Other users are irrelevant — it is their basket. |
+| Stock at checkout | Linearizable | Selling the last unit twice costs money and trust. This is the one operation that justifies coordination. |
+
+One of the four needs the expensive guarantee. Applying it to all four would multiply the cost
+of the system for no user-visible benefit — and, worse, would make view counts unavailable
+during a partition that only the checkout path genuinely needs to be conservative about.
+
+**Consistency is chosen per operation, not per database.**
+
+</Example>
+
+## Formal explanation
+
+<C id="linearizability" /> is a guarantee about single objects: the system behaves as if there
+were one copy, and each operation took effect at a single instant between its invocation and
+its response. It respects real-time ordering — if operation A completed before B started, B sees
+A's effect.
+
+<C id="serializability" /> is a guarantee about *transactions*: the result equals some serial
+execution. It says nothing about which order, and nothing about real time.
+
+They are independent. A system can be one without the other, and combining both is **strict
+serializability**, the strongest practical guarantee and the most expensive.
+
+<C id="cap" />, stated properly:
+
+<Claim label="fact" source="gilbert-lynch">
+The formal result is that it is impossible for a distributed system to simultaneously provide
+linearizable consistency, availability at every non-failing node, and tolerance of network
+partitions. Under a partition, a system must sacrifice either linearizability or availability.
+</Claim>
+
+The popular framing — &ldquo;pick two of three&rdquo; — is wrong in a way that matters.
+Partitions are not a design choice; the network will partition. So P is not optional, and CAP
+describes what happens **during a partition only**: answer, or be right.
+
+<C id="pacelc" /> completes it, and the second half is the one you live with daily:
+
+<Claim label="fact" source="abadi-pacelc">
+PACELC extends CAP: during a Partition, choose Availability or Consistency; Else — in normal
+operation — choose Latency or Consistency. Systems that replicate synchronously pay latency on
+every operation, not only during failures.
+</Claim>
+
+Partitions are rare. Normal operation is constant. **The latency-versus-consistency trade is
+therefore the one that shapes your system**, and CAP alone does not mention it.
+
+<Callout kind="info" title="Eventual consistency is a choice, not a compromise">
+For likes, view counts, feeds, search indexes and recommendations, a slightly stale answer is
+more valuable to the user than a slow one or no answer at all. These are not systems that
+"gave up" on consistency; they chose the guarantee that fits the data.
+</Callout>
+
+<Deeper title="Session guarantees: most of the value, almost none of the cost">
+
+The gap between "eventual" and "linearizable" is enormous, and most of the practical value sits
+just above the bottom.
+
+<C id="session-guarantees">Session guarantees</C> are per-user promises:
+
+- **<C id="read-your-writes" />** — you see your own updates. Implement by routing your reads to
+  the leader briefly after you write, or by carrying a write position that a replica must have
+  reached.
+- **<C id="monotonic-reads" />** — you never see time run backwards. Implement by pinning a user
+  to one replica.
+- **Monotonic writes** — your writes are applied in the order you made them.
+- **Consistent prefix** — you never see an effect before its cause.
+
+Together these make an eventually-consistent system *feel* correct to each individual user,
+because the anomalies people notice are almost always about their own actions. Another user's
+comment appearing a second late is invisible; your own comment vanishing on refresh is a bug
+report.
+
+<Claim label="recommendation">
+Before reaching for linearizability, check whether session guarantees would satisfy the actual
+complaint. They usually do, and they cost routing logic rather than a coordination round trip
+on every operation.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The same system offering different guarantees on different paths."
+  columns={[
+    { title: 'Operations', nodes: [{ id: 'count', label: 'View count' }, { id: 'basket', label: 'Basket' }, { id: 'checkout', label: 'Checkout', tone: 'accent' }] },
+    { title: 'Guarantee', nodes: [{ id: 'eventual', label: 'Eventual' }, { id: 'session', label: 'Session' }, { id: 'linear', label: 'Linearizable' }] },
+    { title: 'Mechanism', nodes: [{ id: 'replica', label: 'Any replica', note: 'no coordination' }, { id: 'routed', label: 'Routed reads', note: 'per-user' }, { id: 'quorum', label: 'Consensus', note: 'majority round trip' }] },
+  ]}
+  edges={[
+    { from: 'count', to: 'eventual' },
+    { from: 'basket', to: 'session' },
+    { from: 'checkout', to: 'linear' },
+    { from: 'eventual', to: 'replica' },
+    { from: 'session', to: 'routed' },
+    { from: 'linear', to: 'quorum' },
+  ]}
+  stages={[
+    {
+      label: 'One guarantee for everything',
+      show: ['checkout', 'linear', 'quorum'],
+      because:
+        'Applying the strongest guarantee everywhere is simple to reason about and makes every operation pay coordination cost, including the ones nobody would notice being stale.',
+    },
+    {
+      label: 'Guarantee per operation',
+      show: ['count', 'basket', 'checkout', 'eventual', 'session', 'linear', 'replica', 'routed', 'quorum'],
+      because:
+        'Each path gets what it needs. The expensive mechanism protects the one operation where being wrong costs money, and the rest stay fast and available.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Single node',
+      behaviour:
+        'Everything is linearizable for free. No coordination, no lag, no choice to make.',
+      firstToBreak: 'Nothing. This is why the trade-offs feel abstract until you distribute.',
+    },
+    {
+      scale: 'Replicas in one region',
+      behaviour:
+        'Coordination costs a millisecond or two. Linearizable reads are affordable, and lag is small enough that eventual consistency rarely shows.',
+      firstToBreak:
+        'Read-your-writes, which is the first anomaly users report.',
+    },
+    {
+      scale: 'Replicas across regions',
+      behaviour:
+        'Coordination costs a cross-region round trip on every operation. Now the guarantee choice is a product decision with a visible latency price.',
+      firstToBreak:
+        'Write latency, if you chose consistency; user trust, if you chose availability without session guarantees.',
+    },
+    {
+      scale: 'Active-active across continents',
+      behaviour:
+        'Linearizable writes are impractical for most operations. Concurrency and conflicts become the normal case.',
+      firstToBreak:
+        'The assumption that there is one current value. Conflict resolution becomes a product decision.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Applying linearizability everywhere',
+      symptom:
+        'Every operation is slow, and a partition takes the entire product down rather than degrading it.',
+      cause:
+        'A blanket "we need consistency" decision instead of a per-operation analysis.',
+      mitigation:
+        'Classify operations by what a stale answer actually costs. Most cost nothing. Reserve coordination for the ones where being wrong is irreversible.',
+    },
+    {
+      what: 'Assuming eventual consistency means "a bit stale"',
+      symptom:
+        'Under load or after a partition, replicas are minutes behind, and application logic that assumed seconds breaks.',
+      cause:
+        'Eventual consistency guarantees convergence if writes stop. It bounds nothing about the interim.',
+      mitigation:
+        'If you need a bound, say so and enforce it: bounded staleness, with monitoring and a policy for what happens when the bound is exceeded.',
+    },
+    {
+      what: 'Session guarantees lost when the user moves',
+      symptom:
+        'A user sees their own write on desktop and not on mobile, or loses it after a load balancer reassignment.',
+      cause:
+        'The guarantee was implemented by pinning to a replica, and the pin is per-connection rather than per-user.',
+      mitigation:
+        'Carry the write position in a token the client holds, rather than relying on routing stickiness.',
+    },
+    {
+      what: 'Read-your-writes implemented with a fixed delay',
+      symptom:
+        'Works in testing, fails under load when replication lag exceeds the assumed delay.',
+      cause:
+        'A hard-coded "read from leader for 500 ms" assumes a lag bound that does not hold during bursts.',
+      mitigation:
+        'Compare against the actual replication position rather than a wall-clock delay.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Serve reads with session guarantees rather than linearizability"
+  options={[
+    'Linearizable reads: coordinate on every read',
+    'Session guarantees: per-user coherence, global eventual consistency',
+    'Eventual consistency with no session guarantees',
+    'Bounded staleness: a contractual maximum lag',
+  ]}
+  why="The anomalies users actually report are about their own actions — my comment vanished, my setting did not save. Other users lagging by a second is invisible. Session guarantees fix exactly the visible class at a small fraction of the cost."
+  gain="Reads served from any replica, so read capacity scales and reads stay available during a partition. The user-visible anomaly disappears. No coordination round trip on the common path."
+  sacrifice="Different users can see different states, which is wrong for anything with a cross-user invariant. Implementation requires tracking write positions or routing, which is state you must maintain."
+  failureModes={[
+    'Losing the session context on device change, reconnection or load balancer reassignment',
+    'Cross-user invariants silently violated, because the guarantee is per-user by construction',
+    'A lagging replica pinned to a user, giving them a consistently stale view',
+  ]}
+  operationalBurden="Moderate. Routing logic or write-position tokens, plus lag monitoring so a badly lagging replica is removed from the read pool."
+  cost="No additional infrastructure. Some engineering, and a permanent requirement that developers know which guarantee each path provides."
+  whenNot="When correctness depends on what *other* users did — inventory, seat allocation, permission checks, account balances — per-user coherence is exactly the wrong guarantee, because the invariant spans users. Those operations need linearizability, and the honest design applies it there and nowhere else."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dynamo">
+Dynamo deliberately chose availability over strong consistency for its target workloads,
+accepting that concurrent versions may exist and exposing them to the application for
+resolution. The paper is explicit that this was a product requirement, not a limitation.
+</Claim>
+
+<Claim label="fact" source="spanner">
+Spanner provides externally consistent transactions across geographically distributed replicas,
+using bounded clock uncertainty and commit wait. The latency cost of that guarantee is inherent
+to it rather than an implementation detail.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Practical systems commonly offer different guarantees for different operations rather than one
+global setting, because the cost of the strongest guarantee is only justified for the small
+subset of operations whose correctness depends on it.
+</Claim>
+
+<Claim label="recommendation">
+Write down, per operation, what a stale answer costs. Most rows in most systems cost nothing.
+That document is the consistency design, and it is far more useful than a single sentence
+naming a database's consistency mode.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can state CAP correctly and choose guarantees per operation. Reciting 'pick two of three' is a reliable signal that the model came from a summary rather than from the result."
+  depth="Know that partitions are not optional, know that PACELC's else-branch is the everyday cost, and be able to name which operations in your design need which guarantee. Session guarantees by name are a strong signal."
+  followUps={[
+    'Which operations here need linearizability, and which do not?',
+    'A user does not see their own comment. What guarantee is missing?',
+    'Your database claims strong consistency. What does that cost on every write?',
+    'During a partition, what does your system do?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'CAP means you pick two of three.',
+      why: 'Partitions are not something you choose. The network will partition, so P is a given, and the theorem describes what to do during one. Presenting it as a menu of three suggests you could build a CA system, which in a distributed setting you cannot.',
+      instead:
+        'State it as: during a partition, answer or be right. Then add PACELC, because outside partitions you are still choosing between latency and consistency on every operation.',
+    },
+    {
+      mistake: 'We need strong consistency.',
+      why: 'For which operations, and what does a stale answer cost for each? Applied globally, it means coordination on every read and unavailability during a partition even for data nobody would notice being stale.',
+      instead:
+        'Classify. Name the one or two operations whose correctness genuinely depends on seeing the latest value, and be explicit that everything else is eventually consistent.',
+    },
+    {
+      mistake: 'Eventual consistency is fine, the lag is only milliseconds.',
+      why: 'Eventual consistency promises convergence if writes stop; it promises nothing about the interim. Lag is largest under load, which is when it matters most and when your testing was least representative.',
+      instead:
+        'If you need a bound, ask for bounded staleness explicitly, monitor the actual lag, and say what happens when it is exceeded.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['cap', 'pacelc']}
+  prompt="Your system replicates synchronously across two regions to guarantee consistency. There is no partition today. What are you paying?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing — the cost only appears during a partition',
+      implies: 'You are reasoning from CAP alone.',
+      why: 'CAP describes partition behaviour, which is why it is incomplete as a design tool. Synchronous cross-region replication adds a round trip to every write, every day, whether or not anything has failed.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'A cross-region round trip on every write, which is the "else" half of PACELC',
+      implies: 'You are accounting for the everyday cost rather than only the failure cost.',
+      why: 'This is exactly the gap PACELC names. Partitions are rare; normal operation is constant. The latency you pay when nothing is wrong usually dominates the total cost of the consistency choice.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Reduced availability, because a region outage stops writes',
+      implies: 'You identified a real cost, but the one that only appears during failure.',
+      why: 'True and important — synchronous replication means an unreachable replica stalls writes. But the question asked what you pay when there is no partition, and that is latency on every operation.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer asks which writes actually need it. Making all writes synchronous to protect a small set of critical ones means the whole product pays cross-region latency for a guarantee that only a few operations require — and the honest fix is to apply synchronous replication selectively rather than globally."
+/>
+
+<Check
+  concepts={['session-guarantees', 'eventual-consistency']}
+  prompt="Users report that comments they post sometimes vanish on refresh and reappear a moment later. What is the cheapest correct fix?"
+  options={[
+    {
+      id: 'a',
+      text: 'Make all reads linearizable',
+      implies: 'You are reaching for the strongest guarantee.',
+      why: 'It fixes the symptom and charges coordination on every read in the product, including the vast majority that have nothing to do with the user\'s own recent write. It also makes reads unavailable during a partition.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Read-your-writes: route this user\'s reads to a replica that has caught up to their write position',
+      implies: 'You matched the guarantee to the specific anomaly rather than to the general category.',
+      why: 'The complaint is entirely about the user\'s own action. Other users seeing the comment a second late is invisible. Tracking the write position and requiring a replica to have reached it fixes the visible class of anomaly without any coordination on the common path.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Add a short delay before refreshing so replication catches up',
+      implies: 'You are working around the lag with a timing assumption.',
+      why: 'It works when lag is small and fails when lag is large — which is under load, which is exactly when more users are affected. Any fixed delay is a guess about a bound that is not guaranteed.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the implementation detail that makes it robust: carry the write position in a token the client holds rather than pinning by connection, so the guarantee survives reconnection and load balancer reassignment. It also notes that monotonic reads should come with it, or the user can still see the comment disappear by being routed to a staler replica."
+/>
+
+<DebugCheck
+  concepts={['session-guarantees', 'monotonic-reads', 'eventual-consistency', 'staleness']}
+  symptom="Users report that a comment they posted appears, then disappears, then appears again over about thirty seconds. Nothing is being deleted."
+  observations={[
+    { label: 'Write path', detail: 'Comments are written to the primary and replicated asynchronously to five read replicas.' },
+    { label: 'Read path', detail: 'Reads are load balanced across all five replicas per request, with no affinity.' },
+    { label: 'Replication lag', detail: 'Ranges from 20 ms to about 4 seconds across replicas, varying by replica and by minute.' },
+    { label: 'Reproduction', detail: 'A page refresh loop after posting shows the comment present and absent in no fixed pattern.' },
+    { label: 'Deletion audit', detail: 'No delete operations recorded for any of the affected comments.' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'Successive reads land on replicas with different lag, so the user moves backwards and forwards in time. It is a monotonic reads violation as well as a read-your-writes one.',
+      implies: 'You are naming the specific session guarantee that is missing rather than describing the symptom.',
+      why: 'A replica 20 ms behind has the comment; one 4 seconds behind does not. Without affinity, consecutive reads sample different points in the replication history, so the user sees the comment blink. Read-your-writes alone would explain the comment being missing at first; the reappearing and vanishing needs monotonic reads too, and naming both is what makes the fix complete.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The write is not durable and is being rolled back, then retried.',
+      implies: 'You are treating the disappearance as evidence of a failed write.',
+      why: 'A rolled-back write would leave nothing on any replica and would show in the primary. Here the comment is definitely present — some reads return it — so the write succeeded, and the question is which copy the reader is being shown.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Replication lag. Route this user’s reads to the primary for a few seconds after they write.',
+      implies: 'You have identified the cause and reached for read-your-writes.',
+      why: 'Correct diagnosis and a fix that solves half of it. Routing to the primary after a write gives the author a consistent view of their own comment. Every other reader on the page can still see it blink as their reads sample different replicas, which is the monotonic reads half and needs its own remedy.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer implements it without pinning to a connection. Carry the write position in a token the client holds, and require any replica serving that user to have reached it — which survives reconnection and load balancer reassignment in a way that sticky routing does not. It also observes that the same token gives monotonic reads for free, because a replica behind the token cannot serve the request, and that these are two of the four session guarantees rather than two unrelated bugs."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: "Brewer's conjecture and its formal proof", sourceId: 'gilbert-lynch' },
+    {
+      label: 'PACELC: the trade-off outside partitions',
+      sourceId: 'abadi-pacelc',
+      note: 'The half of the story that CAP leaves out, and the one that costs you every day.',
+    },
+    { label: 'Consistency models and session guarantees', sourceId: 'ddia' },
+    {
+      label: 'Next: moving work between machines without losing or duplicating it',
+      href: '/lessons/delivery-and-duplicates',
+    },
+  ]}
+/>

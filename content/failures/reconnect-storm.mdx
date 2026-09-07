@@ -1,0 +1,169 @@
+---
+id: reconnect-storm
+title: The Reconnect Storm
+symptom: Forty seconds of packet loss in one zone becomes a forty-minute global outage, and most of the affected users were never on the failed network.
+category: overload
+concepts: [websocket, push-vs-pull, thundering-herd, connection-exhaustion, exponential-backoff, admission-control, load-shedding, cascading-failure, capacity-planning, cell-architecture, blast-radius, health-check]
+sources: [hpbn, aws-jitter, aws-builders-library, release-it, discord-eng]
+status: reviewed
+---
+
+## What you see
+
+**03:14:20** — A network device in one availability zone is replaced. Roughly forty seconds of
+packet loss, affecting about a third of the connection gateways.
+
+**03:15:00** — The network is healthy again. 900,000 of 2.4 million connected clients have
+dropped.
+
+**03:15:04** — All 900,000 reconnect. The gateway tier, which handles a few thousand new
+connections per second on an ordinary day, receives nine hundred thousand in four seconds.
+
+**03:15:20** — Gateways are out of file descriptors and pinned on TLS handshakes. They begin
+refusing connections. Refused clients retry immediately.
+
+**03:16:40** — The gateways that were *not* in the failed zone are now saturated too, because the
+displaced clients landed on them. They start dropping the connections they were already holding.
+
+**03:22** — All 2.4 million clients are disconnected and retrying. The authentication service
+behind the gateways is at 100% CPU, which means nobody can connect even where there is capacity.
+
+**03:55** — Recovery, after the team blocks reconnects at the edge and admits them in batches.
+
+Forty seconds of packet loss. Forty minutes of outage. And the majority of affected users were on
+networks that never failed — they were disconnected by the recovery of people who did.
+
+## The mechanism
+
+Two facts, and everything follows from them.
+
+**Establishing a connection costs orders of magnitude more than using one.** A TLS handshake, a
+token validation, a session-registry write, a subscription restore. Sending a message afterwards
+costs a few bytes and a syscall. The ratio is easily a thousand to one.
+
+**Steady state hides that completely.** At half a percent daily churn, 2.4 million connections
+generate a few thousand handshakes a second, and the gateway tier runs at 5% utilisation. Every
+dashboard says the tier is enormously over-provisioned, because for the workload it normally does,
+it is.
+
+A correlated disconnect converts the cheap operation into the expensive one for everybody at once.
+The tier was sized for the connections it *holds*, and it is now being asked to do the thing it
+almost never does, at a rate three hundred times its normal peak.
+
+Then it compounds, in two ways that matter more than the initial spike.
+
+**Retries are synchronised.** All 900,000 failed in the same instant, so a fixed retry delay — or
+a backoff with no jitter — schedules them all to return in the same instant. The load arrives as a
+series of waves rather than as a rise, and each wave re-triggers the failure.
+
+**Displacement spreads it.** Clients from the failed zone connect to gateways that were healthy.
+Those gateways saturate and drop the connections they were already serving, which then reconnect.
+
+<Claim label="inference">
+This second phase is what turns a zone incident into a global one, and it is the part that
+surprises people. The blast radius of the original fault was one third of the fleet. The blast
+radius of the recovery was all of it, because a saturated gateway does not fail politely — it
+sheds the connections it is holding, and those become new arrivals somewhere else.
+</Claim>
+
+## Why the obvious fixes make it worse
+
+**Restarting the gateways.** Every restart drops that gateway's remaining connections into the
+storm. During an incident this is close to the worst available action, and it is the first thing
+most people reach for.
+
+**Adding gateway capacity.** New instances come up empty and immediately receive a share of a load
+that no instance can absorb — and they authenticate against the same auth service, which is
+already the constraint. You have added capacity to the layer that is not the bottleneck.
+
+**Raising file descriptor and connection limits.** More handshakes now start concurrently, so each
+takes longer, so more of them exceed the client timeout, so more clients abandon and retry. It
+converts a fast refusal into a slow failure, which is strictly worse.
+
+**Waiting for clients to back off.** They will, on whatever schedule was shipped to them months
+ago. You cannot change it now, which is precisely why the retry delay needs to be something the
+server can dictate.
+
+## What actually works
+
+**Refuse cheaply, before the expensive part.** A refusal must cost far less than an acceptance —
+ideally rejected before the TLS handshake completes, returning a signed token that says when to
+come back. A refusal that costs as much as an acceptance is not shedding, it is the same load with
+no benefit.
+
+Then admit in batches:
+
+1. Block reconnects at the edge entirely. Let the auth service and the registry recover with no
+   work to do.
+2. Admit a fraction — start at something the auth service can certainly serve, not at what you
+   hope it can.
+3. Increase in steps, watching **connections successfully established**, not connections
+   attempted.
+4. Expect this to take longer than feels reasonable. Re-establishing 2.4 million connections at
+   20,000 per second is two minutes of pure handshake, and the real rate will be lower.
+
+## How to prevent it
+
+**Jittered backoff sized against your reconnect capacity, not against a convention.** The
+arithmetic is the point: if 900,000 clients must reconnect and you can accept 20,000 per second,
+the jitter window must be at least forty-five seconds, or the tail of the window is still a storm.
+A three-second jitter on a nine-hundred-thousand-client fleet is decoration.
+
+**Server-directed retry delay.** The reconnect response carries the delay. This is the difference
+between having a control during the incident and having a policy you shipped last quarter.
+
+<Claim label="fact" source="aws-jitter">
+Adding randomisation to exponential backoff spreads retry attempts over time rather than allowing
+clients that failed together to return together, and measurably reduces both contention and the
+work wasted on collided attempts.
+</Claim>
+
+**Make reconnection cheap.** TLS session resumption, a resumption token that avoids a full
+authentication round trip, and subscription state restored from a client-held token rather than
+rebuilt by querying. Every millisecond removed from the reconnect path multiplies by the size of
+your connected population.
+
+**Plan capacity for the reconnect path explicitly**, and state it as a duration: *we can
+re-establish the entire connected population in N minutes.* That number is a capacity requirement
+in its own right, and almost nobody has it.
+
+**Isolate by cell**, so a zone or region event disconnects a bounded fraction rather than a third
+of everything.
+
+**Drain on deploy, never drop.** This is the same path, and a rolling deploy exercises it every
+week — which makes it one of the few disaster paths you can be confident is tested, provided you
+never restart more than a small percentage of gateways at once.
+
+## How to detect it early
+
+- **Connection establishment rate**, with its own stated capacity. It is a completely different
+  metric from connection count, and the tier's real limit is expressed in it.
+- **Handshake latency.** It rises before refusals begin, which makes it the leading indicator.
+- **Alert on a sudden drop in connected count.** A fall of more than a few percent in a minute is
+  the warning; the storm arrives seconds later, and those seconds are enough to start shedding.
+- **Rehearse it.** Disconnect ten percent of the fleet deliberately and measure the time to full
+  reconnection. If nobody has ever done this, the recovery time is unknown rather than acceptable.
+
+## Related
+
+<Claim label="fact" source="hpbn">
+Establishing a connection costs round trips for the transport handshake and again for encryption,
+and long-lived connections consume server resources whether or not data is flowing. Connection
+count and connection establishment rate are therefore separate capacity dimensions.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Shedding load early and cheaply, so that rejection costs far less than service, is described as
+the mechanism that allows a system to remain useful during overload rather than failing uniformly.
+</Claim>
+
+<Claim label="convention" source="release-it">
+A saturated component that sheds the work it is already holding converts its own overload into new
+arrivals elsewhere, which is how a bounded fault propagates into a general one.
+</Claim>
+
+<Claim label="convention" source="discord-eng">
+Published engineering writing on large real-time messaging systems treats mass reconnection as a
+primary architectural concern rather than a tuning detail, with the connection-handling tier kept
+separate from application logic for exactly this reason.
+</Claim>

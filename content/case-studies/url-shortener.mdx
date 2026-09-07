@@ -1,0 +1,399 @@
+---
+id: url-shortener
+title: A URL Shortener
+ask: Design a URL shortener. Something like the ones you have used.
+difficulty: core
+minutes: 45
+signatures: [id-generation, hot-key, fanout]
+concepts: [back-of-envelope, statelessness, index, cache-generic, hot-key, cdn, local-cache, cache-stampede, rate-limiting, sharding, idempotency, optimistic-concurrency, availability-math, graceful-degradation]
+patterns: [cache-aside, read-through-edge, key-splitting]
+prerequisites: [when-load-is-not-even, caching-a-bet-on-time]
+sources: [ddia, rfc9110, rfc9111, cloudflare-blog, aws-builders-library]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a URL shortener. Something like the ones you have used.&rdquo;
+
+It looks trivial: store a mapping, return a redirect. It is the most common opener in system
+design interviews precisely because the trivial version is easy and the interesting version is
+four questions away.
+
+Underneath it are three real problems: generating unique identifiers without coordination,
+surviving a read/write ratio of roughly 100:1, and handling a single key that receives more
+traffic than the rest of the system combined.
+
+## Clarify
+
+The questions worth asking, and — the part that matters — what each one changes.
+
+| Question | Why it changes the design |
+|---|---|
+| How many links created, and how many redirects served? | Sets whether this is one database or many. It is the first thing to establish. |
+| What is the read/write ratio? | At 100:1, caching and replicas come first and sharding is irrelevant. At 1:1 it is a different system. |
+| Custom aliases? | Introduces a uniqueness contention problem that random generation avoids entirely. |
+| Do links expire? | Determines whether storage grows without bound and whether deletion is a supported operation. |
+| Analytics on clicks? | A write per redirect changes the write path from 40/sec to 4,000/sec — a two-order-of-magnitude difference. |
+| Can links be removed or blocked? | Determines whether mappings are immutable, which decides the entire caching strategy. |
+
+The last one is the trap. If you assume mappings are immutable and cache them forever, the
+abuse round later invalidates your design. A strong candidate asks about takedown early.
+
+**Assumed answers for this walkthrough:** 100 million new links a month, 10 billion redirects a
+month, custom aliases supported, optional expiry, analytics as a stretch goal, and takedown
+required.
+
+## Requirements
+
+**Functional**
+
+- Create a short link for a long URL, optionally with a custom alias and an expiry.
+- Redirect a short link to its target.
+- Remove or block a link.
+
+**Non-functional**
+
+- Redirect latency: p99 under 50 ms at the edge.
+- Redirect availability: this is the critical path. Creation may be less available.
+- Durability: losing a mapping breaks every existing link, so this is a hard requirement.
+- Consistency: a newly created link should work immediately for its creator. A takedown should
+  take effect within seconds.
+
+**Explicitly out of scope:** user accounts, billing, link editing after creation, and preview
+pages.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+With the assumed numbers — 100 million writes and 10 billion reads a month:
+
+- A month is roughly 2.6 million seconds.
+- **Writes:** about 40 per second average, perhaps 200 at peak.
+- **Reads:** about 4,000 per second average, perhaps 20,000 at peak.
+- **Read/write ratio:** roughly 100:1.
+
+Storage:
+
+- 1.2 billion links a year. At roughly 500 bytes per row including indexes, about 600 GB a year.
+- With three replicas, about 1.8 TB a year of physical storage.
+
+<Claim label="inference">
+Two hundred writes per second is comfortably within a single well-indexed relational primary,
+and 600 GB a year fits on one machine for several years. The estimate therefore says: **do not
+shard.** The interesting problem is entirely on the read path.
+</Claim>
+
+This is the single most valuable output of the estimate, and candidates who skip it usually
+propose a sharded database for a workload one machine handles.
+
+## Data model
+
+Two entities, and the access patterns are what matter:
+
+| Access pattern | Frequency | Key |
+|---|---|---|
+| Look up target by short code | 20,000/sec peak | short code |
+| Create mapping | 200/sec peak | short code (uniqueness) |
+| Check whether an alias is taken | 200/sec peak | short code |
+| Look up links by creator | rare | creator id |
+
+Every hot access is by short code, so short code is the primary key. That decides the storage
+layout: a key-value lookup, no joins, no range scans on the hot path.
+
+The mapping row: `short_code` (primary key), `long_url`, `created_at`, `expires_at`,
+`creator_id`, `status`. The `status` column is what makes takedown possible without deleting
+the row, which matters for auditing and for preventing the code being reissued.
+
+## Design v1
+
+<Arch
+  caption="The simplest thing that satisfies the stated requirements."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Browser' }] },
+    { title: 'Entry', nodes: [{ id: 'lb', label: 'Load balancer' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Link service', note: 'stateless', tone: 'accent' }] },
+    { title: 'Data', nodes: [{ id: 'db', label: 'Primary', note: 'PK on short code' }, { id: 'replica', label: 'Read replica' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'lb' },
+    { from: 'lb', to: 'app' },
+    { from: 'app', to: 'db', label: 'create' },
+    { from: 'app', to: 'replica', label: 'redirect' },
+  ]}
+  stages={[
+    {
+      label: 'v1',
+      show: ['client', 'lb', 'app', 'db', 'replica'],
+      because:
+        'At 200 writes and 20,000 reads per second, a stateless tier over one primary with a read replica meets the requirement. Everything added beyond this must be justified by a constraint that has actually appeared.',
+    },
+  ]}
+/>
+
+A redirect is a primary-key lookup returning a 301 or 302. That is the entire product.
+
+<Callout kind="info" title="Which redirect status code, and why it matters here">
+A 301 is permanent and is cached aggressively by browsers, so subsequent clicks may never reach
+you at all — excellent for load, fatal for click analytics and for takedown. A 302 is temporary
+and is re-requested, so you keep analytics and control at the cost of serving every click.
+This is a product decision with a large infrastructure consequence, and it is worth raising
+explicitly.
+</Callout>
+
+## ID generation
+
+The first real design decision. Three viable approaches:
+
+<TradeOff
+  decision="Generate short codes with per-instance blocks from a central counter, encoded in base62"
+  options={[
+    'Hash the long URL and truncate',
+    'Random string with a uniqueness check',
+    'Monotonic counter, base62 encoded, allocated in blocks',
+  ]}
+  why="Seven base62 characters give roughly 3.5 trillion codes, far more than needed. Allocating blocks of 10,000 to each instance means the central allocator is contacted once per 10,000 links rather than once per link, so coordination is not on the write path."
+  gain="No coordination per write, no collision handling, and codes are compact. Throughput is bounded by the instances, not by a shared counter."
+  sacrifice="Codes are guessable in aggregate: knowing one tells you roughly where others are. Blocks are lost when an instance dies with an unused range, though at 3.5 trillion codes that is irrelevant."
+  failureModes={[
+    'The allocator becomes a dependency for link creation, though only once per block',
+    'Sequential codes enable enumeration of other users’ links',
+    'Clock or ordering assumptions if blocks are derived from timestamps',
+  ]}
+  operationalBurden="Low. One small counter table with a conditional increment, plus in-memory block tracking per instance."
+  cost="Negligible."
+  whenNot="When enumeration matters — links to private documents, for example — sequential codes leak the existence and approximate creation time of other links. There, random generation with a uniqueness constraint is the better default, accepting a read-check per write and a rising collision rate as the space fills. A middle option is to scramble the counter with a reversible permutation, which keeps allocation cheap and makes codes non-sequential."
+/>
+
+Custom aliases are a different problem: two users may request the same alias simultaneously.
+The correct mechanism is a unique constraint on the column with the insert failing for the
+loser — never a check followed by an insert, which is the classic
+<C id="lost-update">lost update</C> race.
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Reads are 100 times writes.&rdquo;
+
+The mapping is immutable once created (subject to takedown, which we will come to), so it caches
+almost perfectly. Add a shared cache with a long TTL in front of the database.
+
+At a 95% hit rate, the database sees 1,000 reads per second at peak instead of 20,000. At 99%
+it sees 200.
+
+**New cost:** staleness on takedown, which we now owe an answer for.
+
+### Round 2 — &ldquo;One link gets 2 million requests per second.&rdquo;
+
+A viral campaign. This is a <C id="hot-key" />, and it is a different problem from aggregate
+load: every one of those requests is for the same key, which lives on one cache node. Adding
+cache nodes does not help.
+
+Three moves, in order of effectiveness:
+
+1. **Serve it from the edge.** A redirect for an immutable mapping is a cacheable HTTP response.
+   A CDN absorbs it entirely and the request never reaches your infrastructure.
+2. **In-process cache on each application instance.** Divides residual hot-key load by instance
+   count. Costs a few seconds of staleness.
+3. **Split the key** across N cache entries. Works, and is more complex than replication for a
+   read-heavy key.
+
+**New cost:** two more cache layers with weaker invalidation. Takedown now has to propagate
+through the edge and through every instance's local cache.
+
+### Round 3 — &ldquo;The cache goes down.&rdquo;
+
+The database was seeing 5% of read traffic. With an empty cache it sees 100%: 20,000 reads per
+second against a database provisioned for perhaps 5,000.
+
+<Estimator preset="cache" />
+
+The cold-cache overload factor is 4. That means a cache restart is an outage unless three things
+exist:
+
+- **Request coalescing**, so one miss per key reaches the origin rather than thousands.
+- **Load shedding**, so the origin serves what it can rather than failing everything.
+- **Staggered TTLs**, so keys do not expire in synchronised waves.
+
+Persistence on the cache tier also helps: a restart that reloads from disk is not a cold start.
+
+### Round 4 — &ldquo;A database region goes down.&rdquo;
+
+Redirects are read-only and the data is immutable, which makes this unusually tractable.
+
+- **Reads:** serve from a replica in another region. Redirects continue.
+- **Writes:** link creation is unavailable until a replica is promoted, or is queued.
+
+This is a deliberate asymmetry worth stating out loud: **the redirect path must survive; the
+creation path may degrade.** Most systems have such an asymmetry and most candidates do not name
+it.
+
+### Round 5 — &ldquo;We need custom aliases.&rdquo;
+
+Covered above: unique constraint, insert fails for the loser, no check-then-insert.
+
+The subtler issue is the namespace collision between generated codes and custom aliases. Either
+they share a space — in which case a generated code might collide with a reserved alias — or they
+are separated, for example by prefix or by length. Separating them is simpler and worth doing at
+design time, because unpicking it later requires reissuing codes.
+
+### Round 6 — &ldquo;Someone is abusing the service.&rdquo;
+
+Two distinct problems:
+
+**Creation abuse.** A script creating a million links an hour. Answer: rate limit per
+authenticated identity and per IP with a <C id="token-bucket" />, enforced at the edge so
+rejection is cheap. Require authentication above a low anonymous threshold.
+
+**Malicious targets.** Links to malware. Answer: check the destination against a reputation
+service asynchronously at creation, re-check periodically because a benign URL can turn
+malicious later, and support fast takedown.
+
+<Callout kind="warn" title="This round invalidates an earlier decision">
+We cached mappings as immutable, with long TTLs, at the edge and in every instance's local
+memory. Takedown requires invalidating all of that within seconds.
+
+The resolution: keep a small denylist checked on the redirect path — a set of blocked codes,
+small enough to hold in memory on every instance and to refresh every few seconds. The mapping
+stays cacheable; the block is checked separately.
+
+The edge is the harder half. Options are a purge API with propagation delay, a shorter edge TTL
+that trades load for control, or serving through a worker at the edge that consults the denylist.
+Noticing this contradiction unprompted is the strongest thing a candidate can do in this round.
+</Callout>
+
+### Round 7 — &ldquo;We need click analytics.&rdquo;
+
+This changes the write path fundamentally: from 200 writes per second to one write per redirect,
+which is 20,000 per second at peak — a hundred-fold increase.
+
+Do not write to the primary database synchronously. The redirect must not wait for analytics.
+
+- Emit an event to a queue or log from the redirect path, fire and forget.
+- Aggregate asynchronously into a time-series or analytical store.
+- Accept eventual consistency: click counts lag by seconds or minutes, which nobody notices.
+
+If a 301 is used, many clicks never reach you at all, so analytics are structurally incomplete —
+which is the point raised in the callout above, arriving with consequences.
+
+### Round 8 — &ldquo;Storage is growing forever.&rdquo;
+
+1.2 billion rows a year, growing. Options:
+
+- **Expiry.** If links may expire, old rows can be removed, but only if the code is never
+  reissued — reissuing a code makes an old link point somewhere new, which is a security problem.
+- **Tiering.** Recent links in the hot store, old links in cheaper storage with a slower path.
+  Access to links is heavily skewed toward recent ones, so this works well.
+- **Do nothing.** At 600 GB a year, a single machine holds several years. This is often the right
+  answer, and saying so is a legitimate design decision rather than an evasion.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'The cache tier fails',
+      symptom: 'Redirect latency spikes, then the database saturates and redirects begin failing.',
+      cause: 'The origin was provisioned for the miss rate, not the request rate.',
+      mitigation:
+        'Request coalescing, load shedding, staggered TTLs, cache persistence. Edge caching also means many requests never depend on the shared cache at all.',
+    },
+    {
+      what: 'The ID allocator is unavailable',
+      symptom: 'Link creation fails; redirects are unaffected.',
+      cause: 'Block allocation requires the central counter.',
+      mitigation:
+        'Large blocks mean instances hold thousands of unused codes, so a brief allocator outage is invisible. Pre-allocate a second block before the first is exhausted.',
+    },
+    {
+      what: 'A hot key saturates one cache node',
+      symptom: 'One node at capacity, the rest idle, and elevated latency for one link.',
+      cause: 'A single key cannot be partitioned.',
+      mitigation: 'Edge caching, local in-process caching, or key splitting.',
+    },
+    {
+      what: 'Takedown does not propagate',
+      symptom: 'A blocked link continues to redirect from edge or local caches.',
+      cause: 'Mappings were cached as immutable with long TTLs across several layers.',
+      mitigation:
+        'A separate denylist checked on the redirect path, refreshed frequently, plus edge purge with a known propagation delay.',
+    },
+    {
+      what: 'Analytics writes overwhelm the write path',
+      symptom: 'Redirect latency rises with click volume.',
+      cause: 'Analytics written synchronously on the redirect path.',
+      mitigation: 'Emit asynchronously; never let telemetry block a user-facing request.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Single database, no sharding | One primary plus replicas | Horizontal write scale | Writes exceeded what one primary sustains |
+| Counter-based IDs in blocks | Cheap, no collisions | Codes are enumerable | Enumeration were a privacy concern |
+| Cache with long TTL | Very high hit rate | Immediate invalidation | Mappings became mutable |
+| Edge caching for hot keys | Absorbs viral traffic | Control over takedown propagation | Takedown latency requirement were sub-second |
+| Asynchronous analytics | Redirect stays fast | Exact, immediate counts | Counts were used for billing |
+| 302 rather than 301 | Analytics and control | Free client-side caching | Load mattered more than measurement |
+
+## Cost
+
+The dominant costs, in order:
+
+1. **Edge traffic.** Billed per request and per gigabyte. At 10 billion redirects a month this is
+   the largest line, and it is also what makes the system survivable.
+2. **Cache memory.** Sized for the hot set rather than the full dataset — a small fraction of
+   1.2 billion links, so modest.
+3. **Database storage.** Roughly 1.8 TB a year including replicas. Inexpensive.
+4. **Compute.** Small. The application does almost nothing per request.
+
+<Claim label="recommendation">
+The cheapest version of this system serves nearly all redirects from the edge and touches the
+origin rarely. Optimising the origin is optimising the small term; the design decision that
+matters is how much traffic never arrives.
+</Claim>
+
+## What we did NOT build
+
+- **A distributed database.** Two hundred writes per second does not need one, and it would have
+  cost cross-shard queries and a much harder migration path.
+- **A message queue on the redirect path.** Redirects are synchronous reads. A queue would add
+  latency and a dependency for no benefit. Analytics uses one; redirects do not.
+- **Microservices.** One service does two things: create and redirect. Splitting them buys
+  deployment independence nobody needs at this size.
+- **Consensus.** No operation requires one agreed global order. Uniqueness is enforced by a
+  database constraint, which is sufficient and much cheaper.
+- **Multi-region active-active.** Redirect data is immutable and read-only, so read replicas in
+  other regions give most of the benefit without concurrent-write conflicts.
+
+## Evidence
+
+<Claim label="fact" source="rfc9110">
+HTTP defines redirection status codes, including permanent and temporary variants with different
+caching semantics. The choice between them has direct consequences for client caching and for
+whether subsequent requests reach the origin.
+</Claim>
+
+<Claim label="fact" source="rfc9111">
+HTTP caching rules determine what intermediaries may store and for how long, which is what makes
+edge caching of redirects possible without custom protocol work.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Absorbing high-volume traffic for identical public content at the edge, rather than at the
+origin, is standard practice for content that is cacheable and identical across users.
+</Claim>
+
+<Claim label="speculation">
+The specific architecture above is a pedagogical construction derived from the stated
+requirements. It is not a description of how any particular commercial URL shortener is built,
+and no claim is made about any company's internal design.
+</Claim>
+
+## Try it under pressure
+
+The same problem, with an interviewer who reacts to your answers, is available in the
+[interview simulator](/interview). Work through the rounds above yourself before reading the
+answers, or the exercise is reading rather than deriving.

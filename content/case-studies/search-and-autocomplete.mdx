@@ -1,0 +1,457 @@
+---
+id: search-and-autocomplete
+title: Search and Autocomplete
+ask: Design search over a large product catalogue, including the autocomplete that fires on every keystroke.
+difficulty: advanced
+minutes: 55
+signatures: [search-index, hot-key]
+concepts: [inverted-index, tokenisation, relevance-ranking, index, cqrs, denormalisation, eventual-consistency, staleness, cdc, cache-generic, hit-rate, cache-stampede, request-coalescing, sharding, partition-key, cross-shard-query, tail-latency, hedged-request, load-shedding, graceful-degradation, batching, ttl, immutability, compaction, backfill, dead-letter-queue, replay, read-amplification, expand-contract]
+patterns: [cqrs, cache-aside, read-through-edge, transactional-outbox, expand-contract]
+prerequisites: [finding-things-again, caching-a-bet-on-time]
+sources: [elasticsearch-docs, ddia, database-internals, tail-at-scale, aws-builders-library, redis-docs]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design search over a large product catalogue, including the autocomplete that fires on
+> every keystroke.&rdquo;
+
+This is two workloads sharing one name, and treating them as one system is the first mistake
+available.
+
+**Search** runs once per query. It can afford tens of milliseconds of real work: term lookups,
+intersections, scoring, faceting.
+
+**Autocomplete** runs on every keystroke. A user typing eight characters generates eight requests,
+each of which must return before they type the next one. That is roughly **eight times the traffic
+at a fifth of the latency budget**, for a result that matters less.
+
+Underneath both: matching is the easy part, ranking is the product, and freshness is what you pay.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| How large is the corpus, and how fast does it change? | Ten million documents changing hourly and ten billion changing continuously are unrelated problems. |
+| How quickly must a change be searchable? | Minutes allows batch indexing. Seconds forces a streaming pipeline and changes the storage engine. |
+| Which fields change often? | A field that changes every minute rewrites its whole document every minute, because index segments are immutable. |
+| Is ranking personalised? | Personalisation at retrieval time destroys cacheability. Personalisation as a re-rank does not. |
+| Filters and facets? | A filter is set membership with no score, which caches perfectly. Scored terms do not. Conflating them means caching nothing. |
+| Autocomplete over what — past queries or document titles? | Different data source, different pipeline, different failure mode when it is empty. |
+
+**Assumed answers:** 50 million products; price and stock change continuously while text rarely
+does; text changes searchable within a minute, stock within seconds; lightly personalised ranking;
+facets required; typo tolerance required; autocomplete drawn from popular past queries with
+product names as a fallback.
+
+## Requirements
+
+**Functional:** full-text query with filters and facets; typo tolerance; prefix completion;
+ranked results; pagination.
+
+**Non-functional**
+
+- Search p95 under 200 ms; autocomplete p95 under 50 ms end to end, which leaves roughly 20 ms
+  of server budget after the network.
+- A text change is searchable within 60 seconds; a stock change is reflected within 5.
+- Indexing failures must not take search down, and search load must not stop indexing.
+- Zero-result rate is a tracked product metric, not an engineering afterthought.
+
+**Out of scope:** crawling and ingestion of external catalogues, training the ranking model, ads
+and sponsored placement, image and vector retrieval.
+
+## Estimate
+
+- **50,000,000 documents** at about 2 KB of source text each → roughly **100 GB** of documents.
+- The inverted index is typically the same order as the text it indexes, larger if positions and
+  stored fields are kept: call it **100 to 200 GB**.
+- **5,000 searches per second** at peak.
+- Eight keystrokes per search → **40,000 autocomplete requests per second**.
+- Catalogue updates: price and stock churn across 50 million products gives roughly
+  **1,400 document updates per second**, essentially all of them to two fields.
+
+<Claim label="inference">
+The traffic profile inverts the intuition. The feature people describe as a nice touch carries
+eight times the query volume of the feature they describe as the product, at a quarter of the
+latency budget. Any design that treats autocomplete as &ldquo;search with a shorter query&rdquo;
+has already committed to being eight times too slow.
+</Claim>
+
+<Estimator preset="storage" />
+
+The number to watch is the working set. If the index does not fit in page cache, every term
+lookup becomes a disk read, and a query touching six terms becomes six disk reads before scoring
+starts. The difference between an index that fits in memory and one that does not is usually two
+orders of magnitude in tail latency, and it is decided by the size estimate, not by tuning.
+
+## Data model
+
+| Structure | Shape | Serves |
+|---|---|---|
+| Document store | product id to fields | Fetching what to display |
+| Inverted index | term to posting list of document ids | Matching |
+| Forward index | document id to field values | Sorting, filtering, faceting |
+| Prefix store | prefix to top-k completions | Autocomplete |
+
+**Analysis is the part that quietly decides whether anything works.** Text is lowercased, split,
+stemmed, stripped of stop words and expanded with synonyms before it enters the index. The query
+must go through **the same chain**. When it does not, searching for a product's exact title
+returns nothing, and the bug looks like a mystery rather than a mismatch.
+
+**Filters are not queries.** A filter answers yes or no about set membership and contributes
+nothing to the score, so its result is a bitset that can be cached and reused across every user
+who applies it. A scored term cannot be. Systems that treat every clause as scored throw away the
+largest easy optimisation available.
+
+**Autocomplete is not a search.** A prefix match against an inverted index means scanning a range
+of the term dictionary and unioning many posting lists — expensive, and worst for exactly the
+short prefixes that are most common. The right structure is a precomputed map from prefix to its
+top completions: one lookup, no scoring, no merging.
+
+## Design v1
+
+<Arch
+  caption="Two read paths, one source of truth, and an index that is explicitly derived."
+  columns={[
+    { title: 'Source', nodes: [{ id: 'db', label: 'Catalogue database', note: 'source of truth', tone: 'accent' }] },
+    { title: 'Propagation', nodes: [{ id: 'stream', label: 'Change stream', note: 'outbox or CDC' }] },
+    { title: 'Build', nodes: [{ id: 'indexer', label: 'Indexer' }, { id: 'prefix', label: 'Prefix builder' }] },
+    { title: 'Read models', nodes: [{ id: 'shards', label: 'Index shards' }, { id: 'pfx', label: 'Prefix store', note: 'in memory' }] },
+    { title: 'Serving', nodes: [{ id: 'coord', label: 'Query coordinator' }, { id: 'ac', label: 'Autocomplete service' }] },
+    { title: 'Authority', nodes: [{ id: 'stock', label: 'Stock service', note: 'checked on the page' }] },
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client' }] },
+  ]}
+  edges={[
+    { from: 'db', to: 'stream' },
+    { from: 'stream', to: 'indexer' },
+    { from: 'stream', to: 'prefix' },
+    { from: 'indexer', to: 'shards' },
+    { from: 'prefix', to: 'pfx' },
+    { from: 'shards', to: 'coord' },
+    { from: 'pfx', to: 'ac' },
+    { from: 'coord', to: 'stock', label: 'top page only' },
+    { from: 'stock', to: 'client' },
+    { from: 'ac', to: 'client' },
+  ]}
+  stages={[
+    {
+      label: 'Query the database',
+      show: ['db', 'client'],
+      because:
+        'A LIKE query against the products table. It is genuinely correct up to a few hundred thousand rows, and understanding exactly where it stops is worth more than skipping it.',
+    },
+    {
+      label: 'Build an index',
+      show: ['db', 'stream', 'indexer', 'shards', 'coord', 'client'],
+      because:
+        'An inverted index makes matching fast and ranking possible. It is a second copy of the data, derived from the catalogue, and therefore eventually consistent with it. That is the cost, and it is permanent.',
+    },
+    {
+      label: 'Split the two workloads',
+      show: ['db', 'stream', 'indexer', 'prefix', 'shards', 'pfx', 'coord', 'ac', 'stock', 'client'],
+      because:
+        'Autocomplete gets a precomputed prefix store because it cannot afford a query. Stock is checked against the authority for the results actually shown, because the index will always be slightly behind.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 — &ldquo;Why not just use LIKE on the products table?&rdquo;
+
+Three separate reasons, and only the first is about speed.
+
+A leading wildcard cannot use a B-tree index, because a B-tree orders by prefix and the query has
+no prefix. Every such query is a full scan of the table.
+
+It does no ranking. `LIKE` gives you a set, not an order, and the order is the product.
+
+And it puts a scan-shaped workload on the transactional database that also takes orders. One
+enthusiastic search session degrades checkout.
+
+So: build an inverted index. Name the cost immediately — it is **a second copy of the data,
+derived from the catalogue and asynchronously updated**. Search results are eventually consistent
+with the catalogue from the moment this decision is made, and no amount of later engineering takes
+that back.
+
+### Round 2 — &ldquo;Stock changes every minute and the index cannot keep up.&rdquo;
+
+This is the round that separates people who have used a search engine from people who have
+operated one.
+
+Index segments are **immutable**. Updating a document is not an update: it is a new document plus
+a tombstone marking the old one deleted, with the space reclaimed later by a merge. A product
+whose stock count changes every minute therefore rewrites its entire document — title,
+description, attributes, all of it — every minute, and leaves a deleted version behind each time.
+Merge pressure rises, disk churns, and query latency degrades for a field nobody searches on.
+
+The fix is to **keep volatile fields out of the index**:
+
+- Text and attributes, which change rarely, live in the index.
+- Price and stock, which change constantly, live in a fast key-value store and are applied at
+  query time to the results actually returned.
+
+This costs a second lookup on the read path and saves continuous rewriting of 50 million
+documents. It also decouples the two freshness requirements — 60 seconds for text, 5 seconds for
+stock — which the original single-index design had accidentally fused into one.
+
+### Round 3 — &ldquo;The index no longer fits on one machine.&rdquo;
+
+Two ways to split an inverted index, and the choice is not close in practice.
+
+**By document.** Each shard holds a complete index over a subset of documents. Every query goes to
+every shard; each returns its local top *k*; the coordinator merges. Document count and indexing
+throughput scale linearly.
+
+**By term.** Each shard owns a subset of terms. A query touches only the shards holding its terms,
+so fan-out is smaller. But a multi-term query must intersect posting lists that live on different
+machines, which means shipping posting lists across the network — and posting lists are longest
+for exactly the common terms that appear in most queries.
+
+Document sharding wins because its cost scales with the number of shards while term sharding's
+cost scales with the popularity of the terms, which is the thing you cannot control.
+
+One consequence worth knowing: with document sharding, term statistics are per-shard, so a
+relevance score computed on shard A is not strictly comparable to one from shard B. With
+reasonably even document distribution the error is small and universally tolerated. Correcting it
+requires an extra round trip to exchange global frequencies, which is a real technique and almost
+never worth it.
+
+### Round 4 — &ldquo;Search p99 is 2 seconds and every shard reports p99 of 100 ms.&rdquo;
+
+Both statements are true. With twenty shards and each slow 1% of the time, roughly **18% of
+queries touch at least one slow shard**, and the query is as slow as its slowest shard.
+
+- **Fewer, larger shards.** Fan-out is a cost, and more shards is not automatically better. There
+  is an optimum where per-shard work and fan-out width balance, and it is usually far fewer shards
+  than people expect.
+- **Hedged requests.** After the p95 elapses, send the same shard request to a replica and take
+  whichever answers first. A few percent more load buys a dramatically better tail.
+- **Deadline with partial results.** Return what arrived. Search results are allowed to be
+  incomplete — but measure how often it happens and for which shards, because a shard that is
+  quietly excluded from every query is a shard whose documents have become unfindable.
+
+### Round 5 — &ldquo;Forty thousand autocomplete requests per second.&rdquo;
+
+Do not run a search. Precompute.
+
+Build a map from prefix to its top completions, scored by past query frequency. A lookup is one
+key fetch and no scoring. For a few million distinct popular queries and prefixes up to about
+twenty characters, this is tens of millions of small entries — a few gigabytes, comfortably
+memory-resident, and completely read-only between builds.
+
+Two properties make this cheap. The prefix distribution is **extremely skewed**: there are only a
+few hundred plausible two-character prefixes, and they absorb most of the traffic, so a small
+cache achieves a very high hit rate. And the data is derived, so a replica in every region is
+correct by construction.
+
+Then the cheapest optimisation in the whole design: **debounce on the client.** Firing after
+roughly 100 ms of no typing rather than on every keystroke removes more than half the traffic and
+improves the result, because a partial word matches worse than a finished one. It belongs in the
+architecture, not in a client backlog, because the capacity plan depends on it.
+
+### Round 6 — &ldquo;A product launches and one prefix takes a million requests per second.&rdquo;
+
+A hot key — and this is the easy kind.
+
+**A read-only hot key is solved by copying it.** The prefix store is derived, immutable between
+builds and small, so it can be replicated to every serving node and cached at the edge with a
+short TTL. There is no coordination to do, because there is nothing to keep consistent.
+
+Contrast that with the write hot key in the proximity study, where a cell that everyone is writing
+to cannot be copied at all — a mutable thing has one authority by definition. Recognising which of
+the two you have is worth more than any specific technique, because it tells you immediately
+whether the answer is *replicate* or *split*.
+
+One detail that is easy to omit: on a cache miss, a thousand simultaneous requests for the same
+hot prefix must not become a thousand origin requests. Coalesce them into one and let the rest
+wait for its result — otherwise the moment the entry expires is the moment the origin falls over.
+
+### Round 7 — &ldquo;Users add out-of-stock products to their basket.&rdquo;
+
+Do not try to make the index authoritative. Search returns candidates; the authority decides.
+
+The results actually displayed — twenty-four of them, not ten thousand — are checked against the
+stock service before rendering, and out-of-stock items are filtered or marked. The cost is a
+result count that is slightly wrong and a page that occasionally shows twenty-one items instead of
+twenty-four. Both are acceptable. Showing a purchasable item that cannot be purchased is not.
+
+This is the same structure as the seat map in the ticket study and the driver list in the
+proximity study: **a large, fast, stale read narrows the field, and a small, exact read decides.**
+Once you see the shape, it transfers to any problem where the authority is too expensive to
+consult at retrieval width.
+
+### Round 8 — &ldquo;The indexing pipeline fell behind six hours ago and nobody noticed.&rdquo;
+
+Queue depth is the wrong metric, because a pipeline that is dropping messages has a queue depth of
+zero. Measure **end-to-end freshness**: stamp each change at the source, and record the time from
+that stamp to the moment the document is searchable. That number is a service level objective and
+should page.
+
+Three more pieces:
+
+- **A poisonous document must not stop the pipeline.** One product with a malformed field should
+  be dead-lettered with its error, not retried forever ahead of everything behind it.
+- **Full reindex must be routine.** Not a disaster procedure — a Tuesday.
+- **The index schema is not migratable in place.** Changing a tokeniser, a stemmer or a synonym
+  list changes what is in the posting lists, so every document must be reprocessed. The only
+  correct migration is build a new index, verify it, swap the alias, keep the old one until you are
+  sure. That means **capacity for two full indexes**, which is a real cost that surprises people
+  the first time they need it.
+
+### Round 9 — &ldquo;Relevance is bad, and everyone has an opinion.&rdquo;
+
+The engineering contribution here is not a better ranking. It is making relevance **measurable**,
+so that opinions become experiments.
+
+- Log queries, results shown, and clicks. Without this, every ranking discussion is anecdote.
+- Track the **zero-result rate** and the **no-click rate** by query. They point at the failures
+  users never report, because a user who finds nothing leaves rather than complaining.
+- Hold an offline evaluation set for fast iteration, and confirm online, because offline metrics
+  and user behaviour disagree often enough to matter.
+
+And one structural rule: **personalise the re-rank, not the retrieval.** Retrieving the top few
+hundred candidates identically for everyone keeps that stage cacheable and comparable across
+users; personalising the final ordering of those few hundred costs little and caches poorly, which
+is fine at that width. Personalising retrieval makes every query unique, and every cache in the
+system stops working at once.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Analysis mismatch',
+      symptom: 'Searching a product exact title returns nothing, while a partial phrase works.',
+      cause: 'The query was analysed differently from the documents — a stemmer, synonym set or tokeniser applied to one side only.',
+      mitigation: 'One analysis definition applied to both paths, with a test that indexes a document and searches for its own field values.',
+    },
+    {
+      what: 'Segment churn from volatile fields',
+      symptom: 'Merge activity is constant, disk write volume is far higher than the change rate suggests, query latency degrades over the day.',
+      cause: 'A frequently changing field lives in the index, so every change rewrites the whole document and leaves a deletion behind.',
+      mitigation: 'Keep volatile fields out of the index and apply them at query time to the results actually returned.',
+    },
+    {
+      what: 'Fan-out tail amplification',
+      symptom: 'Query p99 is many times worse than shard p99 and gets worse as shards are added.',
+      cause: 'Every query waits for the slowest of N shards.',
+      mitigation: 'Fewer, larger shards; hedged requests; a deadline with partial results, monitored so a permanently excluded shard is visible.',
+    },
+    {
+      what: 'Deep pagination',
+      symptom: 'Page 1 is instant, page 500 times out, and the coordinator uses enormous memory.',
+      cause: 'To return results 10,000 to 10,024, every shard must return its first 10,024 results for merging. Cost grows linearly with the offset.',
+      mitigation: 'Cursor-based pagination that carries the last sort position, so each page costs the same. Cap the reachable depth.',
+    },
+    {
+      what: 'Schema change with no swap path',
+      symptom: 'A tokeniser change is needed and there is no way to apply it without downtime.',
+      cause: 'One index, aliased directly, with no capacity to build a second.',
+      mitigation: 'Always address the index through an alias, and keep headroom for two full copies. Build, verify, swap, retain.',
+    },
+    {
+      what: 'Silent indexing lag',
+      symptom: 'Search results are hours stale and every dashboard is green.',
+      cause: 'Freshness was inferred from queue depth, which is zero when messages are being dropped.',
+      mitigation: 'Measure source-to-searchable time end to end and alert on it directly.',
+    },
+    {
+      what: 'Hot prefix stampede',
+      symptom: 'The origin collapses at a predictable moment, roughly when a cache entry expires.',
+      cause: 'A very hot prefix expires and every concurrent request misses at once.',
+      mitigation: 'Request coalescing on miss, staggered expiry, and replication of the small read-only prefix set to every node.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Derived inverted index | Fast matching and real ranking | Search is eventually consistent, forever | The corpus were small enough for the database |
+| Volatile fields outside the index | No segment churn from stock changes | A second lookup on the read path | Volatile fields needed to be searchable |
+| Document sharding | Even scaling, simple indexing | Every query fans out to every shard | Queries were single-term and posting lists small |
+| Precomputed prefix store | Autocomplete at 40k rps for almost nothing | Completions are only as fresh as the last build | Completions had to reflect the catalogue instantly |
+| Authority check on the shown page | Never offer an unbuyable item | Slightly wrong result counts | Stock changed rarely |
+| Personalised re-rank only | Retrieval stays cacheable | Less personalisation than is theoretically possible | Caching were not on the critical path |
+| Alias plus rebuild for schema changes | Safe analysis changes with no downtime | Capacity for two full indexes | Analysis never changed, which it does |
+
+## Cost
+
+1. **Index serving memory.** The dominant cost, and the one with a cliff in it: an index that
+   fits in page cache and one that does not differ by two orders of magnitude in tail latency, and
+   only one of them meets the requirement.
+2. **Indexing compute**, proportional to the change rate. Removing volatile fields from the index
+   cut this by most of its original size, which is why Round 2 is worth more than it looks.
+3. **The prefix store**, small, replicated everywhere, and cheap. It carries eight times the
+   traffic of search at a small fraction of the cost, precisely because it does no work at request
+   time.
+4. **Headroom for a second index copy**, needed permanently rather than occasionally.
+
+A cheaper design drops typo tolerance and synonyms, both of which increase index size and query
+work. What that sacrifices is the recall of exactly the queries users type badly, which is most of
+them — so it lowers cost by lowering the zero-result rate's own denominator. Measure before
+trading it away.
+
+## What we did NOT build
+
+- **A custom search engine.** Inverted indexes, scoring, merge policies and analysis chains are
+  decades of well-understood engineering. Building one is justified by a requirement no existing
+  engine can meet, and &ldquo;ours would be faster&rdquo; is not that requirement.
+- **Term sharding.** Fewer shards per query, at a network cost proportional to the popularity of
+  the terms. The cost scales with the thing you least control.
+- **Personalised retrieval.** It makes every query unique, which disables every cache in the
+  system in exchange for an improvement that a re-rank of the top few hundred delivers nearly all
+  of.
+- **The index as the source of truth.** It is derived, and a derived store that accumulates
+  unrecoverable state has silently become an authority — the failure the CQRS pattern warns about
+  directly.
+- **Vector or semantic retrieval.** A real and increasingly standard addition, deliberately out of
+  scope here. It does not remove the lexical path — exact identifiers, part numbers and brand
+  names are matched, not approximated — and it changes the freshness and cost profile enough to be
+  its own design, not a paragraph in this one.
+
+## Evidence
+
+<Claim label="fact" source="elasticsearch-docs">
+Search is near-real-time rather than immediately consistent: a document becomes searchable after a
+refresh, and the refresh interval is a configurable trade between indexing throughput and
+freshness.
+</Claim>
+
+<Claim label="fact" source="elasticsearch-docs">
+Index segments are immutable. Updating a document writes a new version and marks the old one
+deleted; the space is reclaimed only when segments are merged. Deleting and reindexing is what an
+update physically is.
+</Claim>
+
+<Claim label="fact" source="elasticsearch-docs">
+The same analysis chain must be applied to indexed text and to query text for terms to match, and
+filter clauses that do not contribute to scoring can be cached and reused independently of the
+scored part of a query.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+An inverted index maps each term to a posting list of the documents containing it, so a
+conjunctive query becomes an intersection of posting lists, and query cost is governed by the
+length of the shortest list involved.
+</Claim>
+
+<Claim label="fact" source="tail-at-scale">
+When a request fans out to many servers and must wait for all of them, the overall latency is
+governed by the slowest response, so tail latency degrades as fan-out width grows. Hedged requests
+to a second replica are described as an effective mitigation at modest extra load.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Bounding work with explicit deadlines and returning partial results rather than waiting
+indefinitely is established practice for fan-out services, on the grounds that a late complete
+answer is often worth less than a prompt partial one.
+</Claim>
+
+<Claim label="speculation">
+The document counts, index sizes, keystroke rates, shard counts and cache figures here are
+pedagogical choices derived from the stated requirements. They describe no particular deployment.
+</Claim>

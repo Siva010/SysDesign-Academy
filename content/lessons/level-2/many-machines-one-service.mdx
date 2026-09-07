@@ -1,0 +1,431 @@
+---
+id: many-machines-one-service
+title: Many Machines, One Service
+level: 2
+module: l2-more-machines
+order: 1
+summary: Statelessness is not about having no state. It is about moving state somewhere every machine can see, and then living with the consequences of that move.
+difficulty: core
+minutes: 26
+prerequisites: [load-balancer, finding-the-ceiling]
+concepts: [statelessness, horizontal-scaling, load-balancer, session-state, health-check, l4-vs-l7]
+unlocks: [distributed-cache, sticky-sessions, cascading-failure, autoscaling]
+sources: [sre-book, aws-builders-library, ddia]
+status: reviewed
+---
+
+## The problem
+
+You add a second application server behind a load balancer. Deployment is smooth. Then the
+support tickets start.
+
+Users are being logged out at random. A multi-step form loses everything on the third step.
+An uploaded file is &ldquo;not found&rdquo; immediately after a successful upload.
+
+Nothing is broken on either server. Each is working perfectly with the information it has. The
+problem is that they have different information, and the load balancer does not know or care.
+
+## Intuition
+
+One server is a shop with one assistant who remembers you. Two servers is a shop with two
+assistants who do not talk to each other, and you get a different one each time you walk in.
+
+Anything the first assistant remembered — that you were logged in, what was in your basket,
+the file you just handed over — is invisible to the second.
+
+There are only two ways out:
+
+1. **Always send a customer back to the same assistant.** This works, and it means one busy
+   assistant stays busy while the other idles, and everything that person knew is lost when
+   they go home.
+2. **Move the memory out of the assistants and into a shared ledger both can read.** Now
+   either assistant can serve anyone. This is what statelessness means.
+
+The second is almost always right, and it comes with a bill: the shared ledger is now a thing
+you must scale, protect, and survive the failure of.
+
+## Concretely
+
+<Example title="Where the state actually goes">
+
+Four kinds of per-request state, and where each moves:
+
+| State | Where it lived on one server | Where it goes with many |
+|---|---|---|
+| Login session | Server memory | A shared store, or a signed token the client carries |
+| Shopping basket | Server memory | The database, or a shared cache |
+| Uploaded file | Local disk | Object storage |
+| In-progress background job | An in-process timer | A queue or a scheduled job table |
+
+Notice that none of these disappear. Each one becomes a dependency: something over the network,
+with its own latency, its own failure mode, and its own capacity limit.
+
+This is the honest description of horizontal scaling. You did not remove state. You moved it,
+and in doing so you converted a fast local memory access into a network call — which is why
+this step often makes a single request *slower* while making the system able to serve far more
+of them.
+
+</Example>
+
+## Formal explanation
+
+A <C id="statelessness">stateless</C> service holds nothing between requests that a subsequent
+request needs. Any instance can serve any request, which is what makes instances
+interchangeable — and interchangeability is what makes all of the following possible:
+
+- **Horizontal scaling.** Add instances to add capacity.
+- **Failure tolerance.** Remove a broken instance and nothing is lost.
+- **Rolling deploys.** Replace instances one at a time.
+- **Autoscaling.** Instances can appear and disappear on demand.
+
+The <C id="load-balancer" /> distributes requests and stops sending traffic to instances that
+fail their <C id="health-check" />. Two kinds are worth distinguishing:
+
+- **L4** balances connections. It is fast and cheap and knows nothing about what is inside
+  them.
+- **L7** understands requests, so it can route by path, retry idempotent requests on another
+  instance, and terminate TLS. It costs more and sees your traffic.
+
+<Callout kind="warn" title="Health checks are load-bearing, and easy to get wrong">
+A health check that verifies every dependency will mark every instance unhealthy the moment
+one shared dependency degrades. The balancer then has nowhere to send traffic, and a partial
+degradation becomes a total outage. A health check should answer "can this instance serve
+traffic?", not "is the entire system in perfect condition?"
+</Callout>
+
+<Deeper title="Two health checks, not one">
+
+The confusion resolves once you separate two questions that people try to answer with one
+endpoint.
+
+**Liveness: is this process broken and in need of restarting?** Should check only local state:
+is the event loop responsive, is memory catastrophic, are internal invariants intact. It must
+never check a downstream dependency, because restarting your process does not fix somebody
+else's database.
+
+**Readiness: should this instance receive traffic right now?** May check whether the instance
+has warmed up, established its connection pools, and loaded configuration. It may check
+critical dependencies, but only if losing them genuinely makes this instance useless *and*
+other instances might be fine.
+
+The failure mode to avoid: a deep readiness check on a shared dependency. When that dependency
+degrades, every instance reports not-ready simultaneously, the balancer removes all of them,
+and traffic that would have been partially served is now entirely rejected. The correlated
+failure is worse than the original one.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="State did not disappear. It moved, and became a dependency."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Clients' }] },
+    { title: 'Entry', nodes: [{ id: 'lb', label: 'Load balancer', note: 'health checks', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'app1', label: 'Instance 1', note: 'stateless' }, { id: 'app2', label: 'Instance 2', note: 'stateless' }, { id: 'app3', label: 'Instance 3', note: 'stateless' }] },
+    { title: 'Shared state', nodes: [{ id: 'sessions', label: 'Session store' }, { id: 'db', label: 'Database' }, { id: 'blobs', label: 'Object storage' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'lb' },
+    { from: 'lb', to: 'app1' },
+    { from: 'lb', to: 'app2' },
+    { from: 'lb', to: 'app3' },
+    { from: 'app1', to: 'sessions' },
+    { from: 'app1', to: 'db' },
+    { from: 'app2', to: 'blobs' },
+  ]}
+  stages={[
+    {
+      label: 'One machine',
+      show: ['client', 'app1', 'db'],
+      because:
+        'Everything is local. Sessions in memory, files on disk, and no coordination problem exists.',
+    },
+    {
+      label: 'Add instances',
+      show: ['client', 'lb', 'app1', 'app2', 'app3', 'db'],
+      because:
+        'A balancer spreads load across interchangeable instances. Interchangeable is the operative word, and it is not free.',
+    },
+    {
+      label: 'Where the state went',
+      show: ['client', 'lb', 'app1', 'app2', 'app3', 'sessions', 'db', 'blobs'],
+      because:
+        'Every piece of formerly-local state is now a shared dependency over the network. You have gained scalability and acquired three new things that can fail.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '2 instances',
+      behaviour:
+        'Capacity doubles. Every hidden assumption about local state surfaces immediately.',
+      firstToBreak: 'Sessions, uploads and in-memory caches, in roughly that order.',
+    },
+    {
+      scale: '10 instances',
+      behaviour:
+        'Deploys are safe and rolling. The shared session store is now on the critical path for every request.',
+      firstToBreak: 'The session store, which has quietly become a single point of failure.',
+    },
+    {
+      scale: '100 instances',
+      behaviour:
+        'Each instance holds connections to every dependency. Connection counts at the database multiply by instance count.',
+      firstToBreak:
+        'Database connection limits. A hundred instances with a pool of 20 each is 2,000 connections to a database that may accept a few hundred.',
+    },
+    {
+      scale: '1,000 instances',
+      behaviour:
+        'Coordination overheads dominate: service discovery, config propagation, connection churn during deploys.',
+      firstToBreak:
+        'Everything shared. This is where connection poolers, cell-based partitioning of the fleet, and control-plane scaling become necessary.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Hidden local state',
+      symptom:
+        'Intermittent, user-specific bugs that cannot be reproduced and that resolve on retry.',
+      cause:
+        'Something still lives in one instance: an in-memory cache, a local file, a scheduled timer, a rate-limit counter.',
+      mitigation:
+        'Audit deliberately. In-memory caches, local file writes, and in-process schedulers are the usual three, and all three are easy to introduce accidentally.',
+    },
+    {
+      what: 'Deep health checks causing correlated removal',
+      symptom:
+        'A dependency degrades slightly, and moments later every instance is out of the load balancer pool. Total outage from a partial problem.',
+      cause:
+        'The readiness check verifies a shared dependency, so all instances fail it at the same instant.',
+      mitigation:
+        'Separate liveness from readiness. Keep shared dependencies out of health checks unless the instance is genuinely useless without them, and even then consider degrading rather than withdrawing.',
+    },
+    {
+      what: 'Connection multiplication at the database',
+      symptom:
+        'The database refuses connections during a deploy or a scale-up, although query load is unchanged.',
+      cause:
+        'Connections scale with instance count times pool size, and a rolling deploy briefly doubles the instance count.',
+      mitigation:
+        'Use a connection pooler in front of the database, size per-instance pools with the fleet size in mind, and account for the overlap window during deploys.',
+    },
+    {
+      what: 'Retry on a non-idempotent request',
+      symptom: 'Duplicate records that correlate with instance failures or deploys.',
+      cause:
+        'An L7 balancer retried a request on another instance after the first went quiet, and the operation was not safe to repeat.',
+      mitigation:
+        'Only enable automatic retry for idempotent methods, and make mutations idempotent with a caller-supplied key.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Move session state to a shared store rather than using sticky sessions"
+  options={[
+    'Sticky sessions: pin each user to one instance',
+    'Shared session store: any instance can serve any user',
+    'Signed tokens: the client carries its own session, no server lookup',
+  ]}
+  why="Interchangeable instances are the property that makes everything else work: scaling, rolling deploys, instance failure, autoscaling. Stickiness preserves local state by giving up exactly that property."
+  gain="Any instance serves any request. Losing an instance loses no sessions. Deploys and autoscaling become routine rather than disruptive. Load spreads evenly."
+  sacrifice="A network round trip on every request that needs session data, and a new shared dependency whose availability is now your availability."
+  failureModes={[
+    'The session store becomes a single point of failure for authentication across the whole system',
+    'Its latency is added to every request',
+    'It needs its own scaling story, and a hot key if one session is unusually busy',
+  ]}
+  operationalBurden="Moderate: another system to run, monitor and secure. Usually a managed cache, which reduces the burden but adds a vendor dependency on the login path."
+  cost="A cache tier sized for concurrent sessions rather than total users, which is usually small. The real cost is the latency added to every authenticated request."
+  whenNot="When the state is genuinely large per user and cheap to rebuild, keeping it local with stickiness can be reasonable — a long-lived WebSocket connection is inherently sticky and there is no point pretending otherwise. Signed tokens are better when you need to avoid the lookup entirely, at the cost of not being able to revoke promptly."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="sre-book">
+Separating liveness from readiness, and keeping shared dependencies out of the checks that
+control traffic routing, is standard practice. The failure mode it prevents — correlated
+removal of every instance in response to one degraded dependency — turns a partial problem
+into a total one.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Prefer degrading over withdrawing. An instance that can serve 80% of requests correctly is
+more useful in the pool than out of it. Health checks that remove capacity during overload
+make overload worse, because the remaining instances receive the same traffic spread over
+fewer machines.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Moving state out of application servers converts a local memory access into a network request,
+with the corresponding latency, failure and consistency implications. This is a trade rather
+than an improvement, and it is the trade that makes horizontal scaling possible.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that statelessness relocates state rather than eliminating it, and whether you can name what the relocation costs. Candidates who say 'make it stateless' without naming the new dependency have learned the phrase rather than the idea."
+  depth="Know where each kind of state goes, know why health checks are dangerous when they are deep, and know that connection counts multiply with instance count. Load balancer algorithm details are rarely the point."
+  followUps={[
+    'Where does the session go, and what happens when that store is down?',
+    'Your health check pings the database. What happens when the database is slow?',
+    'You scale from 10 to 200 instances. What breaks first?',
+    'When are sticky sessions actually the right answer?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We made the service stateless, so we have no state to worry about.',
+      why: 'The state moved to a store that is now on the critical path for every request. Its availability is your availability, and its latency is added to yours.',
+      instead:
+        'Name where each piece went and what happens when that dependency fails. "Sessions in Redis; if Redis is down, existing signed tokens keep working for 15 minutes and new logins fail" is an answer. "It is stateless" is not.',
+    },
+    {
+      mistake: 'The health check verifies the database so we do not send traffic to broken instances.',
+      why: 'The database is shared. When it degrades, every instance fails the check simultaneously and the balancer has nowhere to route. You have converted a degraded database into a total outage.',
+      instead:
+        'Check only what is local and specific to the instance. If a dependency is down, serve what you can and let the error rate speak for itself.',
+    },
+    {
+      mistake: 'Adding more instances will fix the latency.',
+      why: 'If the bottleneck is downstream, more instances send more concurrent load to the thing that is already the constraint, which makes it worse.',
+      instead:
+        'Find the bottleneck first. Horizontal scaling works when the instances are the constraint, and backfires when they are not.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['health-check', 'cascading-failure']}
+  prompt="Your readiness check queries the database. The database becomes slow but is still serving 70% of queries within the timeout. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'Some instances are removed, and the healthy ones handle the traffic',
+      implies: 'You are expecting the failure to be distributed across instances.',
+      why: 'The database is shared, so instances do not fail independently. They all see the same degradation and they all fail at roughly the same time. There are no healthy ones to take over.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Every instance fails the check at once, the balancer has nowhere to route, and a partial degradation becomes a total outage',
+      implies: 'You recognise that a check on a shared dependency produces correlated failure.',
+      why: 'This is the classic amplification. The database could have served 70% of requests; instead 100% fail because no instance is in the pool. The system\'s response to the failure is worse than the failure.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The balancer keeps some instances in the pool because it will not remove all of them',
+      implies: 'You are relying on a safety feature of the balancer.',
+      why: 'Some balancers do implement this, sometimes called fail-open, and it is a genuinely good defence. But relying on it means relying on a specific configuration of a specific product, when the underlying design flaw is still there.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer distinguishes liveness from readiness and states the general rule: a health check must never depend on something shared by every instance, because it converts an independent failure into a correlated one. It then proposes degrading — serving cached or partial responses — instead of withdrawing."
+/>
+
+<Check
+  concepts={['statelessness', 'session-state']}
+  prompt="You move sessions from instance memory to a shared cache. What have you actually changed about the system's failure characteristics?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing important; sessions are just stored elsewhere now',
+      implies: 'You are treating the move as an implementation detail.',
+      why: 'The failure characteristics changed substantially. Before, losing an instance lost the sessions on it. Now, losing the shared store affects every user at once. You traded many small independent failures for one large correlated one.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'You traded many small independent failures for one large correlated failure, and added latency to every request',
+      implies: 'You are weighing both sides of the trade rather than treating it as an upgrade.',
+      why: 'Instance loss used to affect the users on that instance. Now it affects nobody — but store loss affects everybody. The blast radius changed shape. Meanwhile every authenticated request now includes a network round trip that used to be a memory access.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The system is now more reliable because instances are interchangeable',
+      implies: 'You are counting the gain and not the cost.',
+      why: 'Instance interchangeability is a real and valuable gain, and it is the point of the change. But the shared store is a new single point of failure on the login path, so the overall reliability depends on which failure is more likely and more damaging.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer says what to do about the new correlated failure: run the store with replication and failover, keep short-lived signed tokens so existing sessions survive a store outage even if new logins do not, and decide deliberately whether a session store outage should log everyone out or fail open."
+/>
+
+<BottleneckCheck
+  concepts={['horizontal-scaling', 'bottleneck', 'connection-pooling']}
+  prompt="You scaled the application tier from 4 instances to 40. Throughput rose by about 15%. Where did it go?"
+  resources={[
+    { component: 'Application CPU', measured: '9% average across 40', capacity: '4 cores each', note: 'Was 55% at 4 instances' },
+    { component: 'Load balancer', measured: '2,400 rps', capacity: '50,000 rps', note: 'Even distribution' },
+    { component: 'Database connections', measured: '400 of 400 in use', capacity: '400 server-side max', note: '10 per instance x 40 instances' },
+    { component: 'Database CPU', measured: '88%', capacity: '16 cores', note: 'Mostly connection and context-switch overhead' },
+    { component: 'Database disk', measured: '2,100 IOPS', capacity: '20,000 IOPS', note: 'Not the constraint' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'The database. Scaling the stateless tier multiplied the concurrency arriving at the one thing that was not scaled.',
+      implies: 'You are following the load to the component that did not multiply with it.',
+      why: 'Forty instances at ten connections each is exactly the database’s 400-connection limit, and the database is now spending its CPU on managing that concurrency rather than on queries. Horizontal scaling moves the constraint rather than removing it, and it moves it onto whatever is shared — which is nearly always the data tier.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The load balancer, since all traffic passes through it.',
+      implies: 'You are looking at the component every request touches.',
+      why: 'It touches every request and is at under 5% of its capacity with even distribution, so it is doing its job and has enormous headroom. A component being on the path is not evidence that it is the constraint.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'The application tier is now over-provisioned and the 9% CPU is waste.',
+      implies: 'You are reading the low utilisation as the finding.',
+      why: 'True and it is a consequence rather than a cause. The instances are idle because they are all waiting on a database that cannot go faster. Removing instances would cut cost without changing throughput, which is worth doing, and it is not the answer to where the throughput went.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the fix that most people get backwards: reduce connections per instance rather than raise the database limit. Forty instances need a smaller pool each, or a connection proxy in front of the database, so total concurrency stays near what the database can actually use. It also states the general rule — scaling a stateless tier is only useful until the shared tier saturates, and that point should be calculated before the scaling rather than discovered by it."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Health checking and its failure modes', sourceId: 'sre-book' },
+    {
+      label: 'Why degrading beats withdrawing during overload',
+      sourceId: 'aws-builders-library',
+    },
+    { label: 'What moving state across a network actually costs', sourceId: 'ddia' },
+    {
+      label: 'Next: how to avoid doing the work at all',
+      href: '/lessons/caching-a-bet-on-time',
+    },
+  ]}
+/>

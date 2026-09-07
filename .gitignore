@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+
+# Editor and OS
+Thumbs.db
+*.swp
+
+# Local env, should never be committed
+.env
+.env.*

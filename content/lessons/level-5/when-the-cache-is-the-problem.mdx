@@ -1,0 +1,452 @@
+---
+id: when-the-cache-is-the-problem
+title: When the Cache Is the Problem
+level: 5
+module: l5-spread
+order: 2
+summary: A cache does not just make things faster. It resizes the origin around a hit rate, and every way that hit rate can drop is now an outage rather than a slowdown.
+difficulty: advanced
+minutes: 26
+prerequisites: [caching-a-bet-on-time, how-failures-spread]
+concepts: [cache-stampede, request-coalescing, cache-penetration, fanout-latency-amplification, noisy-neighbour]
+unlocks: [bloom-filter, local-cache, cell-architecture, tenant-isolation, thundering-herd]
+patterns: [cache-aside, read-through-edge]
+failures: [cold-cache-collapse]
+sources: [aws-builders-library, redis-docs, tail-at-scale, sre-book, release-it]
+status: reviewed
+---
+
+## The problem
+
+The cache is at a 95% hit rate and has been for a year. The database sits at 12% CPU. Everything
+is comfortable.
+
+At 09:00 on a Tuesday the cache cluster is restarted for a routine upgrade, one node at a time.
+Within four seconds the database is at 100% CPU, queries are queuing, timeouts are firing, and the
+application is returning errors to every user — including the 95% whose requests would have been
+served from cache, because the application is now out of workers.
+
+Nothing failed. The cache came back in ninety seconds. The database did not recover for forty
+minutes, because by then every client was retrying.
+
+The database was never sized to serve this traffic. It was sized to serve 5% of it, and that
+decision was made quietly, by whoever observed that the hit rate was 95% and provisioned
+accordingly.
+
+## Intuition
+
+Adding a cache feels like adding speed. It also does something less visible: **it changes what the
+origin is sized for.**
+
+Once the origin is provisioned against a 95% hit rate, the cache is not an optimisation. It is a
+load-bearing dependency, and the interesting question stops being &ldquo;how fast is it&rdquo; and
+becomes &ldquo;in how many ways can it stop absorbing traffic?&rdquo;
+
+There are more ways than people expect, and they have one thing in common: they are **correlated**.
+Ordinary traffic is many independent users doing unrelated things, and it averages out. Cache
+misses are not independent. Everyone misses the same key at the same instant because it expired at
+the same instant. Every instance has a cold local cache at the same moment because they were all
+deployed together. Every request scans the whole cluster after a node is lost.
+
+That is the shape of the whole subject: **a cache converts a capacity problem into a correlation
+problem**, and correlated load arrives as a spike rather than as an increase.
+
+## Concretely
+
+<Example title="Four ways a cache stops absorbing load">
+
+An origin sized for 5,000 requests per second behind a cache serving 100,000.
+
+**Expiry of a hot key.** One key gets 20,000 requests per second. Its entry expires. In the
+milliseconds before anything repopulates it, every one of those requests misses and goes to the
+origin — a four-fold overload from one key, and no error anywhere reported until the origin fails.
+
+**A deploy.** Every application instance restarts with an empty local cache. Local hit rate goes
+from 60% to 0 across the fleet simultaneously, and the shared cache and the origin behind it both
+see a step change that lasts until the caches warm.
+
+**Keys that do not exist.** A scanner requests one million product identifiers that were never
+issued. Each one misses, reaches the origin, finds nothing, and caches nothing — so the next
+identical request misses again. The cache is a pure pass-through for this traffic and the origin
+absorbs all of it.
+
+**A neighbour.** Another team starts writing 5 MB objects into the shared cache. Eviction pressure
+climbs, your working set no longer fits, and your hit rate falls from 95% to 70%. You have changed
+nothing, and your origin load has increased six-fold.
+
+Each of these is a hit-rate change and every one of them arrives as a step, not a slope.
+
+</Example>
+
+## Formal explanation
+
+**<C id="cache-stampede" />** — also called a dog-pile — is many concurrent requests for the same
+key missing at the same moment and all being forwarded. Whether it hurts depends on one ratio: the
+time to recompute the value against the request rate for that key. A 200 ms computation and 20,000
+requests per second means 4,000 concurrent recomputations of the identical value.
+
+Four mitigations, and they compose:
+
+- **<C id="request-coalescing" />.** One request per key recomputes; the rest wait for its result.
+  This is the single most effective mitigation because it caps concurrent origin work at one per
+  key regardless of demand. It must be applied per instance *and* ideally cluster-wide, because a
+  hundred instances each coalescing to one still produce a hundred.
+- **Serve stale while revalidating.** Return the expired value immediately and refresh in the
+  background. Nobody waits, the origin sees one request, and the cost is bounded staleness — which
+  most content can accept and some cannot.
+- **Early probabilistic refresh.** As expiry approaches, each request has a small and rising
+  chance of refreshing the entry. The value is refreshed slightly early by one request rather than
+  simultaneously by all of them.
+- **Jittered lifetimes.** Populating a thousand entries in one batch with an identical lifetime
+  guarantees they expire together. Add randomness at write time and the expiry spreads.
+
+**<C id="cache-penetration" />** is traffic for keys that do not exist. Because there is nothing to
+store, the cache never populates and every request reaches the origin. It arises from a scanner, a
+broken client looping over identifiers, or a deliberate attack — and it is the one failure mode
+here where a caching layer provides zero protection by default.
+
+- **Cache the negative result** with a short lifetime. This alone removes most of it. The short
+  lifetime matters, because a key that is created later must become visible.
+- **A <C id="bloom-filter" /> of existing keys** answers &ldquo;definitely not present&rdquo;
+  cheaply, with a small false-positive rate that costs only an occasional unnecessary lookup.
+- **Validate the key shape** before doing any work. Most scanning traffic requests identifiers that
+  could never have been issued.
+
+**<C id="fanout-latency-amplification" />** is what happens when one user request makes many cache
+calls. If a page makes 50 lookups and each has a 1% chance of being slow, the probability that
+*at least one* is slow is about 39%. The page's tail latency is governed by the slowest of the
+fifty, not by the median of one (<Cite id="tail-at-scale" />).
+
+The fixes are all about reducing the number of independent chances to be slow: batch the lookups
+into one multi-key request, reduce the fanout, or set a per-call deadline with a defined fallback.
+And the measurement follows from it — the number that predicts page latency is the cache's p99,
+multiplied out by the fanout, and not its average, which will look excellent throughout.
+
+**<C id="noisy-neighbour" />** is a shared cache behaving like any shared resource. Another
+tenant's large values or scan-heavy access pattern evicts your working set, and your hit rate falls
+without anything in your system changing. The signature is distinctive and worth recognising:
+**your hit rate dropped and you deployed nothing.**
+
+- Separate caches for workloads with genuinely different access patterns — an analytics job and a
+  serving path should not share eviction pressure.
+- Per-tenant memory quotas where the technology supports them.
+- Value size limits, because a small number of very large values does most of the damage.
+
+## Architecture
+
+<Arch
+  caption="Every layer that can miss is a layer that can miss for everyone at once."
+  columns={[
+    { title: 'Users', nodes: [{ id: 'user', label: 'Clients' }] },
+    { title: 'Instances', nodes: [{ id: 'app', label: 'App instances', note: 'local cache, cold on deploy' }] },
+    { title: 'Coalescing', nodes: [{ id: 'single', label: 'Single-flight', note: 'one miss per key', tone: 'accent' }] },
+    { title: 'Shared', nodes: [{ id: 'cache', label: 'Shared cache', note: 'shared eviction pressure' }] },
+    { title: 'Origin', nodes: [{ id: 'db', label: 'Database', note: 'sized for 5% of traffic', tone: 'accent' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'app' },
+    { from: 'app', to: 'single', label: 'on miss' },
+    { from: 'single', to: 'cache' },
+    { from: 'cache', to: 'db', label: 'miss' },
+  ]}
+  stages={[
+    {
+      label: 'Cache in front of a database',
+      show: ['user', 'app', 'cache', 'db'],
+      because:
+        'The hit rate decides how much traffic the origin sees, and capacity planning quietly follows the hit rate. At this point the cache has become a dependency without anyone deciding that it should be.',
+    },
+    {
+      label: 'Cap the concurrent misses',
+      show: ['user', 'app', 'single', 'cache', 'db'],
+      because:
+        'Coalescing means one recomputation per key rather than one per request. This is the difference between a hot key expiring and a hot key taking down the origin, and it costs a small amount of per-instance bookkeeping.',
+    },
+    {
+      label: 'Assume the cache is gone',
+      show: ['user', 'app', 'single', 'cache', 'db'],
+      because:
+        'The design must have an answer for a zero percent hit rate: shed load, serve degraded responses, or provision the origin for it. Choosing none of those is choosing the outage, and choosing it in advance rather than during one is the whole point.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Low traffic, high hit rate',
+      behaviour: 'The origin could serve everything unaided. The cache is a genuine optimisation and its loss is a slowdown.',
+      firstToBreak: 'Nothing. This is the only regime where a cache failure is not an incident.',
+    },
+    {
+      scale: 'Origin sized around the hit rate',
+      behaviour:
+        'The cache is now load-bearing. Availability of the system is the availability of the cache, whatever the architecture diagram implies.',
+      firstToBreak: 'The origin, on any event that drops the hit rate — expiry, restart, deploy, eviction.',
+    },
+    {
+      scale: 'High fanout per request',
+      behaviour:
+        'Each page makes many lookups, so the cache tail dominates page latency even at an excellent average.',
+      firstToBreak:
+        'Page p99, which degrades even though every cache metric looks healthy, because the metric being watched is the mean.',
+    },
+    {
+      scale: 'Shared multi-tenant cache',
+      behaviour:
+        'Hit rate becomes a function of other teams behaviour, and changes without any deploy of your own.',
+      firstToBreak:
+        'Your working set, evicted by someone else. The investigation starts in the wrong system because nothing in yours changed.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Stampede on hot-key expiry',
+      symptom: 'The origin spikes at regular intervals, often at a round number of minutes after a deploy or a populate.',
+      cause: 'Thousands of concurrent requests miss the same key in the same instant and all recompute it.',
+      mitigation: 'Coalesce misses to one recomputation per key, serve stale while revalidating, and jitter lifetimes so batch-populated entries do not expire together.',
+    },
+    {
+      what: 'Cold cache after deploy',
+      symptom: 'Every release produces a latency spike and elevated origin load for several minutes.',
+      cause: 'Local caches across the whole fleet are emptied simultaneously by a rolling restart.',
+      mitigation: 'Deploy gradually so the fleet warms in stages, prewarm on start before taking traffic, and keep the shared tier as a backstop for cold local caches.',
+    },
+    {
+      what: 'Penetration by non-existent keys',
+      symptom: 'Origin load is high while the cache hit rate looks reasonable, and the requested keys are unfamiliar.',
+      cause: 'Requests for keys that do not exist cache nothing, so every one of them reaches the origin.',
+      mitigation: 'Cache negative results briefly, keep a membership filter of valid keys, and reject malformed identifiers before doing any lookup.',
+    },
+    {
+      what: 'Tail amplified by fanout',
+      symptom: 'Page p99 is poor while every cache and service reports excellent p99 individually.',
+      cause: 'One request makes many independent lookups, so it waits for the slowest of them.',
+      mitigation: 'Batch lookups into one call, reduce fanout, and set per-call deadlines with a defined fallback. Track the cache p99 against the fanout count, not the average.',
+    },
+    {
+      what: 'Evicted by a neighbour',
+      symptom: 'Hit rate falls and origin load rises, with no change on your side at all.',
+      cause: 'Another workload sharing the cache increased its footprint and evicted your working set.',
+      mitigation: 'Separate caches by workload, enforce value size limits, and alert on hit rate rather than only on cache availability.',
+    },
+    {
+      what: 'The cache hid a degrading origin',
+      symptom: 'A brief cache blip produces a catastrophic and disproportionate outage.',
+      cause: 'Origin performance had been degrading for months, invisible because 95% of traffic never reached it.',
+      mitigation: 'Measure origin latency and headroom at the origin, and periodically verify the miss path can carry the load you claim it can.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Serve stale content while revalidating in the background, instead of blocking on a refresh"
+  options={[
+    'Block every request until the value is recomputed',
+    'Coalesce misses so one request recomputes and the rest wait for it',
+    'Serve the stale value immediately and refresh in the background',
+    'Refresh proactively before expiry, on a schedule',
+  ]}
+  why="The moment a hot value expires is the moment demand for it is highest. Blocking converts one expiry into thousands of simultaneous waits and one enormous burst of origin work, for a value that was correct a second ago."
+  gain="No user waits for a recomputation. The origin sees one request per key per refresh regardless of demand. Latency stays flat across expiry rather than spiking at it, and the cache stops being a source of correlated load."
+  sacrifice="Users receive data known to be expired. Staleness is now unbounded if the refresh keeps failing — the stale value can be served indefinitely while the origin is broken, which hides the failure."
+  failureModes={[
+    'Stale data served long past any acceptable window because refreshes are failing silently',
+    'A refresh loop that never succeeds, so nobody ever sees a fresh value and nothing alerts',
+    'Serving stale for data where staleness is a correctness problem rather than a quality one',
+  ]}
+  operationalBurden="Low to implement, and it needs two pieces of instrumentation that are easy to omit: the age of served values, and the success rate of background refreshes. Without those, the mechanism fails silently by design."
+  cost="A little extra memory for entries kept past expiry, and background refresh traffic that runs whether or not anyone asked."
+  whenNot="When staleness is a correctness problem: a permission that was revoked, a price at the point of sale, a balance before a transfer. There, blocking on a fresh read is correct and coalescing is the right mitigation instead. Also cap how long stale may be served — a bounded window, after which requests block or fail — or a broken origin becomes an invisible outage in which everyone is confidently served last week's answers."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-builders-library">
+Correlated retries and simultaneous refreshes are described as a primary source of overload,
+because clients that failed or expired together return together. Randomisation and limiting
+concurrent work per key are the standard mitigations.
+</Claim>
+
+<Claim label="fact" source="redis-docs">
+Keys can be given expiry times, and eviction policies decide what is removed when memory is
+exhausted. A shared instance therefore evicts across all workloads sharing it, according to one
+policy configured for the instance rather than per client.
+</Claim>
+
+<Claim label="fact" source="tail-at-scale">
+When a single request depends on many servers, the probability that at least one responds slowly
+rises quickly with fanout, so overall latency is governed by the slowest component rather than the
+typical one.
+</Claim>
+
+<Claim label="recommendation" source="sre-book">
+Systems should be tested against the failure of their dependencies rather than assumed to degrade
+gracefully. A cache whose loss has never been exercised is an untested dependency in the critical
+path.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Failures propagate through shared resources: a component that consumes a shared pool, cache or
+thread supply degrades every other consumer of it, which is why isolation between workloads is a
+stability pattern rather than an efficiency one.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you treat a cache as a dependency with failure modes, rather than as a speed improvement. The question 'what happens when the cache is empty' separates candidates quickly."
+  depth="Know the difference between a stampede and penetration, and that they need different fixes. Be able to state what the origin is sized for. Recognise that hit rate is an availability metric, not only a performance one."
+  followUps={[
+    'Your cache cluster restarts. What happens in the next five seconds?',
+    'A hot key expires and 20,000 requests want it. What do they do?',
+    'Someone requests a million identifiers that do not exist. What absorbs that?',
+    'Your hit rate fell from 95% to 70% and you deployed nothing. Where do you look?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Treating the cache as an optimisation once the origin is sized around it.',
+      why: 'At a 95% hit rate the origin is provisioned for a twentieth of the traffic. The cache is now in the critical path, and its failure is a total outage rather than a slowdown, whatever the diagram suggests.',
+      instead:
+        'State the origin capacity as a multiple of full traffic, and have an explicit plan for a zero percent hit rate: shed, degrade, or provision. Then test it deliberately.',
+    },
+    {
+      mistake: 'Monitoring cache availability instead of hit rate.',
+      why: 'The cache can be perfectly available and absorbing far less traffic than it did last week, because of eviction pressure or a change in access patterns. Availability will be green throughout.',
+      instead:
+        'Alert on hit rate and on origin request rate. A hit-rate drop is an early warning of an origin overload that has not happened yet.',
+    },
+    {
+      mistake: 'Adding retries in front of a cache miss storm.',
+      why: 'The origin is overloaded because too many requests arrived at once. Retrying multiplies exactly the traffic that caused it, and turns a recoverable spike into a sustained overload that outlives its trigger.',
+      instead:
+        'Coalesce misses, shed excess load, and use a retry budget so total retry traffic is bounded regardless of how many requests are failing.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['cache-stampede', 'request-coalescing']}
+  prompt="A key serving 20,000 requests per second expires. Recomputing it takes 200 ms. What happens, and what is the most effective single fix?"
+  options={[
+    {
+      id: 'a',
+      text: 'About 4,000 concurrent recomputations start. Coalesce so one request recomputes and the others wait for its result.',
+      implies: 'You are bounding concurrent origin work rather than trying to prevent the miss.',
+      why: 'In the 200 ms before the entry is repopulated, every arriving request misses: 20,000 per second times 0.2 seconds is 4,000 identical computations of the same value. Coalescing caps that at one per key regardless of demand, which is why it is the strongest single mitigation — it removes the multiplier rather than reducing it.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Increase the lifetime so it expires less often',
+      implies: 'You are reducing the frequency of the event.',
+      why: 'It makes the spike rarer and exactly as severe when it happens, while making the data more stale the rest of the time. You have traded freshness for a less frequent outage, which is not the trade anyone wanted.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Serve the stale value while refreshing in the background',
+      implies: 'You are removing the wait entirely.',
+      why: 'Genuinely effective and often the best answer: nobody blocks and the origin sees one refresh. It requires that stale data is acceptable for this value, which is a per-value decision, and it needs a bound on how long stale may be served or a failing refresh becomes an invisible outage.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer notes that per-instance coalescing is not enough on its own: a hundred instances each collapsing to one request still send a hundred to the origin. Either coalesce cluster-wide through the shared cache with a short-lived lock, or accept a bounded multiple and size for it. It also pairs coalescing with jittered lifetimes, since entries populated in one batch otherwise expire in one batch."
+/>
+
+<Check
+  concepts={['cache-penetration']}
+  prompt="Origin load is high, the cache hit rate reads 92%, and traffic volume is normal. The requested keys look unfamiliar. What is happening?"
+  options={[
+    {
+      id: 'a',
+      text: 'Requests for keys that do not exist. They cache nothing, so every one reaches the origin.',
+      implies: 'You recognise that a miss with no value to store never becomes a hit.',
+      why: 'A normal miss populates the cache and the next request hits. A miss on a non-existent key stores nothing, so identical requests miss forever and the cache is a pure pass-through for that traffic. The hit rate looks fine because legitimate traffic is still being served well; the two populations are simply mixed in one number.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The cache is too small and the working set no longer fits',
+      implies: 'You are diagnosing eviction pressure.',
+      why: 'A real cause of a hit-rate drop, and it would show as a falling hit rate and rising evictions on familiar keys. Here the hit rate is healthy and the keys are unrecognised, which points at traffic for things that were never cached rather than things that were evicted.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'The origin has become slower, so requests are queuing',
+      implies: 'You are looking at the origin as the cause.',
+      why: 'The origin is a victim here rather than a cause: it is receiving requests it should never have seen. Tuning it would raise the ceiling slightly and leave the mechanism untouched.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer fixes it in layers: cache the negative result with a short lifetime to absorb the bulk immediately, validate identifier format to reject impossible keys before any lookup, and add a membership filter for cheap definite-absence answers at scale. It also observes that the hit rate should be reported separately for existing and non-existing keys, because one aggregate number hid this failure completely."
+/>
+
+<DebugCheck
+  concepts={['noisy-neighbour', 'cache-stampede', 'hit-rate', 'eviction']}
+  symptom="Your service’s origin load has tripled over four days. You have deployed nothing, traffic is flat, and no code has changed."
+  observations={[
+    { label: 'Request volume', detail: 'Unchanged. Same requests per second, same distribution of endpoints.' },
+    { label: 'Cache availability', detail: '100% over the period. No node failures, no restarts, no errors.' },
+    { label: 'Cache hit rate', detail: 'Fell from 94% to 82% over four days, gradually rather than in a step.' },
+    { label: 'Cache memory', detail: 'At its configured maximum throughout, which is normal. Eviction rate has risen fourfold.' },
+    { label: 'Cluster keyspace', detail: 'Total key count is up 40%. Your service’s key count is unchanged.' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'Another workload sharing the cache grew and is evicting your working set. Your hit rate fell because your keys are being removed, not because your requests changed.',
+      implies: 'You are treating the shared cache as a shared resource with a single eviction policy.',
+      why: 'Every signal points outside your service: your traffic and your key count are unchanged, the cache is perfectly healthy, and the cluster keyspace grew by 40% without any of that growth being yours. Eviction is cluster-wide under one policy, so a neighbour’s growth removes your keys. The gradual slope rather than a step is the signature of somebody else’s rollout.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The time-to-live is too short, so entries expire before they are reused.',
+      implies: 'You are looking at expiry as the cause of the misses.',
+      why: 'A short lifetime does lower hit rate, and it would have been lowering it for months rather than changing over four days. Nothing about your configuration changed, so a static setting cannot explain a moving number.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'The working set has grown — users are requesting a wider spread of items than before.',
+      implies: 'You are considering a change in access distribution.',
+      why: 'A genuinely good hypothesis and the right one to hold second, because it produces exactly this signature from inside your own service. It is ruled out here by the endpoint distribution being unchanged and your key count being flat, but on a different day it would be the answer, and distinguishing the two is why both numbers are worth having.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates the immediate remedy from the structural one. Immediately: a memory quota for the offending workload if the technology supports one, or a value size limit, since a few very large values usually do most of the damage. Structurally: separate caches for workloads with different access patterns, because a serving path and an analytics job should never share eviction pressure. It also notes the monitoring gap this exposes — alerting on cache availability said nothing, and hit rate is the metric that would have paged on day one."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Correlated load, jitter, and limiting concurrent work', sourceId: 'aws-builders-library' },
+    { label: 'Expiry and eviction policies on a shared instance', sourceId: 'redis-docs' },
+    { label: 'Why fanout dominates tail latency', sourceId: 'tail-at-scale' },
+    { label: 'Shared resources as the path failures travel along', sourceId: 'release-it' },
+    { label: 'Next: which defences work, and what they cost when nothing is wrong', href: '/lessons/stopping-the-spread' },
+  ]}
+/>

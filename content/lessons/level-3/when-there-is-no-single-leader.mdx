@@ -1,0 +1,449 @@
+---
+id: when-there-is-no-single-leader
+title: When There Is No Single Leader
+level: 3
+module: l3-replication
+order: 2
+summary: One leader means one order and one place to fail. Every alternative buys availability or write locality, and pays in conflicts you must resolve.
+difficulty: advanced
+minutes: 30
+prerequisites: [copies-and-what-they-cost, what-the-database-promises]
+concepts: [multi-leader, leaderless, quorum, sloppy-quorum, hinted-handoff, read-repair, anti-entropy, conflict-resolution, crdt, failover, heartbeat]
+unlocks: [split-brain, network-partition, vector-clock, causal-consistency, last-write-wins]
+failures: [split-brain, tombstone-resurrection]
+sources: [dynamo, ddia, cassandra-paper, cassandra-docs, gilbert-lynch, database-internals]
+status: reviewed
+---
+
+## The problem
+
+Your database has one leader and two followers. It works, and then at 03:00 the leader stops
+responding.
+
+Nobody knows whether it is dead or merely unreachable, and there is no way to find out — those two
+situations look identical from every other machine. If you promote a follower and the old leader
+was alive, you now have two machines accepting writes for the same rows. If you wait, and it was
+dead, you are down.
+
+You promote. Ninety seconds later the old leader comes back, still believing it is the leader,
+holding forty writes it accepted and never replicated. Those writes are in nobody else's copy, and
+the new leader has since accepted writes to the same rows.
+
+Nothing here was a mistake. The single-leader design is correct, the failover was reasonable, and
+you now have two versions of the truth and no rule for choosing between them.
+
+## Intuition
+
+One leader is a decision about where **order** is decided. Every write goes through one machine,
+so that machine can say what happened first, and every replica applies the same sequence. That is
+the entire source of the design's simplicity, and it is worth naming, because everything that
+follows is about giving it up.
+
+Give it up and you get something. There are only two things worth having:
+
+**Writes accepted in more than one place** — so a user in Sydney does not wait 150 milliseconds for
+a leader in Virginia, or so a laptop can accept edits with no network at all.
+
+**Writes that continue during a failure** — so no single machine's death stops the system, and
+there is no promotion decision to get wrong.
+
+And you pay for it with the same thing in both cases: **two machines accepted conflicting writes
+and neither was wrong to.** With one leader that cannot happen. Without one it is not an edge case
+— it is the normal operation of the system, and the design is not finished until you have said what
+happens.
+
+The honest framing is that these architectures do not remove difficulty. They **move** it: from a
+rare, acute problem (failover, at 03:00, under pressure) to a continuous, chronic one (conflicts,
+every day, in application code). Which you prefer is a real question with a real answer, and the
+answer depends on your product rather than on which architecture is more sophisticated.
+
+## Concretely
+
+<Example title="One shopping cart, three replication designs">
+
+A user adds a scarf on their phone and, seconds later, removes a hat on their laptop. The two
+requests reach different places.
+
+**Single leader.** Both go to the leader. It applies them in the order it received them. The cart
+has the scarf and no hat. There is nothing to resolve, because one machine saw both.
+
+**Multi-leader across regions.** The phone writes to Sydney, the laptop to Virginia. Each accepts
+locally and replicates asynchronously. Both regions now have a cart the other has not seen, and
+they must merge. Last-write-wins picks one whole cart and discards the other — so either the scarf
+vanishes or the hat comes back, and the user is certain they did the thing that got discarded.
+
+**Leaderless with quorums.** Both writes go to whichever replicas answer. If the write quorums
+overlap, the conflict is visible and both versions are retained for the application to resolve. If
+they were sloppy quorums during a partition, the overlap is not guaranteed and the conflict may not
+be detected until anti-entropy runs.
+
+Notice the useful thing: for a cart, the correct merge is not a choice at all. **Union the
+additions, union the removals, apply removals last.** The conflict disappears because the data type
+has a merge rule. That is not a trick — it is the entire idea behind conflict-free replicated types,
+and it is available whenever the data has such a rule.
+
+</Example>
+
+## Formal explanation
+
+**Single leader.** One replica accepts writes and propagates them. Simple, and the entire risk
+concentrates in <C id="failover" />, which is three hard problems at once:
+
+- **Detection.** A <C id="heartbeat" /> plus a timeout is a *guess*. A dead machine and a slow
+  network are indistinguishable from outside, and no timeout separates them — a shorter one
+  promotes during a hiccup, a longer one extends every outage.
+- **Split brain.** If the old leader is alive and does not know it was replaced, two leaders accept
+  writes. Fencing — a term that only increases, which storage refuses to accept when stale — is
+  what actually prevents this, and it must be enforced by the resource rather than agreed among
+  the leaders.
+- **Lost writes.** Anything the old leader accepted and had not replicated is gone, or has to be
+  discarded when it returns. Asynchronous replication means this is not a possibility, it is a
+  quantity, and it is your recovery point objective whether or not anyone wrote it down.
+
+**<C id="multi-leader" />.** Several replicas accept writes and replicate to each other. Justified
+by write latency across regions, or by clients that must work offline. The cost is that conflicts
+are guaranteed rather than occasional, and they are guaranteed *for the rows that are edited most*.
+
+**<C id="leaderless" />.** Any replica accepts a write; the client or a coordinator writes to
+several and reads from several (<Cite id="dynamo" />). With N replicas, W written and R read,
+**W + R &gt; N** forces the read set and the write set to share at least one replica, so a read sees
+the latest acknowledged write. This is quorum intersection, and it is the whole mechanism.
+
+Three refinements matter, and the third is the one people miss.
+
+**Read repair.** A read that sees disagreeing replicas writes the newer value back to the stale
+one. It converges the data you actually read, which is exactly the data you least need converged.
+
+**<C id="anti-entropy" />.** A background comparison — typically by hashing ranges into a tree so
+that identical ranges are dismissed cheaply — that finds and repairs differences in data nobody has
+read. Without it, rarely-read records drift indefinitely, and the drift is invisible until a
+replica is lost and takes the only correct copy with it.
+
+**<C id="sloppy-quorum">Sloppy quorums</C> and <C id="hinted-handoff">hinted handoff</C>.** During a partition, if the replicas
+that should hold a key are unreachable, the write is accepted by *whichever* nodes are reachable,
+which hold it as a hint and hand it back when the home nodes return. Availability improves. And the
+guarantee changes:
+
+<Callout kind="warn" title="A sloppy quorum is not a quorum">
+W + R &gt; N guarantees overlap only when the W nodes and the R nodes are drawn from the same N
+home replicas. Under a sloppy quorum the write went to nodes outside that set, so a subsequent read
+of the home replicas can legitimately miss it and return an older value.
+
+This is not a bug and it is not misconfiguration. It is the trade being taken: durability and
+availability of the write, in exchange for the read guarantee you thought the arithmetic gave you.
+Systems that offer it usually offer it as a setting, which means someone chose — possibly by
+accepting a default.
+</Callout>
+
+**<C id="conflict-resolution" />** is where the design is finished or abandoned. Four options, in
+increasing order of effort and correctness:
+
+- **Last write wins.** Order by timestamp, keep one. Trivial, and it silently discards a write —
+  and because timestamps come from different machines with different clocks, it can discard the
+  *newer* one. The problem is not that it discards; it is that it discards invisibly.
+- **Version vectors.** Detect that two writes were concurrent, without ordering them by time. This
+  *detects*; it does not resolve. Both versions are returned and someone must decide.
+- **Application merge.** The application knows the semantics and can do the right thing — union the
+  cart, take the maximum reading, present both to the user. Correct, and it is real work per data
+  type.
+- **<C id="crdt" />.** A data type whose merge is defined, associative, commutative and idempotent,
+  so replicas converge automatically regardless of order. Genuinely automatic for counters, sets,
+  maps and sequences. Not available for an opaque value with no merge rule — and applying one there
+  degrades into last-write-wins with extra machinery.
+
+## Architecture
+
+<Arch
+  caption="The question is not how many copies. It is how many machines may accept a write."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'c1', label: 'Client A' }, { id: 'c2', label: 'Client B' }] },
+    { title: 'Accepting writes', nodes: [{ id: 'leader', label: 'Leader', note: 'the only order', tone: 'accent' }, { id: 'peer', label: 'Second region', note: 'also accepts' }] },
+    { title: 'Replicas', nodes: [{ id: 'r1', label: 'Replica 1' }, { id: 'r2', label: 'Replica 2' }, { id: 'r3', label: 'Replica 3' }] },
+    { title: 'Convergence', nodes: [{ id: 'rr', label: 'Read repair' }, { id: 'ae', label: 'Anti-entropy', note: 'the unread data' }] },
+  ]}
+  edges={[
+    { from: 'c1', to: 'leader' },
+    { from: 'leader', to: 'r1' },
+    { from: 'leader', to: 'r2' },
+    { from: 'c2', to: 'peer' },
+    { from: 'peer', to: 'r3' },
+    { from: 'r1', to: 'rr' },
+    { from: 'r2', to: 'ae' },
+    { from: 'r3', to: 'ae' },
+  ]}
+  stages={[
+    {
+      label: 'One leader',
+      show: ['c1', 'c2', 'leader', 'r1', 'r2'],
+      because:
+        'Every write passes through one machine, so there is one order and no conflicts. All the risk lives in what happens when that machine stops, and in how much unreplicated work it takes with it.',
+    },
+    {
+      label: 'More than one acceptor',
+      show: ['c1', 'c2', 'leader', 'peer', 'r1', 'r2', 'r3'],
+      because:
+        'A second region accepts writes locally, so users near it stop paying a cross-ocean round trip and a regional failure stops nothing. Concurrent writes to the same row are now normal, and the design is incomplete until it says how they merge.',
+    },
+    {
+      label: 'Make them converge',
+      show: ['c1', 'c2', 'leader', 'peer', 'r1', 'r2', 'r3', 'rr', 'ae'],
+      because:
+        'Read repair fixes what is read; anti-entropy fixes what is not. Both are required, because the data most likely to drift undetected is the data nobody looks at — which is also the data whose loss is discovered latest.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One leader, two followers, one region',
+      behaviour: 'Simple and correct. Reads may be stale; writes have one order.',
+      firstToBreak: 'Availability during failover, and unreplicated writes on the machine that died.',
+    },
+    {
+      scale: 'Read replicas at scale',
+      behaviour:
+        'Reads scale out. Replication lag becomes user-visible as a read that does not reflect a write just made.',
+      firstToBreak: 'Read-your-writes expectations, which appear as bug reports rather than as lag metrics.',
+    },
+    {
+      scale: 'Multi-region writes',
+      behaviour:
+        'Local write latency everywhere, no cross-ocean round trip on the critical path, and every row edited in two places is a conflict.',
+      firstToBreak:
+        'Any data type without a merge rule. Counters, carts and sets are fine; a free-text field edited in both places is not.',
+    },
+    {
+      scale: 'Leaderless with quorums',
+      behaviour:
+        'No promotion decision, no split brain, and write availability that survives losing replicas.',
+      firstToBreak:
+        'Anti-entropy, if it is not running or not finishing. Silent divergence accumulates until a replica is lost and takes the only good copy with it.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Split brain after failover',
+      symptom: 'Two machines accept writes for the same rows. Data diverges and neither side is obviously wrong.',
+      cause: 'The old leader was unreachable rather than dead, and nothing prevented it from continuing.',
+      mitigation: 'Fencing enforced by the storage layer, not by agreement between leaders. A promoted leader carries a higher token and the storage rejects lower ones.',
+    },
+    {
+      what: 'Last-write-wins discards the newer write',
+      symptom: 'A user makes a change, sees it succeed, and later finds an older value in its place.',
+      cause: 'Timestamps came from machines whose clocks disagree, so ordering by timestamp ordered by clock error.',
+      mitigation: 'Detect concurrency with version vectors rather than time, and resolve with semantics. If last-write-wins is chosen anyway, make it a stated, documented data-loss policy.',
+    },
+    {
+      what: 'Sloppy quorum breaks the read guarantee',
+      symptom: 'A read that satisfies W + R > N returns a value older than an acknowledged write.',
+      cause: 'The write was accepted by nodes outside the home replica set during a partition, so the read set did not intersect it.',
+      mitigation: 'Know whether sloppy quorums are enabled and what they mean for the guarantee you are claiming. Do not describe the system as strongly consistent while they are on.',
+    },
+    {
+      what: 'Silent divergence in cold data',
+      symptom: 'Nothing, for months. Then a replica is lost and records are missing or old.',
+      cause: 'Read repair only fixes what is read, and anti-entropy was disabled, throttled to nothing, or never completing.',
+      mitigation: 'Monitor anti-entropy completion as a first-class signal. A repair process that has not finished a full cycle is a data-loss risk that reports nothing.',
+    },
+    {
+      what: 'Deleted data reappears',
+      symptom: 'A record deleted weeks ago is back, with no write in any log to explain it.',
+      cause: 'A replica was down longer than the deletion marker was retained. When it returned, it had the original row and no marker, so the row was propagated back as new.',
+      mitigation: 'A node offline longer than the tombstone retention must be rebuilt from a healthy replica rather than rejoined. This is a rule that must be written down, because it is invisible until it happens.',
+    },
+    {
+      what: 'Conflicts nobody resolves',
+      symptom: 'Sibling versions accumulate, reads slow down, and the application returns arbitrary values.',
+      cause: 'The store detects conflicts and returns them, and the application ignores the case.',
+      mitigation: 'Every value in a leaderless store needs a merge function written and tested. Detection without resolution is worse than last-write-wins, because it defers the loss and hides it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Accept writes on more than one node instead of routing every write through a leader"
+  options={[
+    'Single leader, synchronous replication to one follower',
+    'Single leader, asynchronous replication',
+    'Multi-leader across regions',
+    'Leaderless with quorum reads and writes',
+  ]}
+  why="Writes continue when a machine or a region fails, with no promotion decision and no split-brain window; and writes complete at local latency rather than at the distance to a leader. Both matter more as the geography spreads."
+  gain="Write availability that survives losing nodes. Local write latency in every region. No failover procedure to get wrong at three in the morning, which removes an entire class of incident."
+  sacrifice="Conflicts become ordinary and must be resolved by the application. Read guarantees become arithmetic you have to state rather than a property you inherit. Convergence needs background repair that must be monitored."
+  failureModes={[
+    'Conflicts resolved by last-write-wins, silently losing user work',
+    'Sloppy quorums quietly weakening the guarantee the arithmetic implied',
+    'Divergence in unread data, discovered when a replica is lost',
+    'Deleted records resurrected by a node offline past tombstone retention',
+  ]}
+  operationalBurden="High and continuous. Repair processes to monitor, per-type merge logic to maintain, and a consistency model that every engineer touching the data must understand rather than assume."
+  cost="More storage and more cross-node traffic, plus real engineering time on merge logic. The saving is on the incident side: no failover runbook, no promotion decision, no split-brain postmortem."
+  whenNot="When the data has no meaningful merge — a single-valued field two people edit, a balance, an inventory count. Merging those means choosing whose work to discard, and no framework makes that correct. When one region can serve everyone at acceptable latency, multi-leader buys conflicts for nothing. And when the team cannot commit to operating repair processes and writing merge functions per data type, a single leader with a rehearsed failover is the more reliable system in practice, whatever the architecture diagram suggests."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dynamo">
+Dynamo uses quorum-style reads and writes with configurable N, R and W, sloppy quorums with hinted
+handoff to preserve write availability during partitions, and both read repair and an anti-entropy
+process using Merkle trees to converge replicas.
+</Claim>
+
+<Claim label="fact" source="dynamo">
+Concurrent versions are detected with version vectors and returned to the client for
+reconciliation, on the grounds that the application knows the semantics of the data and the
+storage system does not.
+</Claim>
+
+<Claim label="fact" source="cassandra-paper">
+A partitioned, replicated store with tunable consistency lets each operation choose how many
+replicas must respond, so the consistency and availability trade is made per operation rather than
+once for the whole system.
+</Claim>
+
+<Claim label="fact" source="cassandra-docs">
+Deletions are recorded as tombstones with a retention period. A replica that is offline for longer
+than that period must be rebuilt rather than rejoined, because it can otherwise reintroduce data
+whose deletion marker has been removed elsewhere.
+</Claim>
+
+<Claim label="fact" source="gilbert-lynch">
+When a network partition occurs, a system must give up either availability or linearizable
+consistency. Accepting writes on both sides of a partition is choosing availability, and the
+divergence that follows is the cost, not a defect.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Ordering concurrent writes by wall-clock timestamp is unreliable because clocks on different
+machines disagree; last-write-wins therefore discards data and can discard the write that happened
+later.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can say what you gave up. Candidates readily say a leaderless store is highly available; far fewer name the conflict handling, and that is the actual content of the decision."
+  depth="Know why W + R > N works and when it stops working. Be able to name a conflict resolution strategy for your specific data. Know that read repair alone does not converge unread data."
+  followUps={[
+    'Two regions accept a write to the same row. What does the user see?',
+    'You have N=3, W=2, R=2. What does that guarantee, and what does it not?',
+    'What converges data that nobody reads?',
+    'The old leader comes back after a failover. What stops it accepting writes?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Choosing a leaderless store for availability, and not planning conflict resolution.',
+      why: 'Availability is the property you bought; conflicts are the price, and the price arrives on ordinary days rather than during incidents. A system that detects conflicts and has no merge logic returns arbitrary values with confidence.',
+      instead:
+        'For each data type, state the merge rule before choosing the store. If a type has no sensible merge, that type needs a single writer regardless of what the rest of the system uses.',
+    },
+    {
+      mistake: 'Treating W + R > N as strong consistency.',
+      why: 'It guarantees the read set intersects the write set for acknowledged writes on the home replicas. It says nothing about concurrent writes, and sloppy quorums suspend even the intersection.',
+      instead:
+        'State the guarantee precisely, including whether sloppy quorums are enabled. "A read sees the latest acknowledged write, except under a partition where sloppy quorums are in use" is a claim you can defend.',
+    },
+    {
+      mistake: 'Relying on read repair to keep replicas consistent.',
+      why: 'Read repair only touches records that are read. The records most likely to have drifted are the ones nobody reads, and their divergence surfaces only when a replica is lost.',
+      instead:
+        'Run anti-entropy and monitor its completion. A repair cycle that never finishes is a silent data-loss risk with a green dashboard.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['quorum', 'sloppy-quorum']}
+  prompt="You run N=3, W=2, R=2. During a network partition, writes are still being acknowledged. A read then returns a value older than an acknowledged write. Is the system broken?"
+  options={[
+    {
+      id: 'a',
+      text: 'No. Sloppy quorums are enabled, so the write was accepted by nodes outside the home replica set and the read set did not intersect it.',
+      implies: 'You know the intersection argument depends on both sets being drawn from the same replicas.',
+      why: 'W + R > N guarantees overlap only within one set of N home replicas. A sloppy quorum accepts the write on whatever nodes are reachable, so the arithmetic no longer applies and a home-replica read can legitimately miss it. Writes stayed available during the partition, which is exactly the trade the setting makes.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Yes. W + R > N guarantees a read sees the latest write.',
+      implies: 'You are applying the rule without its precondition.',
+      why: 'The rule is correct and its precondition is not stated often enough: the R nodes and the W nodes must come from the same N replicas. Under a partition with sloppy quorums that is precisely what does not hold, which is why the behaviour is a documented consequence rather than a fault.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'No. Replication lag means a read can always be slightly behind.',
+      implies: 'You are attributing it to asynchrony.',
+      why: 'In a quorum system the intersection is what defeats lag: even if one replica is behind, the read quorum includes at least one node that has the write. Lag is not the explanation here — the explanation is that the write was never sent to the nodes the read consulted.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer says what to do about it: hinted handoff will deliver the write to the home replicas when the partition heals, so this is a temporary window rather than lost data. It also notes the documentation consequence — if the system claims read-your-writes anywhere, that claim must be qualified while sloppy quorums are enabled, because the two cannot both be true during a partition."
+/>
+
+<Check
+  concepts={['conflict-resolution', 'crdt']}
+  prompt="Two regions accept concurrent writes to the same document. Which resolution strategy is right?"
+  options={[
+    {
+      id: 'a',
+      text: 'It depends on the data type, and for a document with no merge rule the honest answer is to preserve both versions and involve the user',
+      implies: 'You are treating merge as a property of the data rather than of the store.',
+      why: 'A counter merges by summing increments, a set by union, a cart by union with removals applied last — those merge automatically. An opaque document has no such rule, and any automatic choice discards someone work. Preserving both and surfacing the conflict is the only resolution that never loses data, and it is what file synchronisation systems do for exactly this reason.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Last write wins, using the timestamp on each write',
+      implies: 'You are ordering by time.',
+      why: 'Simple, and it discards one version silently. Worse, the timestamps come from different machines, so with a few hundred milliseconds of clock disagreement it can discard the later write while reporting success. If it is chosen deliberately, it should be recorded as a data-loss policy rather than as a resolution strategy.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Use a CRDT so the merge is automatic',
+      implies: 'You are reaching for a real technique.',
+      why: 'Correct wherever the type has a defined merge, and much of a system does. But a CRDT applied to an opaque value has no merge to perform and collapses back to picking one — last-write-wins wearing a better name. The technique is excellent and it has a precondition.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer decomposes the document instead of resolving it whole: title, tags and a set of sections each merge differently, and modelling them separately converts one unresolvable conflict into several resolvable ones. It also observes that the alternative to merging is avoiding the conflict — routing all writes for one document to one region — which is a single-leader design applied per object rather than per system, and is often the right answer for exactly the data that will not merge."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Quorums, sloppy quorums, hinted handoff and anti-entropy', sourceId: 'dynamo' },
+    { label: 'Multi-leader and leaderless replication, and handling write conflicts', sourceId: 'ddia' },
+    { label: 'Tunable per-operation consistency', sourceId: 'cassandra-paper' },
+    {
+      label: 'Tombstones and the rule about long-absent replicas',
+      sourceId: 'cassandra-docs',
+      note: 'The resurrection failure is documented behaviour, not a bug, and it has an operational rule attached.',
+    },
+    { label: 'Next: how machines reach agreement despite crashes and partitions', href: '/lessons/agreeing-anyway' },
+  ]}
+/>

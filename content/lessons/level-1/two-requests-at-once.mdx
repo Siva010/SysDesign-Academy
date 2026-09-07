@@ -1,0 +1,447 @@
+---
+id: two-requests-at-once
+title: Two Requests at Once
+level: 1
+module: l1-concurrency
+order: 1
+summary: Read, decide, write. Between the read and the write, the world changed. Almost every correctness bug in a web application is this one.
+difficulty: core
+minutes: 28
+prerequisites: [index, correctness]
+concepts: [acid, atomicity, lost-update, locking, optimistic-concurrency, isolation-levels]
+unlocks: [mvcc, snapshot-isolation, write-skew, idempotency]
+sources: [postgres-docs, ddia, mysql-docs]
+status: reviewed
+---
+
+## The problem
+
+You are selling concert tickets. There are 100 left. The code is obvious:
+
+1. Read the remaining count.
+2. If it is greater than zero, subtract one and write it back.
+3. Confirm the sale.
+
+You sell 118 tickets to a venue with 100 seats.
+
+Nothing crashed. No error was logged. Every individual request did exactly what the code said.
+The bug is in the gap between step 1 and step 2, and it only appears when two requests occupy
+that gap at the same time — which, at any real traffic level, is constantly.
+
+## Intuition
+
+Two people are editing the same shared shopping list on paper.
+
+Both read it: &ldquo;milk, bread&rdquo;. Alice adds eggs and writes back &ldquo;milk, bread,
+eggs&rdquo;. Bob, who read the list before Alice wrote, adds coffee and writes back
+&ldquo;milk, bread, coffee&rdquo;.
+
+Alice's eggs are gone. Nobody made a mistake and no error occurred. Bob wrote a version of the
+list based on information that was already stale by the time he wrote it.
+
+This is a <C id="lost-update">lost update</C>, and it is the general shape of nearly every
+concurrency bug in an application: **read, decide, write, where something changed between the
+read and the write.**
+
+There are exactly three families of solution, and every technique you will meet is one of
+them:
+
+1. **Make the whole thing one indivisible step**, so there is no gap.
+2. **Stop anyone else acting during the gap** — locking.
+3. **Detect that the world changed and retry** — optimistic concurrency.
+
+## Concretely
+
+<Example title="The same fix, three ways">
+
+**One indivisible step.** Push the decision into the database:
+
+    UPDATE events SET remaining = remaining - 1
+    WHERE id = 42 AND remaining > 0
+
+The read and the write are a single statement. Either it updates one row, or it updates none
+because the condition failed. The gap does not exist. If the affected row count is zero, the
+tickets are gone.
+
+**Pessimistic locking.** Lock the row, read it, decide, write, release:
+
+    SELECT remaining FROM events WHERE id = 42 FOR UPDATE
+
+Correct, and while you hold the lock nobody else can proceed. Under contention on a popular
+event, every buyer queues behind every other buyer.
+
+**Optimistic concurrency.** Read the row and its version, decide, then write conditionally:
+
+    UPDATE events SET remaining = 99, version = 8
+    WHERE id = 42 AND version = 7
+
+If someone else got there first, version is no longer 7 and zero rows are updated. You retry
+with fresh data. Excellent when conflicts are rare; a retry storm when they are not.
+
+</Example>
+
+## Formal explanation
+
+A **transaction** groups operations so they succeed or fail together, and so that concurrent
+transactions do not corrupt each other's view of the world. The guarantees are conventionally
+bundled as <C id="acid" />:
+
+- **Atomicity** — all of it happens or none of it does. There is no half-applied state to
+  clean up.
+- **Consistency** — declared invariants such as constraints and foreign keys are preserved.
+  This is *your* definition of consistent, not the distributed-systems one.
+- **Isolation** — concurrent transactions do not observe each other's partial work. This is
+  the one with a dial on it.
+- **Durability** — once committed, it survives a crash.
+
+<Callout kind="warn" title="Isolation is a menu, not a guarantee">
+Full isolation means transactions behave as if they ran one at a time. That is expensive, so
+databases offer weaker levels which permit specific anomalies in exchange for concurrency.
+Most default to a level that permits lost updates. Knowing your default is not a detail; it is
+the difference between code that is correct and code that appears correct.
+</Callout>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL's default isolation level is Read Committed. It also offers Repeatable Read and
+Serializable. Under Read Committed, each statement sees a snapshot taken at the start of that
+statement, so a read-modify-write across two statements can be interleaved with another
+transaction's commit.
+</Claim>
+
+<Claim label="fact" source="mysql-docs">
+InnoDB's default isolation level is Repeatable Read, which differs from PostgreSQL's default.
+Two systems both described as "ACID relational databases" therefore give different default
+behaviour for the same application code.
+</Claim>
+
+<Disagreement
+  about="what 'the default isolation level' protects you from"
+  positions={[
+    { source: 'postgres-docs', says: 'defaults to Read Committed, where each statement sees a fresh snapshot' },
+    { source: 'mysql-docs', says: 'InnoDB defaults to Repeatable Read, where the whole transaction sees one snapshot' },
+  ]}
+  takeaway="There is no portable answer to 'is my read-modify-write safe by default'. Check your engine's default, and prefer designs that are safe regardless: a single conditional statement, or an explicit version check."
+/>
+
+<Deeper title="Why weaker isolation exists at all">
+
+Serializable isolation means the result is equivalent to some serial ordering of the
+transactions. That is the guarantee you actually want, and it is not free: the database must
+either take enough locks to prevent all interleaving, or detect conflicts and abort
+transactions that would violate serializability.
+
+Under contention, both approaches reduce throughput — sometimes dramatically, because
+transactions that would have succeeded are now waiting or being retried.
+
+So databases offer weaker levels that permit specific anomalies. The bargain is explicit: you
+get more concurrency, and you take responsibility for the anomalies the level allows. The
+failure mode is that most applications never make this bargain deliberately. They inherit a
+default and discover the anomaly in production, usually as a number that does not add up.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The gap between read and write, and the three places you can close it."
+  columns={[
+    { title: 'Requests', nodes: [{ id: 'r1', label: 'Request A' }, { id: 'r2', label: 'Request B' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Application', note: 'read, decide, write' }] },
+    { title: 'Guard', nodes: [{ id: 'guard', label: 'Lock or condition', note: 'closes the gap', tone: 'accent' }] },
+    { title: 'Storage', nodes: [{ id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'r1', to: 'app' },
+    { from: 'r2', to: 'app' },
+    { from: 'app', to: 'guard', label: 'conditional write' },
+    { from: 'guard', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'The bug',
+      show: ['r1', 'r2', 'app', 'db'],
+      because:
+        'Two requests read the same value, both decide based on it, both write. Nothing between them notices that they overlapped.',
+    },
+    {
+      label: 'The fix',
+      show: ['r1', 'r2', 'app', 'guard', 'db'],
+      because:
+        'Something must adjudicate. The database is the only component that sees both requests, so the guard belongs there — as a conditional update, a unique constraint, or a lock.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One request at a time',
+      behaviour: 'No gap, no conflict, no bug. This is what your tests exercise.',
+      firstToBreak: 'Nothing. This is why the bug reaches production.',
+    },
+    {
+      scale: 'Moderate concurrency, spread across rows',
+      behaviour:
+        'Conflicts are rare because two requests rarely touch the same row. Optimistic concurrency is nearly free.',
+      firstToBreak: 'Occasional anomalies that look like impossible data.',
+    },
+    {
+      scale: 'High concurrency on one hot row',
+      behaviour:
+        'Every request contends for the same row. Pessimistic locking serialises them; optimistic concurrency produces heavy retries.',
+      firstToBreak:
+        'Throughput on that row, which becomes the throughput of the whole feature regardless of how many servers you add.',
+    },
+    {
+      scale: 'Across multiple databases',
+      behaviour:
+        'No single component sees both writes, so no local mechanism can adjudicate.',
+      firstToBreak:
+        'The assumption that a transaction can span the operation at all. This is where sagas and idempotency replace atomicity.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Lost update',
+      symptom:
+        'Counters drift low. Inventory oversells. An edit silently overwrites another. Nothing errors.',
+      cause:
+        'Read-modify-write across two statements, with another transaction committing in between.',
+      mitigation:
+        'A single conditional statement, an explicit version check, or a lock. Never a check followed by an unconditional write.',
+    },
+    {
+      what: 'Deadlock',
+      symptom:
+        'Occasional transaction failures under load, often correlated with a specific pair of operations.',
+      cause:
+        'Two transactions acquire the same locks in different orders, so each holds what the other needs.',
+      mitigation:
+        'Acquire locks in a consistent order everywhere. Keep transactions short. Retry deadlock victims, since the database resolves it by killing one.',
+    },
+    {
+      what: 'Long-running transaction',
+      symptom:
+        'Storage grows, background cleanup falls behind, and unrelated queries slow down.',
+      cause:
+        'A transaction held open across a network call or user think-time. Under MVCC the database must retain every version that transaction might still see.',
+      mitigation:
+        'Never hold a transaction across an external call. Read, close, act, then reopen if you need to write.',
+    },
+    {
+      what: 'Hot row contention',
+      symptom:
+        'Throughput on one feature is capped regardless of how many application servers you run.',
+      cause:
+        'All writes serialise on a single row: an inventory count, a global sequence, a shared aggregate.',
+      mitigation:
+        'Split the row into shards and aggregate on read, or move the operation to an append-only model where the total is derived rather than updated in place.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use optimistic concurrency (version check and retry) rather than row locking"
+  options={[
+    'A single conditional UPDATE where the logic can be expressed in SQL',
+    'Pessimistic locking: SELECT FOR UPDATE, then write',
+    'Optimistic: read with a version, write conditionally, retry on conflict',
+  ]}
+  why="Most rows are not contended. Taking a lock on every write pays a coordination cost on the 99% of operations that would never have conflicted, and the lock is held across whatever the application does in between."
+  gain="No lock held during application logic, so a slow request cannot block others. Throughput scales well when conflicts are rare, and there is no risk of a transaction being held open across a network call."
+  sacrifice="Under contention, work is done and thrown away. Retries add latency and load exactly when the system is busiest, and an unbounded retry loop on a hot row is a self-inflicted denial of service."
+  failureModes={[
+    'Livelock on a hot row: every attempt conflicts and retries forever',
+    'Retry without backoff, amplifying load at the worst moment',
+    'Forgetting that a retry must re-read: retrying with stale data reintroduces the original bug',
+  ]}
+  operationalBurden="Low. It needs a version or timestamp column and disciplined retry logic with a bound. The subtle part is remembering to re-read on retry rather than resubmitting the original computation."
+  cost="No infrastructure cost. Wasted work under contention, which is only material when contention is high — at which point the design, not the mechanism, is the problem."
+  whenNot="On a genuinely hot row, optimistic concurrency degrades badly: nearly every attempt fails and retries, so you do many times the work to achieve the same throughput a lock would give you calmly. There, either take the lock, or change the data model so the hot row is no longer a single row."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL implements MVCC: writers do not block readers and readers do not block writers,
+because each transaction sees a snapshot rather than the latest state. The cost is that old
+row versions must be retained until no transaction can still see them, and then cleaned up.
+</Claim>
+
+<Claim label="recommendation">
+Prefer a single conditional statement over any application-level coordination whenever the
+logic can be expressed in it. Decrementing with a guard clause is atomic, needs no lock, needs
+no retry, and cannot be got wrong by a future maintainer who does not know the invariant
+exists.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Application-level check-then-act is one of the most common sources of production correctness
+bugs, and it is under-tested because it requires concurrency to reproduce. Tests that exercise
+one request at a time cannot find it.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you spot a read-modify-write race unprompted. This is the single most reliable filter in a design interview: interviewers introduce concurrency specifically to see whether the candidate notices."
+  depth="Know the three families of solution and when each applies. Know that isolation levels differ by engine and that defaults usually permit lost updates. Anomaly taxonomy beyond that is a bonus."
+  followUps={[
+    'Two users claim the last item simultaneously. Walk me through what happens.',
+    'What does your database actually guarantee by default?',
+    'When would optimistic concurrency be the wrong choice?',
+    'How does this change when the two writes are in different services?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We check whether stock is available, then decrement it.',
+      why: 'Two requests can both pass the check before either decrements. This is the same race in every domain: overselling, duplicate usernames, double-applied discounts.',
+      instead:
+        'Make it one atomic operation with the condition inside the write, and check the affected row count. If it is zero, the condition failed and the sale did not happen.',
+    },
+    {
+      mistake: 'We wrap it in a transaction, so it is safe.',
+      why: 'A transaction gives atomicity — the writes land together — but at the default isolation level it does not prevent another transaction from committing between your read and your write. Atomicity is not isolation.',
+      instead:
+        'Say which isolation level you rely on, or design so the answer does not matter: a conditional write is safe at every level.',
+    },
+    {
+      mistake: 'We take a distributed lock so only one server can do it.',
+      why: 'You have added a network dependency, a lease, a fencing requirement and a new failure mode, to solve something the database already adjudicates correctly and atomically for a single row.',
+      instead:
+        'Use the database when the data lives in one database. Reach for distributed coordination when the thing being protected genuinely spans systems.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['lost-update', 'optimistic-concurrency']}
+  prompt="Two requests both read remaining = 1, both check that it is greater than zero, and both write remaining = 0. Two tickets sold, one seat. Which fix removes the race without introducing a lock?"
+  options={[
+    {
+      id: 'a',
+      text: 'Wrap both statements in a transaction',
+      implies: 'You are relying on transactions to provide isolation as well as atomicity.',
+      why: 'At the common default isolation levels, another transaction can still commit between your read and your write. The two writes land atomically but the interleaving that caused the bug is untouched.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'UPDATE ... SET remaining = remaining - 1 WHERE id = ? AND remaining > 0, then check the affected row count',
+      implies: 'You collapsed the read and the write into one atomic operation with the condition inside it.',
+      why: 'The database evaluates the condition and performs the write as a single indivisible step, so there is no gap to interleave into. The second request updates zero rows and you report that the tickets are gone. No lock is held across application logic.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Re-read the value after writing and correct it if it is wrong',
+      implies: 'You are trying to detect the problem after the fact.',
+      why: 'By then the ticket has been sold and possibly confirmed to the customer. Compensating after an irreversible action is far more expensive than preventing the interleaving, and the correction itself races with other requests.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer notes that checking the affected row count is the load-bearing half. An UPDATE that matches zero rows is not an error at the database level, so code that ignores the row count will happily confirm a sale that never happened."
+/>
+
+<Check
+  concepts={['locking', 'optimistic-concurrency']}
+  prompt="A single popular product row receives 5,000 concurrent purchase attempts per second. You have optimistic concurrency with retries. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'It works fine: conflicts are detected and retried',
+      implies: 'You are applying the low-contention model to a high-contention case.',
+      why: 'With everything contending on one row, nearly every attempt conflicts. Each retry re-reads and re-writes, so the system does many times the work for the same throughput, and load rises exactly when it is least welcome.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Retry rates climb steeply and throughput collapses; the row is the bottleneck regardless of server count',
+      implies: 'You recognise that optimistic concurrency degrades under contention rather than degrading gracefully.',
+      why: 'Optimistic control assumes conflicts are rare. When they are the norm, the wasted work grows superlinearly and adding application servers makes it worse, because more concurrency means more conflicts.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The database will serialise them automatically and it will be slow but correct',
+      implies: 'You are assuming the engine converts this into queueing.',
+      why: 'It stays correct, but with optimistic control the engine is not queueing — it is rejecting and letting you retry. The wasted work is real, not just a delay.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer changes the data model rather than the mechanism: split the count into K sub-rows so contention divides by K and reads sum them, or move to an append-only reservation model where the total is derived. It also notes that a single conditional decrement, while atomic, still serialises on the same row and so has the same throughput ceiling."
+/>
+
+<DebugCheck
+  concepts={['lost-update', 'isolation-levels', 'optimistic-concurrency']}
+  symptom="A loyalty-points balance is occasionally wrong. Roughly one customer a day ends up with fewer points than the sum of their transactions. There are no errors and every transaction is recorded correctly."
+  observations={[
+    { label: 'Transaction history', detail: 'Complete and correct. Every award and redemption is present with the right amount.' },
+    { label: 'Frequency', detail: 'Only for customers with two or more point events within about a second of each other.' },
+    { label: 'Application code', detail: 'Reads the current balance, adds the delta in application code, writes the new balance back.' },
+    { label: 'Isolation level', detail: 'Read committed, which is the default for this database.' },
+    { label: 'Load correlation', detail: 'Incidence rises sharply during promotional campaigns, when point events cluster.' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'A lost update. Two transactions read the same balance, each adds its own delta, and the second write overwrites the first.',
+      implies: 'You recognise a read-modify-write race rather than a data or ordering fault.',
+      why: 'Both transactions read 100, one writes 110 and the other writes 120, and the result is 120 instead of 130. Read committed permits this: neither transaction read uncommitted data and neither is wrong on its own. The correlation with events close in time is the signature, and the intact transaction history is what proves the individual writes were fine.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Transactions are being applied out of order, so an older balance wins.',
+      implies: 'You are looking for an ordering problem.',
+      why: 'Ordering would explain a wrong final value if the writes carried absolute balances computed at different times — which is nearly what is happening. But the mechanism is not reordering: both writes are applied in the order they arrive, and the second one simply computed its value from a balance that was already stale when it read it.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A replication lag issue, where the write went to a replica that had not caught up.',
+      implies: 'You are attributing it to reading a stale replica.',
+      why: 'Replica lag produces stale reads and would be a plausible cause if reads were served from a follower. But this happens between two transactions against the same primary within a second, and the isolation level plus the read-modify-write shape explain it entirely without any replication involved.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer gives the fix and ranks the options. Best: make the write itself do the arithmetic — an atomic increment, so the database never has to be told the new value. Next: a conditional update on the version read, retried on conflict, which is optimistic concurrency and works when the new value cannot be expressed as a delta. Last resort: SELECT FOR UPDATE, which is correct and holds a lock for the duration of the transaction. It also notes that raising the isolation level to repeatable read would turn the silent corruption into a visible error, which is an improvement even if you change nothing else."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Isolation levels as implemented, not as specified', sourceId: 'postgres-docs' },
+    {
+      label: 'Weak isolation and the anomalies each level permits',
+      sourceId: 'ddia',
+      note: 'The clearest available treatment of what each level actually allows, with concrete examples.',
+    },
+    { label: 'InnoDB locking and transaction behaviour', sourceId: 'mysql-docs' },
+    {
+      label: 'Next: the same race when the two writes are in different systems',
+      href: '/concepts/dual-write',
+    },
+  ]}
+/>

@@ -1,0 +1,402 @@
+---
+id: talking-to-another-machine
+title: Talking to Another Machine
+level: 1
+module: l1-anatomy
+order: 2
+summary: A remote call looks like a function call and is nothing like one. Every interface style is a different attempt to hide that, and every one of them leaks.
+difficulty: core
+minutes: 26
+prerequisites: [what-a-server-is-doing]
+concepts: [monolith, rpc, grpc, graphql, n-plus-one, batching, versioning]
+unlocks: [microservices, service-boundary, coupling, api-gateway, backward-compatibility, api-design]
+patterns: [expand-contract]
+failures: [pool-exhaustion]
+sources: [rfc9110, building-microservices, fundamentals-arch, ddia, martin-fowler, mdn-http]
+status: reviewed
+---
+
+## The problem
+
+Someone splits the order code and the pricing code into two services. The call site barely changes:
+
+    price = pricing.quote(item, customer)
+
+One line, same shape as before. The team ships it.
+
+A month later the order page is slow, and nobody can say why. It turns out that rendering a cart
+of twelve items calls pricing twelve times, sequentially. Then pricing has an incident, and orders
+stop — not because orders are broken, but because a call that used to be a jump within one process
+now has a way to fail. Then someone renames a field, and a service that was not redeployed starts
+returning nulls.
+
+Nothing here is a bad decision in isolation. All of it follows from one line of code looking
+unchanged while everything underneath it changed.
+
+## Intuition
+
+Asking a colleague sitting next to you a question is instant and reliable. If they hear you, they
+answer. If they do not, you notice immediately.
+
+Asking a colleague in another building is a different act, even though the sentence is identical.
+It takes time. They might be at lunch. Your message might arrive and their reply might not, and
+from where you are sitting those two look exactly the same. If you have twelve questions you would
+walk over once and ask all twelve, not walk twelve times.
+
+The mistake is not going to the other building. Sometimes you must. The mistake is **using the same
+sentence and expecting the same experience**, and writing code as though the distance is a detail.
+
+Four things change the moment a call leaves the process, and none of them are visible at the call
+site:
+
+- **Time.** Nanoseconds become milliseconds. Four orders of magnitude.
+- **Partial failure.** A local call either happens or throws. A remote call can time out after the
+  work was done, and you cannot tell which.
+- **Types.** A compiler checked the local call. Nothing checks the remote one at build time unless
+  you deliberately arrange it.
+- **Deployment.** The two sides now ship separately, so at every moment some caller is running
+  against a version of the interface that is not the current one.
+
+## Concretely
+
+<Example title="The same page, three interface shapes">
+
+A cart page needs, for each of twelve items, a price, a stock figure and a name.
+
+**Twelve sequential calls.** Each round trip is 20 ms, so 240 ms of pure waiting before rendering
+begins. Nothing is slow — every service responds promptly — and the page is slow anyway. This is
+the n+1 problem, and its distinguishing symptom is that no individual component looks unhealthy.
+
+**One batched call.** `quote(items, customer)` takes a list and returns a list. One round trip:
+20 ms. The saving is not efficiency, it is a change of shape — the interface now accepts the
+question the caller actually has instead of a piece of it.
+
+**One flexible query.** The client asks for exactly the fields it wants across several entities and
+the server assembles the response. The over-fetching problem disappears from the wire — and moves
+inside the server, which must now avoid making twelve internal calls to serve one external one.
+The n+1 problem is not solved by the query language; it is relocated to where it is less visible.
+
+</Example>
+
+## Formal explanation
+
+Start from the baseline. A <C id="monolith" /> is one deployable unit where calls between modules
+are in-process. Its properties are frequently misremembered as weaknesses: calls are free, refactoring
+across a boundary is a compiler-checked operation, and there is no partial failure between modules.
+Those are strong properties, and splitting a system gives every one of them up. The reason to split
+is that separate teams can deploy separately and scale separately — an organisational and
+operational benefit purchased with a technical cost, not a technical improvement.
+
+<C id="rpc" /> makes a remote call look like a local one. Historically that was the explicit goal,
+and it is exactly where the trouble comes from: the abstraction hides latency and partial failure,
+which are the two things a caller most needs to know about.
+
+<C id="grpc" /> is a modern instance that keeps the local-call shape while being honest about the
+rest: an interface definition generates client and server code, so the contract is checked at build
+time; it uses a compact binary encoding, so payloads are small; and it uses long-lived multiplexed
+connections, so many calls share one connection without queueing behind each other. The cost is
+that the contract is a build-time artefact — callers need generated code, and browsers cannot
+speak it without a translating proxy.
+
+REST over HTTP takes the opposite position. The unit is a resource, the operations are the HTTP
+methods, and the contract is a document rather than a compiler. It is inspectable, cacheable by
+ordinary intermediaries (<Cite id="rfc9110" />), and works everywhere — at the price of a chatty
+shape, because one resource per request is the model.
+
+<C id="graphql" /> moves the choice of what to fetch to the client, which removes over-fetching and
+under-fetching from the wire in one step. What it gives up is worth stating plainly: response
+caching by intermediaries largely stops working, because the response depends on a query rather
+than on a URL; and the server's cost per request becomes unpredictable, because clients can now
+ask for expensive things.
+
+Two failure patterns cut across all of these.
+
+The <C id="n-plus-one" /> problem: fetching a list, then making one call per element. It appears
+identically in a database (one query per row), in a service mesh (one call per item) and in a
+GraphQL resolver (one lookup per field). The fix is always the same shape — **make the interface
+accept the whole question** — which is what <C id="batching" /> means here. Batching is not a
+performance trick applied afterwards; it is an interface design decision that has to be available
+in the contract.
+
+And <C id="versioning" />. Once two sides deploy independently, every change is live alongside the
+version before it. Additive changes — new optional fields, new endpoints — are safe. Removals and
+meaning changes are not, and they need the expand-contract sequence: add the new thing, migrate
+callers, verify nobody uses the old thing, then remove it. Skipping the verification step is how
+you discover which internal client nobody documented.
+
+## Architecture
+
+<Arch
+  caption="The call site looks identical at every stage. Everything behind it changes."
+  columns={[
+    { title: 'Caller', nodes: [{ id: 'order', label: 'Order code' }] },
+    { title: 'Boundary', nodes: [{ id: 'inproc', label: 'In-process call', note: 'nanoseconds' }, { id: 'net', label: 'Network call', note: 'milliseconds, can fail', tone: 'accent' }] },
+    { title: 'Callee', nodes: [{ id: 'pricing', label: 'Pricing' }] },
+    { title: 'Its data', nodes: [{ id: 'db', label: 'Pricing store' }] },
+  ]}
+  edges={[
+    { from: 'order', to: 'inproc' },
+    { from: 'inproc', to: 'pricing' },
+    { from: 'order', to: 'net' },
+    { from: 'net', to: 'pricing' },
+    { from: 'pricing', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'One process',
+      show: ['order', 'inproc', 'pricing', 'db'],
+      because:
+        'A function call. Free, type-checked, and it cannot half-happen. Twelve of them in a loop is fine, which is why the loop got written.',
+    },
+    {
+      label: 'Across the network',
+      show: ['order', 'net', 'pricing', 'db'],
+      because:
+        'The same line of code now costs a round trip, can time out after the work was done, and is checked by nothing at build time. The loop that was fine is now 240 milliseconds and a new dependency for availability.',
+    },
+    {
+      label: 'Shape the interface for the caller',
+      show: ['order', 'net', 'pricing', 'db'],
+      because:
+        'The interface takes the whole list and returns the whole list, so the caller asks once. Timeouts, retries and a fallback belong here too, because a remote call needs an answer for "it did not reply", and a local call never did.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One service',
+      behaviour: 'Calls are free and compiler-checked. Interface design barely matters because refactoring is safe.',
+      firstToBreak: 'Nothing technical. The pressure that eventually splits it is usually deployment coupling between teams.',
+    },
+    {
+      scale: 'A few services',
+      behaviour:
+        'Round trips appear in latency budgets. Chatty interfaces show up as slow pages built from fast services.',
+      firstToBreak: 'The page that fans out to several services and waits for all of them.',
+    },
+    {
+      scale: 'Tens of services',
+      behaviour:
+        'One user action crosses many boundaries. Latency is the sum of a chain, and availability is the product of the chain.',
+      firstToBreak:
+        'Availability arithmetic. Ten dependencies at 99.9% give 99% if all are required, which is nine hours a year of outages you did not cause.',
+    },
+    {
+      scale: 'Hundreds',
+      behaviour:
+        'No individual understands the call graph. Interface versioning and compatibility become continuous work rather than occasional events.',
+      firstToBreak:
+        'A field removal that was believed safe, breaking a caller nobody knew about. This is why the deprecation process has to be evidence-based.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'N plus one across a service boundary',
+      symptom: 'A page is slow while every service reports healthy latency and no errors.',
+      cause: 'A loop makes one remote call per item, so page latency is the item count times the round trip.',
+      mitigation: 'Batch the interface so it accepts a list. Detect it by counting downstream calls per inbound request, which is the metric that makes it visible.',
+    },
+    {
+      what: 'Ambiguous timeout',
+      symptom: 'A duplicate charge, a duplicate order, or two identical records created seconds apart.',
+      cause: 'A call timed out after the work completed. The caller retried, and the callee had no way to recognise the retry.',
+      mitigation: 'Accept an idempotency key on any operation with an effect. A remote call needs a defined answer for "no reply", and the only safe ones are retry-with-a-key or fail.',
+    },
+    {
+      what: 'Silent contract drift',
+      symptom: 'A field is null in production and nowhere in any test.',
+      cause: 'The producer changed the meaning or optionality of a field, and nothing enforces the contract at build time across two independent deployments.',
+      mitigation: 'A machine-checked schema plus contract tests run against the real producer. A written specification is not a check.',
+    },
+    {
+      what: 'Availability multiplied',
+      symptom: 'Your service misses its target although your own code never fails.',
+      cause: 'Every synchronous dependency multiplies into your availability, and the arithmetic was never done.',
+      mitigation: 'Make dependencies optional where the product allows — a cached price, a default, a degraded panel — so a failure downgrades the response rather than failing it.',
+    },
+    {
+      what: 'Unbounded query cost',
+      symptom: 'One client request occupies the server for seconds and the pattern is not in any dashboard.',
+      cause: 'A flexible query language lets a client request an expensive traversal that no endpoint would ever have exposed.',
+      mitigation: 'Query depth and complexity limits, per-client cost budgets, and persisted queries so only known shapes are accepted.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Expose a batched, coarse-grained interface rather than fine-grained per-entity calls"
+  options={[
+    'Fine-grained resources: one call per entity, cacheable and simple',
+    'Batched operations: the interface accepts and returns lists',
+    'A flexible query language: the client states exactly what it needs',
+    'Keep it in one process: no interface at all',
+  ]}
+  why="Remote calls cost a round trip each, and callers almost never want exactly one entity. An interface built around single entities forces every caller into a loop, and the loop is invisible at the call site where it is written."
+  gain="Page latency stops scaling with item count. Downstream call volume falls by the batch factor. The interface now expresses the question callers actually have, which usually also makes it easier to read."
+  sacrifice="Coarse responses cache poorly, because a batch of twelve is not a reusable cache entry. Partial failure within a batch needs a defined answer. And a coarse interface leaks the caller's use case into the producer's contract, which couples them more tightly."
+  failureModes={[
+    'One bad element failing an entire batch, or a partial result the caller ignores',
+    'Batch size unbounded, so a caller can request ten thousand items and occupy the server',
+    'Cacheability lost, which sometimes costs more than the round trips saved',
+  ]}
+  operationalBurden="Low. The real burden is design discipline: batch endpoints multiply as callers appear with slightly different needs, and without care the interface becomes one endpoint per screen."
+  cost="Negligible directly. The indirect cost is coupling, because each batch shape encodes a caller's needs into the producer's contract."
+  whenNot="When responses are highly cacheable and mostly hit — a fine-grained resource served from cache beats a batch that must be computed. When callers genuinely want one entity at a time. And when the two components are not separately deployed or separately scaled, in which case the correct interface is a function call in one process, and introducing a network boundary buys latency, failure modes and versioning work for nothing."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc9110">
+HTTP defines which methods are safe and which are idempotent. A safe method is expected not to
+change state, and an idempotent method may be repeated with the same effect as a single
+invocation. These properties are what allow intermediaries to cache and retry without coordination.
+</Claim>
+
+<Claim label="convention" source="building-microservices">
+Splitting a system into independently deployable services is presented as an organisational and
+operational decision with real technical costs — network latency, partial failure, and versioning
+across independent deployments — rather than as a technical improvement in itself.
+</Claim>
+
+<Claim label="convention" source="fundamentals-arch">
+Interface granularity is described as a primary architectural decision: fine-grained interfaces
+produce chatty communication and coupling through call volume, while coarse-grained interfaces
+couple through shared shapes. Neither direction is free.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+The observation that a remote call cannot be made to look like a local one — because latency,
+partial failure and independent evolution are visible to the caller whether or not the syntax
+hides them — is long-standing and widely repeated in architecture writing.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Independently deployed services mean old and new versions of code and data formats coexist in
+production. Compatibility must therefore run in both directions: new code reading old data, and
+old code reading data written by new code.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you treat a service boundary as a cost with a justification, rather than as a default. Drawing eight services for a system that one team will operate is a common and revealing over-reach."
+  depth="Be able to say what a boundary costs — latency, partial failure, versioning — and what it buys. Recognise n+1 across services, not only in a database. Have an answer for what happens when a call times out after the work was done."
+  followUps={[
+    'Your call times out. Did the work happen? What does the caller do?',
+    'The page is slow and every service is fast. What do you look at first?',
+    'You want to remove a field from a response. What is the sequence?',
+    'Why not keep all of this in one service?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Splitting into services because it is the modern architecture.',
+      why: 'Every boundary adds a round trip, a failure mode, a deployment dependency and a versioning obligation. Those are paid immediately; the benefits — independent deploys, independent scaling, team autonomy — only arrive if separate teams actually own the pieces.',
+      instead:
+        'Name what the boundary buys in this specific system. If the answer is not about deployment, scaling or ownership, the boundary is a cost with no purchaser.',
+    },
+    {
+      mistake: 'Treating a timeout as a failure.',
+      why: 'A timeout means you do not know. The work may have completed and the reply been lost. Retrying an unknown outcome without an idempotency key is how one action becomes two.',
+      instead:
+        'Classify outcomes as success, definite failure, and unknown. Give the unknown case an explicit design: an idempotency key, a reconciliation pass, or a decision to fail rather than retry.',
+    },
+    {
+      mistake: 'Versioning by putting v2 in the URL and hoping.',
+      why: 'A version number does not tell you when v1 can be removed. Without knowing who still calls it, the old version lives forever and every change is made twice.',
+      instead:
+        'Prefer additive change. When a break is unavoidable, run both, instrument usage of the old path per caller, and remove it only when the number reaches zero and stays there.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['n-plus-one', 'batching']}
+  prompt="A product listing page renders in 900 ms. Every downstream service reports p99 under 15 ms and no errors. What is the most likely cause?"
+  options={[
+    {
+      id: 'a',
+      text: 'The page makes one call per item, sequentially, so latency is item count times round trip',
+      implies: 'You recognise the shape where fast components produce a slow result.',
+      why: 'Sixty items at 15 ms each is 900 ms, and every one of those calls is fast and successful. This is the n+1 pattern, and its signature is exactly this: nothing looks unhealthy anywhere, because nothing is. The metric that would show it is downstream calls per inbound request, which most dashboards do not have by default.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'A downstream service is overloaded and the metrics are misleading',
+      implies: 'You are looking for a broken component.',
+      why: 'The p99 figures are per call and they are honest. Assuming instrumentation is wrong before checking call volume is a habit that costs hours, and here it would find nothing wrong because nothing is wrong with any single call.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Serialisation overhead is dominating',
+      implies: 'You are looking at per-call cost rather than call count.',
+      why: 'Encoding cost is real and worth reducing, but it is a fraction of a millisecond per call at these sizes. It cannot account for 900 ms. The multiplier is the number of calls, and only the number of calls.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer proposes the fix and the detection together: batch the interface so the page asks once, and add a per-request downstream call count as a standing metric so the next instance of this is found by a dashboard rather than by a user. It also notes that parallelising the sixty calls is a partial fix — it removes the sequential multiplication but leaves sixty times the load on the downstream service, which shifts the problem from your latency to their capacity."
+/>
+
+<Check
+  concepts={['versioning']}
+  prompt="You need to rename a field in a response that several teams consume. What sequence is safe?"
+  options={[
+    {
+      id: 'a',
+      text: 'Add the new field alongside the old one, migrate callers, verify the old field has no readers, then remove it',
+      implies: 'You are treating an independently deployed interface as something with live readers you cannot see.',
+      why: 'Additive change is always safe because old callers are unaffected. The step that people skip is verification: instrument reads of the old field per caller and remove it only when that count is zero and has stayed zero. Without evidence, removal is a guess about who is listening.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Announce the change, give a deadline, and remove the field after it passes',
+      implies: 'You are relying on a social process to establish a technical fact.',
+      why: 'Announcements reach the teams you know about and the people currently reading that channel. Batch jobs, a mobile version from last year, and an internal tool nobody owns will all miss it. The deadline tells you when you decided to break things, not whether anything will break.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Create a v2 of the endpoint with the new name and leave v1 in place',
+      implies: 'You are isolating the change, which does avoid breaking anyone.',
+      why: 'Nothing breaks, and now every future change is made twice, forever, because there is still no mechanism that tells you when v1 can go. Versioning without a removal criterion converts a one-off migration into permanent duplicated work.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names this as expand-contract and points out that the same sequence governs database columns, message schemas and configuration keys — one pattern, not three. It also notes the direction of compatibility that people forget: not only must new code read old data, old code must survive data written by new code, because during a rollout both are running at once."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'HTTP semantics: safe and idempotent methods, and why they matter for retries', sourceId: 'rfc9110' },
+    { label: 'Service boundaries as an organisational decision with technical costs', sourceId: 'building-microservices' },
+    { label: 'Interface granularity and its coupling consequences', sourceId: 'fundamentals-arch' },
+    { label: 'Backward and forward compatibility across independent deploys', sourceId: 'ddia' },
+    { label: 'Next: where one machine stops', href: '/lessons/finding-the-ceiling' },
+  ]}
+/>

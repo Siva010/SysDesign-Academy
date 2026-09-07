@@ -1,0 +1,411 @@
+---
+id: how-failures-spread
+title: How One Slow Dependency Becomes an Outage
+level: 5
+module: l5-spread
+order: 1
+summary: Large outages are rarely caused by the initial failure, but by the response to it. Retries, failover and health checks all add load at the worst moment.
+difficulty: advanced
+minutes: 28
+prerequisites: [how-reliable-is-reliable-enough, littles-law]
+concepts: [cascading-failure, retry-amplification, thundering-herd, connection-exhaustion, throughput-vs-goodput, queue-depth, coordinated-omission, tail-latency]
+unlocks: [circuit-breaker, load-shedding, bulkhead, retry-budget]
+patterns: [bulkhead, circuit-breaker]
+failures: [retry-storm, pool-exhaustion, health-check-collapse, reconnect-storm]
+sources: [sre-book, aws-builders-library, aws-jitter, release-it, tail-at-scale]
+status: reviewed
+---
+
+## The problem
+
+One dependency — a recommendation service, entirely optional — gets slow. Not down. Slow: p99
+goes from 30 ms to 4 seconds.
+
+Twenty minutes later the whole product is down. Not the recommendations. Everything. Checkout,
+login, the home page.
+
+The recommendation service never failed. It got slow, and the system's response to slowness did
+the rest.
+
+This is the most important failure pattern in production systems, and almost none of it is
+visible in a design diagram.
+
+## Intuition
+
+Follow the chain, one step at a time.
+
+1. The dependency slows to 4 seconds.
+2. Your service calls it with a 10-second timeout, so each request now occupies a worker for 4
+   seconds instead of 30 ms.
+3. By Little's law, concurrency is arrival rate times service time. Service time went up 130x,
+   so required concurrency went up 130x. Your worker pool did not.
+4. Workers are all busy waiting. Requests that do not need recommendations at all queue behind
+   them, because they need a worker too.
+5. Your service is now slow for every endpoint. Its callers time out and **retry**.
+6. Retries triple the arrival rate at a service that is already saturated.
+7. Health checks time out. The load balancer removes instances, concentrating the same traffic
+   on fewer machines.
+8. The remaining instances fail faster.
+
+Notice that steps 5, 6 and 7 are all things the system did **in response to the problem**. Every
+one of them made it worse.
+
+**The initial failure was small and bounded. The response was unbounded.**
+
+## Concretely
+
+<Example title="Retry amplification, in numbers">
+
+Three layers, each retrying three times on failure.
+
+- The browser retries: 3 attempts.
+- The API gateway retries: 3 attempts per browser attempt.
+- The service retries its dependency: 3 attempts per gateway attempt.
+
+One user action becomes up to 27 requests at the bottom of the stack.
+
+Under normal conditions nothing retries, so the amplification is invisible. It appears only when
+the bottom layer starts failing — which is precisely when it can least absorb 27 times the
+load.
+
+<Claim label="fact" source="aws-jitter">
+Retries without jitter cause clients to synchronise, so retry attempts arrive in waves rather
+than spread out. Adding randomised delay spreads the load and materially improves recovery.
+</Claim>
+
+The second-order effect is worse than the arithmetic suggests: a service under 27x load fails
+more requests, which triggers more retries, which is a feedback loop. Systems in this state
+often cannot recover even after the original cause is fixed, because the retry load alone is now
+enough to keep them down. Recovery requires shedding load or stopping traffic entirely.
+
+</Example>
+
+## Formal explanation
+
+<C id="cascading-failure" /> is failure that spreads because the response to a local problem
+consumes resources elsewhere. Four mechanisms do most of the work:
+
+**Resource exhaustion through waiting.** A slow dependency does not consume CPU; it consumes
+*concurrency*. Workers, connections and memory are held by requests that are doing nothing but
+waiting. This is why the classic signature is high latency with low CPU.
+
+**<C id="retry-amplification" />.** Retries multiply load exactly when capacity is lowest. Each
+layer that retries independently multiplies the layer below.
+
+**<C id="thundering-herd" />.** Synchronised behaviour. Clients that all failed at the same
+moment all retry at the same moment. Caches that were all populated together all expire
+together. A restarted service is hit by every client's reconnection at once.
+
+**Load-shedding-by-accident.** Health checks remove instances, so the same traffic lands on
+fewer machines, so those fail their health checks too. The mechanism intended to route around
+failure manufactures it instead.
+
+<Callout kind="warn" title="Throughput can look fine while goodput is zero">
+A saturated service can be completing thousands of requests per second while every caller has
+already timed out and stopped waiting. <C id="throughput-vs-goodput">Goodput</C> — work that
+somebody still wants by the time it is finished — is the number that matters, and a throughput
+graph will not show you that it has collapsed.
+</Callout>
+
+<Deeper title="Why timeouts must come from the budget, not the dependency">
+
+The instinct is to set a timeout from observed dependency latency: &ldquo;it usually responds in
+30 ms, so 10 seconds is generous&rdquo;.
+
+That reasoning is backwards. The right question is: **how long is the caller willing to wait?**
+
+If the user-facing request has a 2-second budget and this call is one of four in sequence, this
+call gets a few hundred milliseconds. A 10-second timeout on a call inside a 2-second budget is
+not generous — it is a resource leak, because the caller has already gone and your worker is
+still held.
+
+The discipline:
+
+1. Start from the user-facing latency objective.
+2. Subtract what you need for your own work.
+3. Divide the rest among sequential calls.
+4. Propagate a **deadline**, not a timeout, so each hop knows how much of the budget remains
+   rather than restarting the clock.
+
+Deadline propagation is the version that composes. With plain timeouts, four hops each allowing
+one second means the last hop can still be working three seconds after the client gave up.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The failure travels upward through the response to it, not through the dependency itself."
+  columns={[
+    { title: 'Users', nodes: [{ id: 'user', label: 'Clients', note: 'retry on timeout' }] },
+    { title: 'Edge', nodes: [{ id: 'lb', label: 'Load balancer', note: 'removes instances' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Your service', note: 'workers all waiting', tone: 'accent' }] },
+    { title: 'Dependencies', nodes: [{ id: 'slow', label: 'Slow dependency', note: 'optional!' }, { id: 'db', label: 'Database', note: 'healthy' }] },
+  ]}
+  edges={[
+    { from: 'user', to: 'lb', label: 'retries', tone: 'danger' },
+    { from: 'lb', to: 'app' },
+    { from: 'app', to: 'slow', label: '4s each', tone: 'danger' },
+    { from: 'app', to: 'db', label: 'starved' },
+  ]}
+  stages={[
+    {
+      label: 'Normal',
+      show: ['user', 'lb', 'app', 'slow', 'db'],
+      because:
+        'Every call is fast. The optional dependency is one of several, and nobody thinks about what happens if it stops being fast.',
+    },
+    {
+      label: 'One dependency slows',
+      show: ['user', 'lb', 'app', 'slow', 'db'],
+      because:
+        'Workers are held waiting. Requests that never touch the slow dependency queue behind those that do, so a partial failure becomes a total one inside your own service.',
+    },
+    {
+      label: 'The response makes it worse',
+      show: ['user', 'lb', 'app', 'slow', 'db'],
+      because:
+        'Clients retry, multiplying load. Health checks fail, so instances are removed and the same traffic lands on fewer machines. Each mitigation adds load at the worst moment.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Small system, few dependencies',
+      behaviour:
+        'A dependency failure is visible and localised. Someone notices and fixes it.',
+      firstToBreak: 'The dependent feature, and only that feature.',
+    },
+    {
+      scale: 'Several services, shared pools',
+      behaviour:
+        'One slow dependency can consume a shared worker pool, affecting unrelated endpoints.',
+      firstToBreak:
+        'Endpoints that have nothing to do with the failure, which is what makes diagnosis hard.',
+    },
+    {
+      scale: 'Deep call chains with retries',
+      behaviour:
+        'Amplification is multiplicative across layers. A modest failure rate at the bottom becomes a load multiplier.',
+      firstToBreak:
+        'The deepest shared service, then everything depending on it.',
+    },
+    {
+      scale: 'Large fleet, aggressive health checks',
+      behaviour:
+        'Instance removal concentrates load, causing more removals. Capacity falls while load rises.',
+      firstToBreak:
+        'The entire service, from a cause that affected only part of it.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Retry storm',
+      symptom:
+        'A brief dependency failure turns into a sustained outage that continues after the original cause is fixed.',
+      cause:
+        'Retries at multiple layers multiply load; the load itself is now enough to keep the service down.',
+      mitigation:
+        'Retry budgets capping retries as a fraction of traffic, exponential backoff with jitter, retry at one layer only, and circuit breakers to stop calling a dependency that is clearly broken.',
+    },
+    {
+      what: 'Worker starvation from a slow optional dependency',
+      symptom:
+        'Every endpoint is slow, including those that do not touch the failing dependency. CPU is low.',
+      cause:
+        'A shared worker pool. Requests waiting on the slow call hold workers that other requests need.',
+      mitigation:
+        'Bulkheads — separate pools per dependency — plus timeouts derived from the latency budget, so a slow call is abandoned before it consumes the pool.',
+    },
+    {
+      what: 'Health-check-induced capacity collapse',
+      symptom:
+        'Instances are removed from the pool one after another until none remain, during a partial degradation.',
+      cause:
+        'Health checks verify a shared dependency, so all instances fail simultaneously; or they time out under load, which the load itself caused.',
+      mitigation:
+        'Keep shared dependencies out of health checks. Configure the balancer to fail open rather than removing every instance. Prefer degrading to withdrawing.',
+    },
+    {
+      what: 'Recovery causing a second outage',
+      symptom:
+        'The service comes back, is immediately overwhelmed, and falls over again. Repeatedly.',
+      cause:
+        'Every client reconnects and every queued retry arrives at once, against a cold cache and empty connection pools.',
+      mitigation:
+        'Bring capacity back gradually, shed load during recovery, and require clients to back off with jitter. Warm caches before accepting full traffic.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Propagate a deadline through the call chain instead of setting independent timeouts"
+  options={[
+    'No timeouts: wait indefinitely',
+    'Independent per-call timeouts chosen from observed dependency latency',
+    'A deadline set at the edge and propagated, each hop passing the remainder',
+  ]}
+  why="With independent timeouts, a chain of four hops each allowing one second can still be working three seconds after the client gave up. Every second of that is a worker held for a result nobody will read."
+  gain="Work stops when it stops being useful, so goodput is protected. Concurrency requirements stay bounded under dependency slowness, and the whole chain fails fast together rather than in confusing stages."
+  sacrifice="Every service and client library must understand and propagate the deadline, which is a cross-cutting change. Requests that would have succeeded slightly late are now cancelled."
+  failureModes={[
+    'A service that ignores the deadline and restarts the clock, silently breaking the chain',
+    'Deadlines set too tight, cancelling work that would have succeeded',
+    'Cancellation not actually releasing resources, so the benefit is theoretical',
+  ]}
+  operationalBurden="Moderate and cross-cutting. It requires framework support and a convention every service follows. Retrofitting it into an existing estate is a real project."
+  cost="No infrastructure cost. Engineering cost is in the plumbing and in the discipline to keep it correct as new services are added."
+  whenNot="For genuinely asynchronous background work with no waiting caller, a deadline is meaningless — the work should complete whenever it can. Deadlines belong on the synchronous request path, where somebody is waiting."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="sre-book">
+Google's SRE writing documents cascading failure as a distinct pattern in which a system's
+response to overload — retries, failover, and reduced capacity from health checking — amplifies
+the original problem. Recovery frequently requires reducing load rather than adding capacity.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Timeouts derived from latency budgets, retry budgets that cap retries as a proportion of
+traffic, and load shedding during overload are standard practice for services operating at
+scale. The common thread is bounding the system's own response to failure.
+</Claim>
+
+<Claim label="fact" source="aws-jitter">
+Adding randomised jitter to backoff spreads retry attempts over time rather than allowing
+clients to synchronise into waves, and measurably improves recovery under contention.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Stability patterns — timeouts, circuit breakers, bulkheads — exist specifically to bound the
+propagation of failure between components. Their common purpose is to make one component's
+failure survivable by its callers.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that the system's response to failure is usually the cause of the outage. This is one of the strongest senior signals available: candidates who describe only the initial failure have not operated systems at scale."
+  depth="Be able to trace the chain from slow dependency to total outage, naming each amplification step. Know retry amplification arithmetic and the health-check trap."
+  followUps={[
+    'An optional dependency slows to 4 seconds. Walk me through the next 20 minutes.',
+    'Why does the service fall over again immediately after recovering?',
+    'Three layers each retry three times. What does the bottom see?',
+    'Why might removing unhealthy instances make things worse?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We retry failed requests to improve reliability.',
+      why: 'Retries improve reliability for transient, isolated failures and multiply load during correlated ones. They are most dangerous precisely when they are most tempting.',
+      instead:
+        'Retry with backoff and jitter, cap retries as a fraction of traffic, retry at one layer only, and stop retrying entirely when a circuit breaker indicates the dependency is broken rather than flaky.',
+    },
+    {
+      mistake: 'We set a generous timeout so we do not fail requests unnecessarily.',
+      why: 'A timeout longer than the caller will wait is not generous — it holds a worker for a result nobody will read. Generous timeouts are how a slow dependency consumes a service.',
+      instead:
+        'Derive timeouts from the user-facing latency budget and propagate a deadline so the whole chain gives up together.',
+    },
+    {
+      mistake: 'Add more capacity when the service is struggling.',
+      why: 'During a cascading failure, more capacity often means more concurrent load on the saturated dependency, which prolongs the failure. Recovery usually requires less load, not more capacity.',
+      instead:
+        'Shed load first to restore goodput, then restore capacity gradually. Adding capacity into an active cascade frequently extends it.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['cascading-failure', 'littles-law', 'connection-exhaustion']}
+  prompt="An optional recommendation service slows from 30 ms to 4 seconds. Why does your checkout endpoint, which never calls it, become unavailable?"
+  options={[
+    {
+      id: 'a',
+      text: 'Checkout must share a database with recommendations',
+      implies: 'You are looking for a shared data dependency.',
+      why: 'Possible, and not the usual mechanism. The classic path is a shared concurrency resource inside your own service rather than a shared backend.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Requests waiting on the slow dependency hold workers from a shared pool, so checkout requests queue behind them',
+      implies: 'You identified concurrency as the shared resource being exhausted.',
+      why: 'Service time went up 130-fold, so by Little\'s law the concurrency required to sustain the same arrival rate went up 130-fold. The pool is fixed, so every worker ends up waiting on the slow call and checkout cannot get one. CPU stays low throughout, which is why this is so often misdiagnosed.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The load balancer is routing checkout traffic to overloaded instances',
+      implies: 'You are looking at routing.',
+      why: 'It contributes later — health checks fail and instances are removed, concentrating load — but that is the second-order effect. The first-order cause is worker starvation inside the service.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names both the immediate fix and the structural one: a timeout derived from the latency budget so the call is abandoned in a few hundred milliseconds, and a bulkhead giving the recommendation dependency its own bounded pool so it can never consume the workers checkout needs. It also notes that an optional dependency should be behind a circuit breaker and degrade to no recommendations."
+/>
+
+<Check
+  concepts={['retry-amplification', 'thundering-herd']}
+  prompt="Your service recovers from an outage, comes back up, and immediately falls over again. This repeats. Why?"
+  options={[
+    {
+      id: 'a',
+      text: 'The original problem was never fixed',
+      implies: 'You are assuming the root cause persists.',
+      why: 'Worth ruling out first. But the characteristic pattern of repeated recovery-then-collapse points at the recovery itself rather than at the original fault.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Every client reconnects and every queued retry arrives at once, against cold caches and empty pools',
+      implies: 'You recognise the thundering herd on recovery.',
+      why: 'During the outage, clients accumulated retries and connection attempts. When the service returns, all of that arrives simultaneously — and the service is at its weakest, with a cold cache, empty connection pools and no warm JIT state. Peak load meets minimum capacity.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The instances need more memory',
+      implies: 'You are looking at instance sizing.',
+      why: 'Resource limits can contribute, and they would not explain the specific pattern of recovering and immediately failing. That pattern is about load arriving faster than the service can warm up.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer describes a controlled recovery: admit a small fraction of traffic first, shed the rest, warm the cache, and increase admission gradually while watching goodput. It also notes the client-side requirement — backoff with jitter — because without it the herd will re-form at every attempt regardless of what the server does."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Addressing cascading failures', sourceId: 'sre-book' },
+    { label: 'Timeouts, retries and backoff with jitter', sourceId: 'aws-builders-library' },
+    { label: 'Stability patterns and failure propagation', sourceId: 'release-it' },
+    {
+      label: 'Next: the defences that actually stop the spread',
+      href: '/lessons/stopping-the-spread',
+    },
+  ]}
+/>

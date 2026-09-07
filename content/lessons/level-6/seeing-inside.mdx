@@ -1,0 +1,444 @@
+---
+id: seeing-inside
+title: Seeing Inside
+level: 6
+module: l6-seeing
+order: 1
+summary: Metrics say something is wrong, traces say where, logs say why. Reaching for the wrong one is why incidents take hours instead of minutes.
+difficulty: core
+minutes: 26
+prerequisites: [how-failures-spread]
+concepts: [observability, metrics, logs, traces, correlation-id, structured-logging, golden-signals, alerting, sampling, cardinality, incident-response, postmortem]
+unlocks: [cost-optimisation, control-plane-vs-data-plane]
+failures: [cardinality-explosion, silent-backlog]
+sources: [sre-book, dapper, brendan-gregg, datadog-eng, sre-workbook]
+status: reviewed
+---
+
+## The problem
+
+At 02:14 the alert fires: checkout error rate above 5%.
+
+You open the dashboards. CPU is normal. Memory is normal. The database reports healthy. The
+error rate is real and rising. You have twelve services and no idea which one is failing, and
+the only tool you have is a log search across all of them for the last fifteen minutes.
+
+Ninety minutes later someone notices a third-party address-validation call timing out.
+
+The information existed the whole time. Nothing in your system connected the symptom to the
+cause, because nothing tied one user's request to the twelve services it touched.
+
+## Intuition
+
+Three kinds of telemetry, answering three different questions. Using the wrong one is what makes
+incidents long.
+
+**Metrics — is something wrong?** Cheap aggregate numbers over time. You can keep them for a
+year and query them instantly. They cannot tell you about a specific request, because they
+aggregated that away by design.
+
+**Traces — where is the time going?** One request, stitched across every service it touched,
+with timings. This is the only tool that answers &ldquo;which of my twelve services is slow&rdquo;
+without guessing.
+
+**Logs — why did this specific thing happen?** Detailed events with full context. Expensive at
+volume, and irreplaceable once you know what to look for.
+
+The typical incident goes metrics → traces → logs, and the middle step is the one most teams do
+not have. Without it, you go straight from &ldquo;something is wrong&rdquo; to grepping twelve
+services, which is what turns ten minutes into ninety.
+
+**The cheapest thing you can do, by a wide margin, is propagate a correlation ID.** One
+identifier, generated at the edge, passed through every call, attached to every log line. It
+costs almost nothing and converts twelve unrelated log streams into one story.
+
+## Concretely
+
+<Example title="What each tool answers, and what it cannot">
+
+Incident: checkout errors at 5%.
+
+**Metric:** `checkout_errors_total` is elevated. You know *that* it is broken and roughly when
+it started. You cannot tell which requests, which users, or which dependency.
+
+**Trace:** a sampled failing request shows: gateway 4 ms → checkout 30 ms → inventory 12 ms →
+**address-validation 10,000 ms (timeout)** → error. You now know where, in one look.
+
+**Log:** the address-validation client logged `connection reset by peer` with the endpoint and
+the correlation ID. You now know why.
+
+Each was necessary. None was sufficient.
+
+Now consider the same incident without correlation IDs. You have the metric. You have logs in
+twelve services with no shared identifier, so you cannot tell which log lines belong to the
+failing requests. You are reduced to correlating by timestamp across systems whose clocks
+disagree.
+
+</Example>
+
+## Formal explanation
+
+<C id="observability" /> is the ability to answer questions about production that you did not
+anticipate. That distinction matters: monitoring covers the failures you predicted; observability
+covers the ones you did not, which are most of them.
+
+**<C id="golden-signals">The four golden signals</C>** — latency, traffic, errors, saturation —
+are the standard starting set for a service. For resources, the equivalent is the USE method:
+utilisation, saturation, errors. Saturation is the one teams most often omit, and it is usually
+the leading indicator.
+
+**<C id="traces">Distributed tracing</C>** records a span per operation, linked by a trace ID
+propagated across service boundaries.
+
+<Claim label="fact" source="dapper">
+Dapper describes a distributed tracing infrastructure using trace and span identifiers
+propagated through requests, with sampling to control overhead. Sampling is presented as
+essential rather than optional at scale.
+</Claim>
+
+**<C id="structured-logging" />** means logging fields rather than sentences, so a machine can
+filter and aggregate. `level=error service=checkout trace_id=abc user_id=123 dependency=address
+latency_ms=10000` is queryable; &ldquo;Failed to validate address for user 123&rdquo; is not.
+
+<Callout kind="warn" title="Cardinality is what makes observability expensive">
+Every distinct combination of metric labels is a separate stored time series. Adding a user ID
+or a request ID as a metric label turns one series into millions. High-cardinality identifiers
+belong in traces and logs, where they are stored once per event, not in metrics where they
+multiply the series space.
+</Callout>
+
+<Deeper title="Sampling, and why tail sampling is worth the complexity">
+
+You cannot store every trace at high volume. Two strategies:
+
+**Head sampling.** Decide at the start of the request — keep 1%. Simple, cheap, predictable
+volume. The problem: the interesting traces are the slow and failing ones, and 99% of those are
+discarded before anyone knows they were interesting.
+
+**Tail sampling.** Buffer the trace, decide once it completes — keep all errors, all slow
+requests, and a small sample of normal ones. Far more useful, and it requires holding spans in
+memory until the trace finishes, which means a buffering layer with its own capacity limits.
+
+<Claim label="recommendation">
+Tail sampling on errors and high latency, plus a small baseline of successful traces for
+comparison. Without the baseline you cannot tell whether the slow trace is unusual; without the
+tail selection you will not have the slow trace at all.
+</Claim>
+
+The same reasoning applies to logs. Logging every request at full detail is expensive and mostly
+useless; logging every error at full detail, with the correlation ID, is cheap and almost always
+what you need.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="One identifier, generated once, tying three telemetry types together."
+  columns={[
+    { title: 'Entry', nodes: [{ id: 'edge', label: 'Edge', note: 'generates trace ID', tone: 'accent' }] },
+    { title: 'Services', nodes: [{ id: 's1', label: 'Checkout' }, { id: 's2', label: 'Inventory' }, { id: 's3', label: 'Address API' }] },
+    { title: 'Telemetry', nodes: [{ id: 'm', label: 'Metrics', note: 'is it broken?' }, { id: 't', label: 'Traces', note: 'where?' }, { id: 'l', label: 'Logs', note: 'why?' }] },
+  ]}
+  edges={[
+    { from: 'edge', to: 's1', label: 'trace ID' },
+    { from: 's1', to: 's2', label: 'propagated' },
+    { from: 's2', to: 's3', label: 'propagated' },
+    { from: 's1', to: 'm' },
+    { from: 's1', to: 't' },
+    { from: 's1', to: 'l' },
+  ]}
+  stages={[
+    {
+      label: 'Metrics only',
+      show: ['s1', 's2', 's3', 'm'],
+      because:
+        'You know something is wrong and roughly when. With twelve services you now start guessing, which is what makes incidents long.',
+    },
+    {
+      label: 'Add correlation',
+      show: ['edge', 's1', 's2', 's3', 'm', 'l'],
+      because:
+        'One identifier generated at the edge and propagated through every call turns twelve unrelated log streams into one narrative. This is the cheapest observability improvement available.',
+    },
+    {
+      label: 'Add tracing',
+      show: ['edge', 's1', 's2', 's3', 'm', 't', 'l'],
+      because:
+        'Spans with timings show where the time went without reading a single log line. Metrics find the incident, traces locate it, logs explain it.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One service',
+      behaviour: 'Logs are sufficient. You can read them, and there is only one place to look.',
+      firstToBreak: 'Nothing. Tracing here is overhead.',
+    },
+    {
+      scale: 'A handful of services',
+      behaviour:
+        'Correlation IDs become essential. Without them, cross-service debugging is timestamp archaeology.',
+      firstToBreak: 'Mean time to diagnose, which grows faster than service count.',
+    },
+    {
+      scale: 'Dozens of services',
+      behaviour:
+        'Tracing is required. Log volume is now a serious cost, and sampling decisions matter.',
+      firstToBreak: 'The observability budget, and the ability to diagnose anything quickly.',
+    },
+    {
+      scale: 'High-volume telemetry',
+      behaviour:
+        'Cardinality and retention dominate cost. Observability can rival the cost of the system it observes.',
+      firstToBreak:
+        'The budget, usually because someone added a high-cardinality metric label.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'No correlation between services',
+      symptom:
+        'An incident takes hours. Engineers grep several services and correlate by timestamp.',
+      cause:
+        'No identifier propagated across service boundaries, so nothing ties one request together.',
+      mitigation:
+        'Generate a trace ID at the edge, propagate it in a header through every call, and include it in every log line. This is a small change with a large payoff.',
+    },
+    {
+      what: 'Cardinality explosion',
+      symptom:
+        'Observability costs multiply after a release, and the metrics backend slows or drops data.',
+      cause: 'A label with unbounded values: user ID, request ID, or a URL including parameters.',
+      mitigation:
+        'Enforce cardinality limits at ingest and alert on new label keys. Put high-cardinality context in traces and logs instead.',
+    },
+    {
+      what: 'Head sampling discarding the interesting traces',
+      symptom:
+        'A trace of the failing request is needed and does not exist, because 1% sampling kept the healthy ones.',
+      cause:
+        'The sampling decision was made before the outcome was known.',
+      mitigation:
+        'Tail sampling: keep all errors and slow requests, plus a baseline sample of normal ones for comparison.',
+    },
+    {
+      what: 'Alerting on causes rather than symptoms',
+      symptom:
+        'Dozens of nightly alerts, most requiring no action. Real incidents are missed among the noise.',
+      cause:
+        'An alert per possible cause — CPU, memory, queue depth, disk — rather than on user-visible impact.',
+      mitigation:
+        'Page on symptoms and on error-budget burn rate. Keep cause metrics on dashboards for diagnosis, not on pagers.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Adopt distributed tracing with tail sampling"
+  options={[
+    'Metrics and logs only',
+    'Tracing with head sampling at a low fixed rate',
+    'Tracing with tail sampling on errors and latency',
+  ]}
+  why="Once a request touches more than a few services, no amount of per-service metrics tells you which one is responsible. Tracing is the only tool that answers 'where did the time go' directly, and tail sampling ensures the traces you keep are the ones you needed."
+  gain="Diagnosis time drops from hours to minutes for cross-service problems. Dependency relationships become visible, including ones nobody documented. Latency attribution stops being a matter of opinion."
+  sacrifice="Instrumentation must be present in every service and propagated across every boundary, including through queues, where it is easy to lose. Tail sampling needs a buffering layer with its own capacity and failure modes."
+  failureModes={[
+    'One service failing to propagate context, breaking traces at that boundary',
+    'The tracing backend becoming a dependency whose outage removes your diagnostic capability during an incident',
+    'Sampling configured so the interesting traces are the ones discarded',
+  ]}
+  operationalBurden="Moderate. Instrumentation libraries in every service, a collection pipeline, and a backend to run or pay for. The propagation discipline must survive every new service."
+  cost="Meaningful at volume, and controllable through sampling. Cheaper than the engineering hours spent diagnosing without it, though that comparison is rarely made explicitly."
+  whenNot="For a single service or a small number with simple call patterns, correlation IDs in structured logs give most of the benefit at a fraction of the cost. Tracing earns its keep when the call graph is deep enough that you cannot hold it in your head."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dapper">
+Dapper's design propagates trace and span identifiers through requests and uses sampling to
+bound overhead, treating low overhead and ubiquitous deployment as hard requirements — an
+optional tracing system is not deployed everywhere and is therefore not useful during an
+incident.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+The four golden signals — latency, traffic, errors, saturation — are the recommended starting
+point for service monitoring, with alerting based on user-visible symptoms rather than on
+internal causes.
+</Claim>
+
+<Claim label="convention" source="brendan-gregg">
+The USE method — utilisation, saturation and errors for every resource — is the standard
+approach for resource-level investigation, and saturation is the signal most commonly missing
+from dashboards.
+</Claim>
+
+<Claim label="convention" source="datadog-eng">
+High-cardinality dimensions are the dominant cost driver in metrics systems, because each
+distinct label combination is a separately stored series regardless of how often it is written.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know which telemetry answers which question, and whether you would be able to diagnose the system you just designed. A design with no observability story is a design that cannot be operated."
+  depth="Know the three types and their roles, know correlation IDs are the cheapest win, know cardinality drives cost. Sampling strategy is a strong differentiator."
+  followUps={[
+    'Error rate is up across twelve services. How do you find the cause?',
+    'Why not log everything?',
+    'What would you page on, and what would you leave on a dashboard?',
+    'How do you keep the observability bill under control?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We log everything, so we have observability.',
+      why: 'Volume is not visibility. Unstructured logs across many services with no shared identifier cannot answer "what happened to this request", which is the question incidents actually pose.',
+      instead:
+        'Structure the logs, propagate a correlation ID, and add traces once the call graph is deeper than you can hold in your head.',
+    },
+    {
+      mistake: 'We alert on CPU, memory and disk.',
+      why: 'Those are causes. A service can be failing with all three healthy, and all three can be elevated with users perfectly happy. Alerting on causes produces noise, and noise produces ignored alerts.',
+      instead:
+        'Page on user-visible symptoms and error-budget burn rate. Keep resource metrics on dashboards for diagnosis once you are already looking.',
+    },
+    {
+      mistake: 'We will add a user ID label to the metrics so we can debug per user.',
+      why: 'Every distinct label combination is a separate time series. A million users becomes a million series per metric, which is how observability bills multiply overnight.',
+      instead:
+        'Keep identifiers in traces and logs, where they cost one field per event. Metrics are for aggregates.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['traces', 'metrics', 'logs']}
+  prompt="Checkout p99 latency doubled. You have metrics for every service and logs everywhere. What is the fastest path to the cause?"
+  options={[
+    {
+      id: 'a',
+      text: 'Compare per-service latency metrics to find which one increased',
+      implies: 'You are looking for the culprit in aggregates.',
+      why: 'A reasonable step and often inconclusive. If one dependency slowed, its callers slow too, so several services show elevated latency and the aggregates cannot tell you which is cause and which is effect. It also misses the case where the slow dependency is only called on some paths.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Look at traces for slow checkout requests and see which span grew',
+      implies: 'You are using the tool that attributes time directly.',
+      why: 'A trace shows the actual breakdown for a single slow request, so the responsible span is visible immediately rather than inferred. This is precisely the question tracing exists to answer, and it takes seconds rather than a process of elimination.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Search logs for errors around the time it started',
+      implies: 'You are looking for an error signal.',
+      why: 'Useful once you know where to look, and a slow dependency frequently produces no errors at all — it is simply slow. Searching logs first means searching every service without knowing which one matters.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer sequences all three: metrics establish that it is happening and when, traces locate the responsible span, logs for that trace ID explain why. It also notes that this only works if tail sampling kept the slow traces — with 1% head sampling, the trace you need probably does not exist."
+/>
+
+<Check
+  concepts={['alerting', 'golden-signals']}
+  prompt="Which of these should page a human at 3am?"
+  options={[
+    {
+      id: 'a',
+      text: 'Database CPU above 80%',
+      implies: 'You are alerting on a resource metric.',
+      why: 'It may be entirely normal, and it may be fine indefinitely. If users are unaffected, waking someone teaches them that alerts do not mean anything — which is a reliability risk in itself.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Error budget burning at 14 times the sustainable rate',
+      implies: 'You are alerting on user impact, scaled by how fast it is accumulating.',
+      why: 'This is a symptom, it is user-visible, and the severity is proportionate: at 14x, a 28-day budget is gone in two days. It combines "something is wrong" with "it matters enough to act now", which is exactly what a page should mean.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'A single failed health check on one instance',
+      implies: 'You are alerting on an individual component event.',
+      why: 'The system should handle this automatically by removing the instance. If one instance failing requires a human at 3am, the problem is the lack of automation, not the lack of an alert.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer adds the multi-window refinement: a fast burn over a short window pages, a slow burn over a long window creates a ticket. It also notes the review discipline — any alert that fires and requires no action should be changed or deleted, because tolerating those is how alert fatigue starts."
+/>
+
+<DebugCheck
+  concepts={['observability', 'metrics', 'percentiles', 'cache-stampede']}
+  symptom="At 09:00 every weekday, one endpoint's p99 latency rises from 90 ms to 4 seconds for about twenty minutes. The error rate does not change. What is happening?"
+  observations={[
+    { label: 'Request rate', detail: 'Rises about 3x during the window, which is normal for the start of the working day.' },
+    { label: 'p50 latency', detail: 'Unchanged at 40 ms throughout the window.' },
+    { label: 'Database CPU', detail: 'Rises from 20% to 34%. No entries in the slow query log.' },
+    { label: 'Cache hit rate', detail: 'Falls from 96% to 71% during the window, then recovers on its own.' },
+    { label: 'Deploys', detail: 'A rolling deploy is scheduled at 08:58 every weekday by the release pipeline.' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'The daily deploy empties every instance local cache at once, so a fleet-wide cold start coincides with the morning traffic ramp.',
+      implies: 'You connected an unchanged median and a falling hit rate to a scheduled event rather than to load.',
+      why: 'An unchanged p50 with a ruined p99 means most requests are fine and a minority are doing far more work, which is the shape of a cache miss path rather than of an overloaded system. The hit rate confirms it and the deploy schedule explains why it is the same twenty minutes every weekday. Load alone would have moved the median too.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The 3x traffic increase is saturating the service, and it needs more capacity for the morning peak.',
+      implies: 'You are attributing the latency to arrival rate.',
+      why: 'Saturation raises the median as queues form everywhere, and here the median never moves. Database CPU at 34% also has substantial headroom. Adding capacity would leave the cold-cache burst exactly as it is, because the cause is the deploy rather than the traffic.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'A slow query is being triggered by a pattern that only appears in the morning.',
+      implies: 'You are looking for expensive work at the database.',
+      why: 'A sensible hypothesis that the evidence rules out: no slow queries are logged and database CPU rises only modestly. Worth checking early because it is cheap to check, and worth abandoning quickly once the log is clean.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates the diagnosis from the fix. Diagnosis: an unchanged median with a ruined tail is nearly always a minority of requests taking a different path, so look for what distinguishes them rather than for a resource under strain. Fix: stagger the deploy so instances warm in stages, prewarm before an instance takes traffic, and stop scheduling the deploy two minutes before the daily ramp. The last of those costs nothing and removes most of the impact."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Distributed tracing: spans, propagation and sampling', sourceId: 'dapper' },
+    { label: 'Monitoring, golden signals and alerting philosophy', sourceId: 'sre-book' },
+    { label: 'The USE method for resource investigation', sourceId: 'brendan-gregg' },
+    {
+      label: 'Next: adversaries, abuse, and who pays when you are attacked',
+      href: '/lessons/adversaries-and-abuse',
+    },
+  ]}
+/>

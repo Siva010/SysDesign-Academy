@@ -1,0 +1,424 @@
+---
+id: no-shared-clock
+title: No Shared Clock, No Reliable Network
+level: 4
+module: l4-uncertainty
+order: 1
+summary: You cannot tell a dead machine from a slow one, and you cannot order events by wall clock. Every distributed algorithm exists to work around those two facts.
+difficulty: advanced
+minutes: 28
+prerequisites: [splitting-the-data, network-partition]
+concepts: [clock-skew, logical-clock, lamport-clock, vector-clock, happens-before, failure-detector, network-partition, last-write-wins]
+unlocks: [leader-election, consensus, conflict-resolution, causal-consistency]
+failures: [split-brain]
+sources: [lamport-clocks, ddia, spanner, dynamo, mit-6584]
+status: reviewed
+---
+
+## The problem
+
+Two data centres. A user updates their profile picture in one, then — a second later, on their
+phone, routed to the other — changes it back.
+
+Both writes carry a timestamp from the machine that handled them. The second machine's clock is
+600 ms behind. When the two writes meet during replication, conflict resolution keeps the one
+with the higher timestamp: the *first* write.
+
+The user's most recent action has been silently discarded, and there is no error, no log entry,
+and no way to detect it after the fact.
+
+Meanwhile a monitoring system marks a node dead because it has not responded in five seconds.
+The node is fine. Its garbage collector paused for six.
+
+These are the two facts that make distributed systems hard, and no amount of engineering
+removes them.
+
+## Intuition
+
+**Fact one: there is no shared "now".**
+
+Every machine has its own clock, and clocks drift. Time synchronisation reduces the drift; it
+does not eliminate it, and a synchronisation correction can move a clock *backwards*. So a
+timestamp from machine A and a timestamp from machine B cannot be reliably compared at
+millisecond resolution — and millisecond resolution is exactly where concurrent writes live.
+
+**Fact two: you cannot distinguish "dead" from "slow".**
+
+You send a message and get no reply. The possibilities are: the machine crashed, the machine is
+alive but paused, the network dropped your message, the network dropped its reply, or it is
+still working and will answer in a moment.
+
+From your side, these are indistinguishable. You must decide anyway, and whatever you decide,
+you will sometimes be wrong.
+
+Every technique in this level — logical clocks, quorums, leases, consensus — is a way of
+building something useful on top of two facts that cannot be fixed.
+
+## Concretely
+
+<Example title="Two ways the same uncertainty bites">
+
+**Ordering.** Node A processes write X at its local time 10:00:00.100. Node B processes write Y
+at its local time 10:00:00.050. Y appears earlier. But B's clock is 200 ms behind, so in real
+time Y happened *after* X.
+
+If conflict resolution is <C id="last-write-wins">last-write-wins by timestamp</C>, X survives
+and Y is discarded — silently, because from the system's point of view nothing went wrong.
+
+**Failure detection.** A node stops responding to heartbeats. The failure detector waits 5
+seconds and declares it dead. A new leader is elected.
+
+The old node was in a long garbage-collection pause. It resumes, unaware that anything has
+happened, and continues to act as leader. Two leaders, both accepting writes.
+
+The uncomfortable trade: a shorter timeout means faster failover and more false positives; a
+longer timeout means fewer false positives and longer outages. There is no setting that avoids
+choosing which mistake to make.
+
+</Example>
+
+## Formal explanation
+
+<C id="clock-skew" /> is the difference between two machines' clocks. Time synchronisation
+protocols reduce it, but the residual is unbounded in the worst case and corrections can move a
+clock backwards. This makes wall-clock timestamps unsafe for ordering events across machines.
+
+The way out is to stop asking about time and start asking about **causality**.
+
+<C id="happens-before">Happens-before</C> is a partial order. Event A happens-before event B if
+A occurred earlier on the same node, or A was the sending of a message that B received, or the
+relation follows transitively. Events not related by happens-before are **concurrent** — and
+concurrency is a real category, not a measurement failure.
+
+<Claim label="fact" source="lamport-clocks">
+Lamport's 1978 paper defines the happens-before relation and shows that a system of logical
+clocks can produce a total ordering consistent with causality, without any reference to physical
+time.
+</Claim>
+
+Two mechanisms build on it:
+
+- **<C id="lamport-clock">Lamport clocks</C>** — one counter per node, incremented on each
+  event and advanced to at least the sender's value on receipt. If A happens-before B then
+  A's counter is lower. The converse does not hold, so you cannot tell "concurrent" from
+  "ordered" — which is exactly the distinction conflict resolution needs.
+- **<C id="vector-clock">Vector clocks</C>** — one counter per node, all carried together. Now
+  you *can* detect concurrency: two versions are concurrent when neither dominates the other.
+  The cost is size proportional to the number of nodes.
+
+<C id="failure-detector">Failure detection</C> is the second fact. Because you cannot
+distinguish dead from slow, every detector is a bet with a timeout, and the timeout is a choice
+about which error you prefer.
+
+<Callout kind="warn" title="This is why consensus needs a majority">
+If you cannot tell whether the other side is dead, you cannot safely act alone — the other side
+may be alive and acting too. Requiring a majority guarantees that two groups cannot both act,
+because two majorities of the same set must overlap. That single observation is the foundation
+of every consensus algorithm.
+</Callout>
+
+<Deeper title="Buying bounded uncertainty">
+
+There is one way to make wall-clock time usable across machines: instead of pretending the
+clock is exact, make the *uncertainty* explicit and bounded, then wait it out.
+
+<Claim label="fact" source="spanner">
+Spanner's TrueTime API returns an interval rather than a timestamp, representing the bounded
+uncertainty about the current time. Transactions wait out that uncertainty before committing,
+which allows the system to assign globally meaningful timestamps and provide externally
+consistent transactions.
+</Claim>
+
+The cost is that every commit waits for the uncertainty bound to pass, and the bound depends on
+specialised time infrastructure. This is a genuine engineering achievement rather than a trick,
+and it is worth knowing for what it teaches: **you cannot eliminate clock uncertainty, but if
+you can bound it, you can pay for it in latency.**
+
+Most systems cannot bound it, which is why most systems use logical clocks or consensus instead.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The same two writes, ordered three ways, with three different outcomes."
+  columns={[
+    { title: 'Writers', nodes: [{ id: 'a', label: 'Node A', note: 'clock +200ms' }, { id: 'b', label: 'Node B', note: 'clock −400ms' }] },
+    { title: 'Ordering', nodes: [{ id: 'wall', label: 'Wall clock', note: 'silently wrong' }, { id: 'logical', label: 'Logical clock', note: 'causal', tone: 'accent' }, { id: 'consensus', label: 'Consensus', note: 'one true order' }] },
+    { title: 'Outcome', nodes: [{ id: 'lost', label: 'Write discarded' }, { id: 'conflict', label: 'Conflict surfaced' }, { id: 'ordered', label: 'Total order' }] },
+  ]}
+  edges={[
+    { from: 'a', to: 'wall' },
+    { from: 'b', to: 'wall' },
+    { from: 'wall', to: 'lost', tone: 'danger' },
+    { from: 'a', to: 'logical' },
+    { from: 'logical', to: 'conflict', tone: 'accent' },
+    { from: 'b', to: 'consensus' },
+    { from: 'consensus', to: 'ordered' },
+  ]}
+  stages={[
+    {
+      label: 'Order by wall clock',
+      show: ['a', 'b', 'wall', 'lost'],
+      because:
+        'Cheapest and requires no coordination. It silently discards writes when clocks disagree, and gives you no signal that it happened.',
+    },
+    {
+      label: 'Order by causality',
+      show: ['a', 'b', 'logical', 'conflict'],
+      because:
+        'Vector clocks detect that two writes were concurrent rather than ordered, which turns silent loss into a conflict you can resolve deliberately.',
+    },
+    {
+      label: 'Impose one order',
+      show: ['a', 'b', 'consensus', 'ordered'],
+      because:
+        'Consensus makes every node agree on a single sequence. No conflicts arise, and every write now costs a majority round trip.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One node',
+      behaviour: 'One clock, one order. None of this exists.',
+      firstToBreak: 'Nothing. All of this complexity is the price of the second node.',
+    },
+    {
+      scale: 'Two nodes, same rack',
+      behaviour:
+        'Skew is small and round trips are sub-millisecond. Wall-clock ordering is wrong rarely enough to survive testing.',
+      firstToBreak: 'Correctness, occasionally and invisibly.',
+    },
+    {
+      scale: 'Nodes across regions',
+      behaviour:
+        'Round trips are tens or hundreds of milliseconds, so concurrent writes are common and skew is comparable to real ordering differences.',
+      firstToBreak:
+        'Wall-clock ordering, frequently. This is where last-write-wins starts losing meaningful data.',
+    },
+    {
+      scale: 'Many nodes with vector clocks',
+      behaviour:
+        'Vector clock size grows with the number of writing nodes, and the metadata can approach the size of the data.',
+      firstToBreak:
+        'Metadata overhead, which is why production systems prune vector clocks and accept some loss of precision.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Silent write loss from last-write-wins',
+      symptom:
+        'Users report changes that "did not save", with no error and nothing in the logs.',
+      cause:
+        'Two concurrent writes resolved by comparing wall-clock timestamps from machines whose clocks disagree.',
+      mitigation:
+        'Use logical clocks so concurrency is detectable, and resolve conflicts with a rule that suits the data — merge sets, keep both versions, or ask the user. Reserve last-write-wins for data where loss is genuinely acceptable.',
+    },
+    {
+      what: 'False failure detection during a pause',
+      symptom:
+        'A node is declared dead, a failover occurs, and the node returns believing it is still in charge.',
+      cause:
+        'A garbage collection pause, a disk stall or a network blip exceeded the failure detector timeout.',
+      mitigation:
+        'Leases with fencing tokens: the returning node cannot act because the resource rejects its stale token. Tune the timeout deliberately, knowing which error you are choosing.',
+    },
+    {
+      what: 'Clock moves backwards',
+      symptom:
+        'Ordering inverts, or an ID generator produces a duplicate, or a token appears to expire before it was issued.',
+      cause:
+        'A time synchronisation correction, a leap second adjustment, or a virtual machine migration.',
+      mitigation:
+        'Use a monotonic clock for measuring durations, never the wall clock. Do not derive uniqueness from timestamps alone.',
+    },
+    {
+      what: 'Timeouts tuned for the average case',
+      symptom:
+        'Failovers during normal load spikes, which then make the load spike worse.',
+      cause:
+        'A timeout set close to typical latency will fire regularly, because tail latency is far above typical.',
+      mitigation:
+        'Set timeouts from the tail of the observed distribution plus margin, and treat repeated false positives as a signal to raise the timeout rather than to investigate the node.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Resolve concurrent writes using vector clocks rather than last-write-wins timestamps"
+  options={[
+    'Last-write-wins by wall-clock timestamp',
+    'Vector clocks: detect concurrency and resolve deliberately',
+    'Consensus: impose a single order so concurrency never arises',
+    'CRDTs: define a merge function that always converges',
+  ]}
+  why="Last-write-wins silently discards data whenever clocks disagree, and gives no signal that it happened. Vector clocks turn an invisible loss into a visible conflict, which you can then resolve according to what the data actually means."
+  gain="No silent loss. Genuine concurrency is detected rather than arbitrarily ordered, so the application can merge, keep both versions, or ask the user — decisions that only make sense when you know a conflict occurred."
+  sacrifice="Metadata proportional to the number of writing nodes, carried with every version. The application must now handle conflicts, which is real work that last-write-wins avoids by pretending they cannot happen."
+  failureModes={[
+    'Vector clock size growing until metadata rivals the data',
+    'Conflict resolution logic that is never exercised in testing and is wrong in production',
+    'Sibling versions accumulating because nothing ever resolves them',
+  ]}
+  operationalBurden="Moderate. Vector clocks need pruning strategies, and every application path that writes must understand conflicts rather than assuming a single current value."
+  cost="Storage and bandwidth for the metadata, plus engineering time for resolution logic that only runs during concurrent writes."
+  whenNot="When the data is genuinely last-write-wins by nature — a cached rendering, a presence indicator, a most-recent-seen timestamp — the machinery buys nothing. And when a single writer is guaranteed by design, concurrency does not arise, so detecting it is pure cost."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dynamo">
+Dynamo uses vector clocks to capture causality between different versions of an object, and
+exposes concurrent versions to the application for resolution rather than silently choosing one.
+The paper also describes truncating vector clocks when they grow too large, accepting a loss of
+precision.
+</Claim>
+
+<Claim label="fact" source="spanner">
+Spanner's TrueTime exposes bounded clock uncertainty and transactions wait out that bound before
+committing, which is how the system provides externally consistent transactions across
+geographically distributed replicas.
+</Claim>
+
+<Claim label="convention" source="mit-6584">
+The impossibility of distinguishing a failed node from a slow one is a foundational result in
+distributed systems, and it is the reason practical algorithms rely on timeouts plus majority
+agreement rather than on accurate failure detection.
+</Claim>
+
+<Claim label="recommendation">
+Never derive ordering or uniqueness from a wall-clock timestamp across machines. Use monotonic
+clocks for durations, logical clocks for causality, and consensus when you genuinely need one
+agreed order.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that timestamps do not order events across machines, and that failure detection is inherently ambiguous. Proposing last-write-wins without acknowledging the loss is a common gap."
+  depth="Know why wall-clock ordering is unsafe, know what happens-before means, and know the dead-versus-slow ambiguity and its consequence for quorums. Vector clock mechanics are a bonus."
+  followUps={[
+    'Two regions accept a write to the same key. How do you decide which wins?',
+    'A node stops responding. How long do you wait, and what happens if you are wrong?',
+    'Why does consensus need a majority rather than any two nodes?',
+    'When is last-write-wins actually fine?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We use timestamps to order events, and NTP keeps the clocks close enough.',
+      why: 'Close enough for logging, not for ordering. Residual skew is comparable to the interval in which concurrent writes actually occur, and corrections can move a clock backwards, so the ordering can invert.',
+      instead:
+        'Order by causality with logical clocks, or impose an order with consensus. Reserve wall-clock timestamps for human-readable display and coarse-grained expiry.',
+    },
+    {
+      mistake: 'The node did not respond, so it is down.',
+      why: 'It may be paused, or the network may have dropped one of the two messages. Acting on that assumption while the node is alive produces split brain.',
+      instead:
+        'Say what the timeout is, which error it prefers, and what stops a returning node from acting — leases and fencing tokens, not hope.',
+    },
+    {
+      mistake: 'We will just synchronise the clocks better.',
+      why: 'Better synchronisation reduces skew and does not eliminate it, and the guarantee you need is an upper bound rather than a typical value. Bounding it is possible and expensive; assuming it is bounded without paying for that is where the bugs come from.',
+      instead:
+        'Either avoid depending on cross-machine time, or bound the uncertainty explicitly and wait it out, which is what systems with strict global ordering actually do.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['clock-skew', 'last-write-wins']}
+  prompt="Two regions accept writes to the same key. Region A's clock runs 300 ms ahead. A user writes in B, then a moment later writes again in A. Conflict resolution is last-write-wins by timestamp. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: "The second write wins, because it happened later in real time",
+      implies: 'You are assuming timestamps reflect real ordering.',
+      why: 'They do here, but only by accident: A is ahead, so its later write also has a higher timestamp. Reverse the skew and the same user action produces the opposite outcome, which is what makes the mechanism unreliable rather than merely imperfect.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'The outcome depends on which region happens to be ahead, so the same user action can silently lose data depending on routing',
+      implies: 'You recognise that the resolution rule is comparing incomparable values.',
+      why: 'The mechanism compares timestamps from clocks that disagree by more than the interval between the writes. Whether the correct write survives is determined by clock skew and routing, not by what the user did — and there is no error to observe.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The system will detect the conflict and ask the application to resolve it',
+      implies: 'You are describing vector-clock behaviour.',
+      why: 'That is what a causality-tracking system does, and it is the fix. Last-write-wins explicitly does not do it: it picks one and discards the other without surfacing anything.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the specific fix for this shape of problem: route a given key's writes to one region so concurrency does not arise, or track causality with version vectors so the second write is recognised as descending from the first rather than concurrent with it. It also notes that a user's own sequential actions are causally ordered, so a system tracking causality would get this right without any clock at all."
+/>
+
+<Check
+  concepts={['failure-detector', 'network-partition']}
+  prompt="Your failure detector uses a 3-second timeout. A node pauses for 8 seconds during garbage collection. What is the danger, and what actually prevents it?"
+  options={[
+    {
+      id: 'a',
+      text: 'The node is declared dead and restarted, which is safe',
+      implies: 'You are assuming the detector can act on the node.',
+      why: 'The detector cannot restart a node it cannot reach. The node resumes on its own, still believing whatever it believed 8 seconds ago — including, potentially, that it is the leader.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'A new leader is elected while the old one is still alive; a lease with fencing tokens is what stops the old leader acting',
+      implies: 'You identified the split-brain window and the mechanism that closes it.',
+      why: 'Timeouts alone cannot prevent this, because the paused node has no way to know time passed. A lease means its authority expires by wall-clock time; a fencing token means the storage layer rejects writes carrying a stale token even if the node tries.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Increase the timeout to 10 seconds so this cannot happen',
+      implies: 'You are tuning the detector rather than making the failure safe.',
+      why: 'It reduces the frequency and does not remove the possibility — a 12-second pause is still possible — while making every genuine failure take 10 seconds to detect. You have traded availability for a partial reduction in a risk you have not eliminated.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer states the general principle: safety must not depend on timing assumptions. Timeouts affect how quickly you detect failure, which is a liveness property; correctness must come from mechanisms that remain valid regardless of how long a pause lasted, which is what fencing tokens and quorum intersection provide."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'Time, Clocks, and the Ordering of Events',
+      sourceId: 'lamport-clocks',
+      note: 'Short, foundational, and still the clearest statement of why causality beats clocks.',
+    },
+    { label: 'Unreliable clocks and knowledge in distributed systems', sourceId: 'ddia' },
+    { label: 'Bounded uncertainty and externally consistent transactions', sourceId: 'spanner' },
+    {
+      label: 'Next: how machines agree despite all of this',
+      href: '/lessons/agreeing-anyway',
+    },
+  ]}
+/>

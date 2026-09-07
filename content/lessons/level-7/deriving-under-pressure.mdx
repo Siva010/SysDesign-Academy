@@ -1,0 +1,465 @@
+---
+id: deriving-under-pressure
+title: Deriving a Design Under Pressure
+level: 7
+module: l7-method
+order: 1
+summary: A worked transcript of the first fifteen minutes, showing what to say, in what order, and what each move buys you.
+difficulty: staff
+minutes: 25
+prerequisites: [the-primitives-underneath, back-of-envelope]
+concepts: [requirement-clarification, back-of-envelope, non-functional-requirements, bottleneck, vertical-scaling, partition-key, graceful-degradation, operational-burden]
+unlocks: [cost-optimisation, blast-radius]
+caseStudies: [url-shortener, social-feed]
+sources: [hello-interview, exponent, fundamentals-arch]
+status: reviewed
+---
+
+## The problem
+
+You know the method. You know the primitives. You sit down, the interviewer says
+&ldquo;design a system for scheduling deliveries&rdquo;, and forty-five minutes later you have
+produced a diagram, answered some questions, and have no idea whether it went well.
+
+The gap between knowing the framework and executing it is the same gap as between knowing the
+rules of chess and playing. This lesson closes it with a transcript: **what to actually say, in
+what order, and what each move buys.**
+
+## Intuition
+
+Three things the framework does not tell you, and they matter more than the framework.
+
+**The first two minutes set the frame.** If you start drawing boxes, you have signalled that you
+design by recall. If you start asking questions whose answers change the design, you have
+signalled the opposite, and the interviewer relaxes.
+
+**Narrate the search, not just the answer.** The interviewer cannot see you thinking. &ldquo;At
+40,000 reads per second the primary is the constraint, so the question is caching or
+replicas&rdquo; is worth far more than silently drawing a cache. They are assessing reasoning,
+and reasoning is only visible if you speak it.
+
+**Time is the scarcest resource.** Forty-five minutes is roughly: five clarifying, five
+estimating, five modelling, ten designing, ten under pressure, ten on failure and trade-offs.
+Spending twenty minutes on requirements means never reaching the part that differentiates you.
+
+## Concretely
+
+<Example title="The first fifteen minutes, transcribed">
+
+**Interviewer:** &ldquo;Design a system for scheduling deliveries.&rdquo;
+
+**You (0:00):**
+&ldquo;Before I design anything, let me pin down what changes the shape of this. How many
+deliveries a day, and how far ahead are they scheduled? Is a delivery assigned to a specific
+courier, and can that change? What happens if we fail to dispatch one on time — is it a delay or
+a lost order?&rdquo;
+
+*What this buys:* three questions, each of whose answers changes the design. Volume sizes the
+system. Assignment tells you whether this is a contention problem. The failure cost tells you how
+much correctness machinery is justified.
+
+**Interviewer:** &ldquo;Two million a day, scheduled up to a week ahead. Assigned to a courier at
+dispatch time, and reassignment happens. A missed dispatch is a very unhappy customer.&rdquo;
+
+**You (2:00):**
+&ldquo;Two million a day is about 23 per second average. Delivery demand is concentrated —
+mornings and evenings — so call it 100 to 200 per second at peak. That is a small write rate. The
+interesting parts are going to be the scheduling and the assignment, not the throughput.
+
+&ldquo;Storage: two million a day, seven days of future schedule, so around 14 million pending at
+any time, plus history. At a kilobyte each that is well under a terabyte. Also not the hard
+part.&rdquo;
+
+*What this buys:* the numbers, out loud, with the conclusion drawn. You have just eliminated
+sharding and streaming platforms from the conversation, and you did it with arithmetic rather
+than assertion.
+
+**You (4:00):**
+&ldquo;So what makes this hard: it is a scheduling problem — do this at a specific time, exactly
+once, at scale — with an assignment problem attached that has contention, because two dispatchers
+must not assign the same courier to overlapping deliveries. There is probably a geospatial
+element in choosing which courier, but I would like to confirm that is in scope before I spend
+time on it.&rdquo;
+
+*What this buys:* you have named the primitives and asked permission to scope. The interviewer
+now knows you can see the structure, and they can steer you toward the part they want.
+
+**Interviewer:** &ldquo;Courier selection is out of scope. Assume you are given a courier.&rdquo;
+
+**You (5:00):**
+&ldquo;Good, that removes the geospatial piece. So: a store of scheduled deliveries, and a
+dispatcher that picks up work as it becomes due.
+
+&ldquo;The simplest version: deliveries in a table with a due time and a status, a partition key
+of delivery id, and a secondary structure ordered by due time. A dispatcher polls for due work
+and claims it with a conditional update, so two dispatchers cannot claim the same delivery. At
+200 per second, one database handles this comfortably.&rdquo;
+
+*What this buys:* a complete design, deliberately small, with the contention question already
+answered. You have not added a queue, a cache or a second service, and you can justify every
+component.
+
+**You (8:00):**
+&ldquo;Two things I would flag as weak. Polling for due work does not scale gracefully if the
+poll interval has to be short, and I have made the claim atomic but I have not said what happens
+if a dispatcher claims a delivery and then dies. Which of those would you like me to go
+into?&rdquo;
+
+*What this buys:* you have found your own weaknesses before the interviewer did, and offered
+them a choice. This is the single strongest move available in a design interview, and almost
+nobody makes it.
+
+</Example>
+
+## Formal explanation
+
+The transcript demonstrates five moves. Each is small and each changes how the rest of the
+interview goes.
+
+**Move 1 — ask questions that change the design.** Not "what tech stack?" but "what happens when
+this fails?" The test of a good clarifying question is whether two different answers would lead
+you to two different designs.
+
+**Move 2 — convert to per-second and draw the conclusion.** The number alone is not the point.
+&ldquo;23 per second, so this is not a throughput problem&rdquo; is the point.
+
+**Move 3 — name the primitives out loud.** It tells the interviewer you are reasoning from
+structure, and it gives you a plan for the remaining time.
+
+**Move 4 — design the smallest thing, and say that you are doing so.** &ldquo;This is the
+simplest version and I expect to evolve it&rdquo; pre-empts the criticism that you have
+under-designed, and sets up the pressure rounds as evolution rather than correction.
+
+**Move 5 — critique your own design and offer a choice.** It demonstrates that you evaluate your
+work the way a reviewer would, and it lets the interviewer spend the remaining time on what they
+care about.
+
+<Callout kind="info" title="What to do when you do not know">
+Say so, then reason. &ldquo;I have not operated one at that scale. From first principles I would
+expect the constraint to be the number of concurrent claims on the same rows, because that is
+what serialises. Is that where you were going?&rdquo;
+
+Interviewers can distinguish a gap from a bluff easily, and only one of the two is
+disqualifying.
+</Callout>
+
+<Deeper title="Managing the clock">
+
+Rough allocation for 45 minutes, and what to cut when you are behind:
+
+| Phase | Minutes | Cut it by |
+|---|---|---|
+| Clarify | 5 | Stating assumptions instead of asking, and moving on |
+| Estimate | 5 | Doing only the one number that decides the architecture |
+| Model | 5 | Naming the access patterns without drawing the schema |
+| Design v1 | 10 | Drawing fewer boxes and saying what you would add |
+| Pressure | 10 | This is the part being assessed. Do not cut it |
+| Failure and trade-offs | 10 | Also being assessed. Do not cut it |
+
+The two phases people over-spend on are clarification and the data model, and the two they run
+out of time for are pressure and failure — which are the ones that differentiate.
+
+If you are 20 minutes in and still discussing requirements, say: &ldquo;I am going to assume X
+and Y and start designing, and we can revisit if those are wrong.&rdquo; That recovery is itself
+a positive signal.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Where the time goes, and which phases carry the assessment."
+  columns={[
+    { title: 'Frame', nodes: [{ id: 'clarify', label: 'Clarify', note: '5 min' }, { id: 'size', label: 'Size', note: '5 min' }] },
+    { title: 'Build', nodes: [{ id: 'model', label: 'Model', note: '5 min' }, { id: 'v1', label: 'Design v1', note: '10 min' }] },
+    { title: 'Assessed', nodes: [{ id: 'pressure', label: 'Pressure', note: '10 min', tone: 'accent' }, { id: 'fail', label: 'Failure and trade-offs', note: '10 min', tone: 'accent' }] },
+  ]}
+  edges={[
+    { from: 'clarify', to: 'size' },
+    { from: 'size', to: 'model' },
+    { from: 'model', to: 'v1' },
+    { from: 'v1', to: 'pressure' },
+    { from: 'pressure', to: 'fail' },
+  ]}
+  stages={[
+    {
+      label: 'Where people spend it',
+      show: ['clarify', 'size', 'model', 'v1'],
+      because:
+        'Over-spending on requirements and the data model is the most common way to run out of time. Both feel productive and neither is what differentiates candidates.',
+    },
+    {
+      label: 'Where the assessment is',
+      show: ['clarify', 'size', 'model', 'v1', 'pressure', 'fail'],
+      because:
+        'The last twenty minutes are where an interviewer learns whether you can evolve a design and reason about failure. Everything before is setup.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '30-minute interview',
+      behaviour:
+        'One or two clarifying questions, one estimate, a small design, one pressure round.',
+      firstToBreak: 'Depth. Choose one part to go deep on and say that is what you are doing.',
+    },
+    {
+      scale: '45 minutes',
+      behaviour: 'The standard shape. All six phases fit if requirements are kept to five minutes.',
+      firstToBreak: 'The failure discussion, if the earlier phases overran.',
+    },
+    {
+      scale: '60+ minutes or a panel',
+      behaviour:
+        'Expect several pressure rounds and a deep dive into one component chosen by the interviewer.',
+      firstToBreak:
+        'Breadth. You will be taken deeper than your preparation in at least one area, which is intended.',
+    },
+    {
+      scale: 'Take-home or written',
+      behaviour:
+        'The trade-off ledger and the failure analysis carry disproportionate weight, because there is no conversation to demonstrate reasoning.',
+      firstToBreak:
+        'Anything you left implicit. Write down what you would have said out loud.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Silent designing',
+      symptom:
+        'You produce a good diagram and the feedback says "unclear reasoning" or "hard to follow".',
+      cause:
+        'The thinking happened internally. The interviewer assessed the artefact rather than the reasoning, and the artefact is the smaller part.',
+      mitigation:
+        'Narrate the search: what you are considering, what you rejected, and why. Silence is not read as competence.',
+    },
+    {
+      what: 'Running out of time before the pressure rounds',
+      symptom:
+        'The interview ends during the initial design, with the differentiating phases untouched.',
+      cause: 'Over-spending on clarification and the data model.',
+      mitigation:
+        'Watch the clock explicitly. At 15 minutes you should have a design on the board, even a small one.',
+    },
+    {
+      what: 'Defending a decision that has been shown to be wrong',
+      symptom:
+        'The interviewer challenges a choice, you defend it, and the interview becomes adversarial.',
+      cause:
+        'Treating the challenge as an attack rather than as information.',
+      mitigation:
+        'Take it seriously and answer on the merits. If they are right, say so and adjust. Changing your mind on evidence is explicitly assessed.',
+    },
+    {
+      what: 'Restarting when the requirements change',
+      symptom:
+        '"Now it is 100 times bigger" produces a blank page and a new design.',
+      cause:
+        'The original design had no derivation, so there is nothing to evolve.',
+      mitigation:
+        'Identify which component saturates first at the new number, change that one, and name the new problem the change created.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Present a deliberately minimal first design and evolve it, rather than a complete one up front"
+  options={[
+    'Present the full production architecture immediately',
+    'Present the minimal design and evolve it under pressure',
+    'Present the minimal design without saying it is minimal',
+  ]}
+  why="An interview is assessed on reasoning, and reasoning is only visible in transitions. A complete architecture presented at once has no visible derivation, so the interviewer cannot tell whether you derived it or recalled it."
+  gain="Every subsequent addition is justified by a constraint that has appeared, which is exactly what an interviewer wants to see. It also leaves room for the pressure rounds, which is where the assessment happens."
+  sacrifice="It looks less impressive in the first five minutes. An interviewer who is pattern-matching against a checklist may briefly think you are under-designing."
+  failureModes={[
+    'Not saying it is deliberately minimal, so it reads as naive',
+    'Starting so small that you run out of time before reaching a realistic design',
+    'Being unable to evolve it, which exposes that the minimalism was not a choice',
+  ]}
+  operationalBurden="Not applicable, but the preparation equivalent is: you must actually be able to evolve it, which requires knowing the primitives rather than one architecture."
+  cost="A few minutes of apparent under-confidence, repaid across the rest of the interview."
+  whenNot="If the interviewer explicitly asks for the production architecture, or says they have limited time and want the end state, give them that. Reading the room beats following a script — and the fact that you chose the approach deliberately is what you should say when you do."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="hello-interview">
+Interview guidance consistently emphasises communication and structured progression over
+completeness of the final diagram, and identifies requirements clarification followed by
+estimation as the standard opening.
+</Claim>
+
+<Claim label="convention" source="exponent">
+Mock interview guidance emphasises narrating reasoning aloud, on the basis that interviewers
+assess the visible thought process rather than only the artefact produced.
+</Claim>
+
+<Claim label="recommendation" source="fundamentals-arch">
+Architecture decisions should be recorded with their alternatives and reasoning. The interview
+equivalent is stating what you rejected and why, which converts a diagram into a defensible
+design.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Execution rather than knowledge. Two candidates with identical knowledge routinely receive different outcomes because of how the forty-five minutes were spent."
+  depth="Practise the opening until it is automatic, so that your attention is free for the problem rather than for the process."
+  followUps={[
+    'Talk me through your first two minutes on any prompt.',
+    'You are 25 minutes in and still on requirements. What do you do?',
+    'I disagree with your storage choice. Convince me, or change it.',
+    'What is the weakest part of what you have drawn?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Starting with the architecture to show breadth.',
+      why: 'You commit to decisions before knowing anything that would justify them, and you spend the rest of the interview defending choices made blind.',
+      instead:
+        'Ask three questions whose answers would change the design, then estimate, then design. The breadth shows up later, in the pressure rounds, where it counts.',
+    },
+    {
+      mistake: 'Answering "what would you improve?" with "nothing".',
+      why: 'Every design has a weakest part. Not knowing yours reads as either overconfidence or a shallow model of the system.',
+      instead:
+        'Name a specific weakness with a threshold: "the dispatcher poll interval is the weak point above roughly N per second, and here is what I would do instead."',
+    },
+    {
+      mistake: 'Treating a challenge as an attack.',
+      why: 'Interviewers challenge to see whether you reason or defend. Defending a position you cannot support is worse than changing it.',
+      instead:
+        'Engage on the merits. "That is a fair point — if writes are that concentrated, my partition key is wrong. Let me change it" is a strong moment, not a weak one.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['requirement-clarification', 'back-of-envelope']}
+  prompt="You are asked to design a notification system. Which opening question is most useful?"
+  options={[
+    {
+      id: 'a',
+      text: 'What technologies are we allowed to use?',
+      implies: 'You are scoping the toolbox before the problem.',
+      why: 'The answer changes nothing about the design. It also signals that you expect to select from a menu of technologies rather than derive from constraints.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'What happens if a notification is delivered twice, or arrives an hour late?',
+      implies: 'You are probing the correctness and freshness requirements, which determine most of the machinery.',
+      why: 'Two answers give two different systems. If duplicates are unacceptable you need idempotency and deduplication throughout; if an hour late is fine, batching becomes available and the whole design gets cheaper. This question changes the design.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'How many users do we have?',
+      implies: 'You are sizing.',
+      why: 'Necessary, and less discriminating on its own. User count without notifications-per-user and delivery-channel mix does not size anything, and it does not reveal the correctness requirements that shape the design.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer bundles two or three such questions and states why each matters: 'Duplicates and lateness, because they decide how much deduplication machinery is justified; volume and channel mix, because they size it; and whether ordering matters between notifications, because that constrains partitioning.' Three questions in fifteen seconds, each with its consequence attached."
+/>
+
+<Check
+  concepts={['bottleneck', 'vertical-scaling']}
+  prompt="Midway through, the interviewer says: 'Now it is 100 times bigger.' What is the correct response?"
+  options={[
+    {
+      id: 'a',
+      text: 'Redesign with a distributed database, a streaming platform and multiple regions',
+      implies: 'You are replacing the design rather than evolving it.',
+      why: 'Restarting discards the derivation you built, and it is the specific behaviour the question is testing for. It also produces an architecture with no justification for most of its components.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Work out which component saturates first at the new number, change that one, and name the new problem it creates',
+      implies: 'You are evolving the design the way a real system evolves.',
+      why: 'This is exactly what the question tests. Apply the new numbers to the existing design, find the first thing that breaks, fix that, then look again. Naming the new problem each change introduces is what shows you understand the cost rather than just the technique.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Ask whether the growth is in reads, writes or storage',
+      implies: 'You are clarifying before acting.',
+      why: 'A good question and a good instinct — the three have completely different consequences. It is a strong opening to the answer rather than the whole answer, and should be followed immediately by working the numbers through.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer does the arithmetic out loud and reaches a specific conclusion: '100x writes takes us from 200 to 20,000 per second, which is past one primary, so now we partition — and the partition key has to be X because the dominant query is Y. That costs us cross-partition transactions, which affects the assignment flow.' Numbers, decision, and the cost of the decision."
+/>
+
+<CompleteCheck
+  concepts={['outbox', 'dual-write', 'idempotency', 'atomicity']}
+  prompt="An order service writes the order to its database and must notify four downstream services. A crash between the two steps currently loses the notification. What belongs in the gap?"
+  pipeline={[
+    { label: 'Order API', note: 'accepts request' },
+    { label: 'Database', note: 'one transaction' },
+    { label: 'Outbox table', note: 'same transaction', gap: true },
+    { label: 'Publisher', note: 'reads unpublished' },
+    { label: 'Message bus', note: 'four consumers' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'A table in the same database, written in the same transaction as the order, holding the message to be published. A separate process reads unpublished rows and sends them.',
+      implies: 'You are making the two writes one atomic local write rather than coordinating two systems.',
+      why: 'The order and the intent to notify now commit or fail together, because they are one transaction in one database. Publication becomes at-least-once, which consumers already have to handle, rather than lost messages, which they cannot. It needs no coordinator, no prepared transactions, and no second system to be available at write time.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'A retry wrapper around the publish call, with exponential backoff and a dead-letter destination.',
+      implies: 'You are making the publish more likely to succeed.',
+      why: 'It narrows the window and cannot close it. If the process dies after the commit and before the publish, there is no retry state anywhere, because the only record of the intent was in memory. Retries help when the caller survives, and the failure being fixed here is the one where it does not.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A distributed transaction spanning the database and the message bus, so both commit together.',
+      implies: 'You are reaching for atomicity across two systems.',
+      why: 'It would be correct if the bus participated, and it costs blocking on coordinator failure with locks held, plus availability that is now the product of both systems. For this shape, one database and one message, the outbox achieves the same guarantee with a single local transaction.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the two costs it accepts. The publisher is at-least-once, so consumers must be idempotent, which is usually free if they key on the order id. And the outbox table needs a retention policy or it becomes the fastest-growing table in the database within a year. It also states the general rule the gap illustrates: whenever two systems must agree, look first for a way to make one local write carry both facts."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'The full method, step by step', href: '/method' },
+    { label: 'Practise against a branching interviewer', href: '/interview' },
+    {
+      label: 'A worked case study with pressure rounds',
+      href: '/case-studies/url-shortener',
+    },
+    { label: 'Interview structure and communication expectations', sourceId: 'hello-interview' },
+  ]}
+/>

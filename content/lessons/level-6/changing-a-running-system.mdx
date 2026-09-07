@@ -1,0 +1,411 @@
+---
+id: changing-a-running-system
+title: Changing a System That Cannot Stop
+level: 6
+module: l6-change
+order: 1
+summary: During any rollout, two versions of your code run against one dataset. Every change has to be correct in both directions for as long as that lasts.
+difficulty: advanced
+minutes: 28
+prerequisites: [losing-something-large, backward-compatibility]
+concepts: [schema-migration, expand-contract, backward-compatibility, rollback, canary, blue-green, feature-flag, backfill, ci-cd]
+unlocks: [strangler-migration, iac, resharding]
+patterns: [expand-contract, strangler-fig]
+failures: [health-check-collapse]
+sources: [martin-fowler, sre-workbook, aws-well-architected, postgres-docs]
+status: reviewed
+---
+
+## The problem
+
+You rename a database column from `email` to `email_address`, update the code, and deploy.
+
+The deploy is a rolling one, so for four minutes the old version and the new version are both
+running. The old version writes to `email`, which no longer exists. Half your requests fail.
+
+You roll back. Now the new version's writes to `email_address` are invisible to the old code,
+and some of the data written during those four minutes is effectively lost.
+
+Nothing here was a bug in either version. Each was correct in isolation. The failure is that
+**a deploy is not an instant** — and any change that is not valid at every moment of the
+transition is a change that will break.
+
+## Intuition
+
+Two rules cover most of this:
+
+**Rule one: during a rollout, both versions exist.** So every change must be compatible with the
+version it is replacing, in both directions, for the whole rollout window. A rename is two
+incompatible changes wearing one commit.
+
+**Rule two: rollback is only real if the data written by the new version is readable by the old
+one.** A blue-green switch does not un-write rows. If the new version wrote a column the old
+version does not know about, rolling back leaves that data orphaned.
+
+Together they produce the standard technique, which is to never change anything in one step:
+
+1. **Expand.** Add the new thing. Both old and new shapes exist. Nothing reads the new one yet.
+2. **Write both.** New code writes both shapes; old code writes only the old. Both versions
+   remain valid.
+3. **Backfill.** Populate the new shape for existing data.
+4. **Migrate readers.** Switch reads to the new shape once it is complete.
+5. **Contract.** Once no running version depends on the old shape, remove it.
+
+Five deploys instead of one. It is slower, and it is the only version that is safe to roll back
+at every step.
+
+## Concretely
+
+<Example title="Renaming a column, safely">
+
+| Step | Deploy | Schema | Old code | New code |
+|---|---|---|---|---|
+| 1 | Migration only | Add `email_address`, nullable | Works | — |
+| 2 | Code | Both columns | Writes `email` | Writes both |
+| 3 | Backfill | Both columns | Works | Works |
+| 4 | Code | Both columns | Removed | Reads `email_address` |
+| 5 | Migration only | Drop `email` | — | Works |
+
+At every step, both currently-deployed versions work, and a rollback to the previous step is
+safe.
+
+Two details that matter:
+
+**The new column must be nullable, or have a default.** Adding a `NOT NULL` column without a
+default requires writing every existing row, which on a large table can lock it or take a long
+time.
+
+**The backfill must be batched and rate-limited.** Updating 400 million rows in one statement
+holds locks, generates enormous replication lag, and can consume the disk headroom the database
+needs. Batch it, sleep between batches, and monitor replication lag as you go.
+
+</Example>
+
+## Formal explanation
+
+<C id="expand-contract" /> — also called parallel change — is the general form: add the new,
+support both, migrate, remove the old. It applies well beyond database columns:
+
+- **API fields.** Add the new field, populate both, migrate consumers, remove the old. You cannot
+  remove a field until every client is updated, which for public APIs may be never.
+- **Message schemas.** Consumers must tolerate unknown fields, and producers must not remove
+  fields consumers still read. Schema evolution rules exist for exactly this.
+- **Configuration.** Accept both old and new keys during the transition.
+
+<C id="canary" /> deployment gives the new version a small share of real traffic and compares
+its metrics against the old. It bounds the blast radius of a bad release to the canary share,
+which is the largest safety gain available per unit of effort.
+
+<C id="feature-flag">Feature flags</C> separate deploy from release. The code ships dark and is
+enabled by configuration, so turning something off does not require a deploy — which matters
+because during an incident, a deploy is the slowest tool you have.
+
+<Callout kind="warn" title="Blue-green does not make schema changes safe">
+Switching traffic back does not un-write data. If the new version wrote rows the old version
+cannot read, or in a shape it does not understand, rollback leaves you with data the running
+code cannot interpret. Only expand-and-contract makes rollback genuinely safe.
+</Callout>
+
+<Deeper title="Backfilling at production scale">
+
+A backfill is a bulk write to a database that is simultaneously serving traffic. It has its own
+failure modes:
+
+- **Lock contention.** A single large `UPDATE` may hold locks for its duration. Batch by primary
+  key range, commit each batch.
+- **Replication lag.** Bulk writes generate a large volume of replication traffic, and replicas
+  fall behind. Since read traffic is served from replicas, your read path becomes stale — during
+  a migration, when you are least able to interpret anomalies.
+- **Disk and cleanup pressure.** Under MVCC, updating a row creates a new version. Backfilling a
+  large table can double its size until cleanup catches up.
+- **Resumability.** A backfill will be interrupted. It must record progress so it can resume
+  rather than restart.
+
+The practical shape: iterate in batches of a few thousand rows, sleep between batches, monitor
+replication lag and adapt the rate, record the last processed key, and make each batch
+idempotent so re-running is safe.
+
+<Claim label="recommendation">
+Treat a large backfill as a production change with its own rollout plan, monitoring, and abort
+criteria. It is one of the most common causes of self-inflicted incidents, precisely because it
+is thought of as a script rather than as a deploy.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Both versions running against one dataset, for the length of the rollout."
+  columns={[
+    { title: 'Traffic', nodes: [{ id: 'lb', label: 'Load balancer', note: 'splits by share' }] },
+    { title: 'Versions', nodes: [{ id: 'old', label: 'Version N', note: 'reads old shape' }, { id: 'new', label: 'Version N+1', note: 'writes both', tone: 'accent' }] },
+    { title: 'Control', nodes: [{ id: 'flag', label: 'Feature flag', note: 'release without deploy' }] },
+    { title: 'Data', nodes: [{ id: 'db', label: 'One database', note: 'both shapes valid' }] },
+  ]}
+  edges={[
+    { from: 'lb', to: 'old', label: '95%' },
+    { from: 'lb', to: 'new', label: '5% canary', tone: 'accent' },
+    { from: 'flag', to: 'new', label: 'gates behaviour' },
+    { from: 'old', to: 'db' },
+    { from: 'new', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'The assumption',
+      show: ['lb', 'new', 'db'],
+      because:
+        'Deploys are usually imagined as a switch from one version to another. That picture is what makes renames and one-step migrations look safe.',
+    },
+    {
+      label: 'The reality',
+      show: ['lb', 'old', 'new', 'db'],
+      because:
+        'Both versions run against one dataset for the length of the rollout, so the schema must be valid for both and the data written by each must be readable by the other.',
+    },
+    {
+      label: 'With control',
+      show: ['lb', 'old', 'new', 'flag', 'db'],
+      because:
+        'A canary share bounds the blast radius, and a flag lets you disable behaviour without deploying — which matters because during an incident a deploy is the slowest lever available.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Small table, low traffic',
+      behaviour:
+        'A one-step migration completes in seconds. Bad practice survives because nothing punishes it.',
+      firstToBreak: 'Nothing, which is how the habit forms.',
+    },
+    {
+      scale: 'Millions of rows',
+      behaviour:
+        'Adding a column with a default, or an index, takes minutes and may lock. The rollout window is now long enough for both versions to matter.',
+      firstToBreak: 'Write availability during the migration.',
+    },
+    {
+      scale: 'Hundreds of millions of rows',
+      behaviour:
+        'Backfills take hours to days. Replication lag becomes a first-class concern during the migration.',
+      firstToBreak:
+        'The read path, via replication lag, and the disk, via version accumulation.',
+    },
+    {
+      scale: 'Multiple services sharing the data',
+      behaviour:
+        'The contract step requires every consumer to have migrated, and you may not control all of them.',
+      firstToBreak:
+        'The removal step, which is often abandoned. Old columns and fields accumulate for years.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'One-step rename or type change',
+      symptom:
+        'Errors during the rollout window, from whichever version no longer matches the schema.',
+      cause: 'The schema was valid for one version at a time, but both were running.',
+      mitigation: 'Expand and contract. Never rename in one step.',
+    },
+    {
+      what: 'Rollback that cannot read new data',
+      symptom:
+        'Rolling back stops the errors and leaves records the old code cannot interpret, sometimes silently.',
+      cause:
+        'The new version wrote data in a shape the old version does not understand, and rollback does not un-write it.',
+      mitigation:
+        'Ensure every intermediate state is readable by both versions. Rollback safety is a property of the data, not of the deployment mechanism.',
+    },
+    {
+      what: 'Backfill overwhelming the database',
+      symptom:
+        'During a migration, replication lag grows to minutes, read replicas serve stale data, and user-facing latency degrades.',
+      cause: 'Unbatched or unthrottled bulk writes competing with production traffic.',
+      mitigation:
+        'Batch, throttle, monitor replication lag, and define abort criteria before starting.',
+    },
+    {
+      what: 'Contract step never happens',
+      symptom:
+        'Years of unused columns, dual writes, and dead code paths that everyone is afraid to remove.',
+      cause:
+        'The migration was treated as complete once the new path worked, and the cleanup was never scheduled.',
+      mitigation:
+        'Schedule the contract step as part of the original plan, with an owner and a date. Track dual-write code as debt with an expiry.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use expand-and-contract for every schema change, even trivial-looking ones"
+  options={[
+    'Change it in one step during a maintenance window',
+    'Change it in one step and accept a brief error window',
+    'Expand, dual-write, backfill, migrate readers, contract',
+  ]}
+  why="During any rollout, two versions run against one dataset. A change that is only valid for one of them is guaranteed to break, and the break lands mid-deploy, which is when diagnosis is hardest."
+  gain="Every intermediate state is valid, so rollback is safe at every step. No maintenance window. No error window. The migration can be paused indefinitely if something looks wrong."
+  sacrifice="Five deploys instead of one, and a period where the code writes both shapes and is therefore uglier. The temporary complexity is real and visible; the avoided incident is invisible."
+  failureModes={[
+    'The contract step never happens, leaving permanent dual-write code',
+    'The backfill is not rate-limited and causes the incident it was meant to avoid',
+    'The dual-write path has a bug that only shows in one of the two writes',
+  ]}
+  operationalBurden="Higher per change, lower in aggregate. Each step is boring and reversible, which is the point. It also makes the change reviewable in pieces."
+  cost="Engineering time, spread over several releases. Usually days rather than hours for a large table."
+  whenNot="For a genuinely new table or column that nothing reads yet, there is no old shape to be compatible with, so the ceremony is pointless. And for a small internal system where a brief maintenance window is genuinely acceptable and cheap to arrange, a one-step change during a quiet period is a reasonable trade — provided you say so deliberately rather than by default."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="martin-fowler">
+Parallel change — also called expand and contract — is the documented pattern for making
+breaking changes safely: introduce the new form alongside the old, migrate consumers
+incrementally, and remove the old form once nothing depends on it.
+</Claim>
+
+<Claim label="convention" source="sre-workbook">
+Progressive rollout with automated verification between stages is standard practice, because
+changes to production are among the most common causes of incidents and canary analysis catches
+regressions before full exposure.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL supports building indexes concurrently, avoiding the exclusive lock that a standard
+index build takes, at the cost of a longer build and the possibility of leaving an invalid index
+if it fails. Locking behaviour differs by operation and version, so it must be checked for the
+specific change.
+</Claim>
+
+<Claim label="recommendation">
+Write the rollback plan before the change, and make it specific enough to execute under
+pressure. "Roll back the deploy" is not a plan if the new version wrote data the old one cannot
+read.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know that deploys are not instantaneous and that rollback is a data question. This is one of the clearest separators between candidates who have operated a system and those who have only built one."
+  depth="Know expand-and-contract and be able to walk through a rename. Know that blue-green does not make schema changes reversible. Backfill throttling is a strong signal."
+  followUps={[
+    'Walk me through renaming a column with no downtime.',
+    'You deploy, it breaks, you roll back. Is the data safe?',
+    'How do you backfill 400 million rows without an incident?',
+    'What is the difference between deploying and releasing?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will do the migration during a maintenance window.',
+      why: 'It works for small systems and stops being available as you grow — and it trains the team to think of migrations as atomic, which is the mental model that causes the failures once windows are no longer possible.',
+      instead:
+        'Learn the incremental pattern even when a window is available. It is safer, it is reversible at every step, and it scales to systems where a window is not an option.',
+    },
+    {
+      mistake: 'Blue-green gives us instant rollback.',
+      why: 'It gives instant traffic rollback. It does not un-write data. If the new version wrote a new shape, the old version now reads data it does not understand.',
+      instead:
+        'Say what the new version wrote and whether the old version can read it. That is what determines whether rollback is real.',
+    },
+    {
+      mistake: 'The backfill is just a script.',
+      why: 'It is a bulk write against a production database serving traffic. Unbatched, it holds locks, generates replication lag, and can consume disk headroom.',
+      instead:
+        'Treat it as a production change: batched, throttled, resumable, monitored, with abort criteria agreed before it starts.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['expand-contract', 'rollback']}
+  prompt="You deploy a version that writes a new JSON column and stops writing the old text column. Ten minutes later you roll back. What is the state of the data?"
+  options={[
+    {
+      id: 'a',
+      text: 'Fine — rolling back restores the previous code and the previous behaviour',
+      implies: 'You are treating rollback as restoring a snapshot.',
+      why: 'Rollback restores code, not data. Ten minutes of writes went only to the new column. The old version does not read that column, so those records now appear empty or stale to the running application.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Ten minutes of writes are invisible to the rolled-back code, because they only exist in the new column',
+      implies: 'You separated code rollback from data state.',
+      why: 'This is exactly why the dual-write step exists. Had the new version written both shapes, rollback would have been genuinely safe, because everything written during the window would still be readable by the old code.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The database will reject writes from the old version',
+      implies: 'You are expecting a schema-level failure.',
+      why: 'The old column still exists — only the new version stopped writing it — so the old code writes to it happily. The problem is silent divergence rather than a visible error, which makes it worse.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the recovery: you now need a reconciliation pass to copy the new column back into the old for records written during the window, and you need to know exactly when the deploy started and finished to bound which records are affected. It then observes that dual-writing during the transition would have made all of this unnecessary."
+/>
+
+<Check
+  concepts={['canary', 'feature-flag']}
+  prompt="What is the difference between deploying and releasing, and why does it matter during an incident?"
+  options={[
+    {
+      id: 'a',
+      text: 'They are the same thing described at different levels of formality',
+      implies: 'You are treating shipping code as equivalent to enabling behaviour.',
+      why: 'Keeping them separate is one of the highest-leverage operational practices available. Deploying puts code on servers; releasing makes behaviour visible. Conflating them means every change to what users see requires a deploy.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Deploying ships code; releasing enables behaviour. Separating them means you can disable a feature without a deploy, which is far faster during an incident',
+      implies: 'You recognise that the speed of the mitigation lever matters more than its elegance.',
+      why: 'A deploy takes minutes and carries its own risk — it is a change to production while production is already unhealthy. A flag change takes seconds and is far more predictable. During an incident, the difference between a two-second mitigation and a ten-minute one is the difference between a blip and an outage.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Releasing means announcing the feature to users',
+      implies: 'You are using the marketing sense of the word.',
+      why: 'A real usage of the term, and not the operational one. Here it means the technical act of making the code path active, independently of shipping it.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the cost: flags accumulate, and a codebase with hundreds of stale flags has an enormous number of untested combinations. The discipline is to remove a flag once the decision it gated is permanent, and to treat long-lived flags as debt with an owner."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Parallel change (expand and contract)', sourceId: 'martin-fowler' },
+    { label: 'Progressive rollout and canary analysis', sourceId: 'sre-workbook' },
+    { label: 'Locking behaviour of schema operations', sourceId: 'postgres-docs' },
+    {
+      label: 'Next: knowing what is happening inside',
+      href: '/lessons/seeing-inside',
+    },
+  ]}
+/>

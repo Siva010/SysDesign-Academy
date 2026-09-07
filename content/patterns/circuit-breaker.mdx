@@ -1,0 +1,149 @@
+---
+id: circuit-breaker
+title: Circuit Breaker
+problem: A dependency is failing, and continuing to call it consumes resources you need for the requests that could still succeed.
+category: resilience
+concepts: [circuit-breaker, timeout, cascading-failure, graceful-degradation, retry-amplification, bulkhead]
+relatedPatterns: [bulkhead, cell-based-architecture]
+alsoKnownAs: [fail fast, trip switch]
+seenIn: [Service meshes, resilience libraries, API gateways]
+sources: [release-it, aws-builders-library, sre-book]
+status: reviewed
+---
+
+## Problem
+
+A dependency is broken — not slow, broken. Every call to it will fail, and each one takes the
+full timeout to find out.
+
+Meanwhile every call holds a worker, a connection and some memory for the duration. Your service
+is spending its entire capacity waiting for answers it is not going to get, and requests that do
+not need that dependency at all are queueing behind requests that do.
+
+Retrying makes it worse: more load on something already failing, and more workers held.
+
+## Pattern
+
+Track the failure rate of calls to a dependency. When it crosses a threshold, **stop calling**.
+
+Three states:
+
+- **Closed.** Calls pass through. Failures are counted.
+- **Open.** Calls fail immediately without attempting the dependency. No resources are consumed
+  waiting.
+- **Half-open.** After a cool-down, allow a small number of trial calls. If they succeed, close;
+  if they fail, open again.
+
+The value is not that failing fast is pleasant. It is that **failing in microseconds instead of
+seconds frees the resources that were being consumed by waiting**, which is what lets the rest
+of the service keep working.
+
+A breaker is most useful when paired with a fallback: a cached value, a default, or a degraded
+response. Without one, an open breaker converts a slow failure into a fast failure, which is
+better for the system and identical for the user.
+
+## Architecture
+
+<Arch
+  caption="The breaker sits between caller and dependency, and decides whether to try at all."
+  columns={[
+    { title: 'Caller', nodes: [{ id: 'app', label: 'Service' }] },
+    { title: 'Breaker', nodes: [{ id: 'cb', label: 'Circuit breaker', note: 'closed / open / half-open', tone: 'accent' }] },
+    { title: 'Outcome', nodes: [{ id: 'dep', label: 'Dependency' }, { id: 'fallback', label: 'Fallback', note: 'cached or default' }] },
+  ]}
+  edges={[
+    { from: 'app', to: 'cb' },
+    { from: 'cb', to: 'dep', label: 'closed' },
+    { from: 'cb', to: 'fallback', label: 'open', tone: 'danger' },
+  ]}
+/>
+
+## Advantages
+
+- **Resources are released.** Workers stop waiting, so unrelated endpoints keep working.
+- **The failing dependency gets a chance to recover.** Removing load is often what a struggling
+  service needs, and retries actively prevent it.
+- **Failure becomes fast and explicit**, so callers can degrade rather than hang.
+- **The half-open probe automates recovery** without a human deciding when to resume.
+
+## Costs
+
+- **Requests that would have succeeded are rejected** while the breaker is open. A dependency at
+  a 60% failure rate is still serving 40%, and an open breaker serves none of them.
+- **Thresholds are difficult to tune.** Too sensitive and transient blips trip it; too tolerant
+  and it never trips when it matters.
+- **Per-instance state is inconsistent.** Each instance has its own view, so the fleet does not
+  trip together. Shared state is more consistent and adds a dependency.
+- **The fallback path is rarely exercised**, which makes it the least-tested code running at the
+  worst possible moment.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Breaker on a required dependency with no fallback',
+      symptom: 'A brief blip in authentication produces a complete login outage for the cool-down period.',
+      cause: 'The breaker opened and there is nothing to degrade to, so every request fails immediately.',
+      mitigation: 'Reserve breakers for calls with a fallback. On required paths use tight timeouts and budgeted retries, and set thresholds so brief blips do not trip.',
+    },
+    {
+      what: 'Thundering herd on half-open',
+      symptom: 'The dependency recovers, the breaker closes, and it is immediately overwhelmed again.',
+      cause: 'Full traffic resumes the instant the probe succeeds.',
+      mitigation: 'Ramp traffic gradually after closing, and stagger the cool-down across instances so they do not all probe at once.',
+    },
+    {
+      what: 'Untested fallback',
+      symptom: 'The breaker opens correctly and the fallback throws an exception.',
+      cause: 'The fallback path only runs during failures, so it was never exercised.',
+      mitigation: 'Fault injection, and a flag that forces the breaker open in production during business hours.',
+    },
+    {
+      what: 'Breaker hides a real problem',
+      symptom: 'A dependency has been degraded for days and nobody noticed, because the fallback is good enough.',
+      cause: 'Graceful degradation without a corresponding alert.',
+      mitigation: 'Alert on breaker state changes and on time spent open. Degradation should be visible even when it is invisible to users.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The dependency is **optional**, or has a usable fallback.
+- Its failures are correlated rather than independent — when it fails, it fails for everyone, so
+  trying again immediately is pointless.
+- Calls to it are slow to fail, so waiting consumes meaningful resources.
+
+## When NOT to use it
+
+- **On a required dependency with no fallback.** The breaker converts "slow and sometimes
+  working" into "definitely failing", which is worse when there is no alternative response.
+  Timeouts and bulkheads give most of the resource protection without the all-or-nothing
+  behaviour.
+- **When failures are independent per request.** If a dependency fails 1% of calls at random,
+  the failures do not predict each other and a breaker will trip on noise. Retries are the right
+  tool for uncorrelated transient failure.
+- **When the dependency is fast to fail.** If a broken dependency returns an error in one
+  millisecond, waiting costs almost nothing and the breaker adds complexity for little gain.
+- **As a substitute for timeouts.** A breaker with no timeout still lets each trial call hang.
+  Timeouts are the foundation; the breaker sits on top.
+
+## Example systems
+
+<Claim label="convention" source="release-it">
+The circuit breaker is documented as a stability pattern whose purpose is to prevent a failing
+component from consuming the resources of its callers, and it is presented alongside timeouts and
+bulkheads as part of a set rather than in isolation.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Operational guidance at scale emphasises bounding the response to failure — retries, waiting and
+failover — rather than only preventing the initial failure, because the response is usually what
+turns a local problem into a global one.
+</Claim>
+
+<Claim label="recommendation" source="sre-book">
+Prefer degrading to failing. A response with one component missing is more useful than no
+response, which is why a breaker is most valuable when there is something to fall back to.
+</Claim>

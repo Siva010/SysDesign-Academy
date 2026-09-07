@@ -1,0 +1,432 @@
+---
+id: adversaries-and-abuse
+title: Adversaries and Abuse
+level: 6
+module: l6-adversaries
+order: 1
+summary: Security is a capacity problem with an opponent attached. Authorization is where systems actually fail, and rate limiting is where the architecture shows.
+difficulty: advanced
+minutes: 28
+prerequisites: [seeing-inside, authn]
+concepts: [authn, authz, session, jwt, oauth, rate-limiting, token-bucket, ddos, tenant-isolation, least-privilege, threat-modeling, audit-log, encryption-in-transit, secrets-management]
+unlocks: [cell-architecture, encryption-at-rest, key-management, data-residency]
+patterns: [token-bucket]
+sources: [rfc6749, rfc7519, rfc8446, cloudflare-blog, aws-well-architected]
+status: reviewed
+---
+
+## The problem
+
+Your API has authentication. Every request carries a valid token, and you check it.
+
+Then three things happen in the same month:
+
+- A user changes the ID in a URL from their own to someone else's and sees another customer's
+  invoice. The request was perfectly authenticated.
+- One customer's script sends 40,000 requests a second. Everyone else's latency triples. Nothing
+  was malicious; their retry loop had a bug.
+- A support engineer is demoted from admin. Their token remains valid, with admin claims, for
+  another 47 minutes.
+
+None of these is an authentication failure. Authentication is the part most teams get right,
+because it is a single well-defined checkpoint. The failures are in **authorization**,
+**resource limits** and **revocation** — three things that are spread across the whole system
+rather than concentrated at the door.
+
+## Intuition
+
+Two framings that make the rest of this lesson follow.
+
+**Authentication is a door. Authorization is every room.** You check identity once, at the edge,
+and then every single handler must independently decide whether *this* identity may act on
+*this* object. There is one door and a thousand rooms, which is why the rooms are where things go
+wrong.
+
+**Abuse is a capacity problem with an opponent.** Everything from Level 5 applies — bounds,
+shedding, isolation — with one difference: the load is adversarial, so it will find whatever you
+did not bound. That changes two things:
+
+1. **Rejection must be cheaper than service**, and by a wide margin, because the attacker
+   chooses the request rate.
+2. **The limit must be per identity**, not global, or one caller consumes everyone's capacity
+   while remaining within a global limit.
+
+The third framing is about time. A permission checked once and cached in a token is a permission
+that persists after it should have been revoked. Every design here trades **lookup cost** against
+**revocation speed**, and there is no option that avoids the trade.
+
+## Concretely
+
+<Example title="The three failures, and what each needed">
+
+**Broken object-level authorization.** `GET /invoices/8471` returns any invoice to any
+authenticated user. The token was valid; nothing checked that invoice 8471 belongs to this
+caller.
+
+The fix is structural rather than a patch: authorization checks belong in the data access layer
+where the query is constructed, so that the tenant or owner predicate cannot be forgotten.
+`WHERE id = ? AND account_id = ?` is enforced by construction; a separate `if` statement in a
+handler is enforced by memory.
+
+**Unbounded per-tenant consumption.** One customer at 40,000 requests per second. A global rate
+limit of 100,000 does not trigger, and everyone else's latency triples.
+
+The fix is a per-identity <C id="token-bucket" />: a sustained rate plus a burst allowance,
+applied per API key or per account, enforced at the edge before any expensive work.
+
+**Stale authorization in a token.** A <C id="jwt" /> carrying `role: admin` remains valid until
+it expires, so a demotion does not take effect for the token's lifetime.
+
+The fix is a deliberate choice: short-lived access tokens with a refresh step, so revocation
+takes minutes rather than hours; or server-side sessions, so it is instant at the cost of a
+lookup per request.
+
+</Example>
+
+## Formal explanation
+
+<C id="authn" /> establishes who is calling. <C id="authz" /> decides what they may do. The
+second is harder because it is contextual — it depends on the object, the action, and often the
+relationship between them.
+
+Two levels of authorization, and the second is where breaches happen:
+
+- **Function level.** May this role call this endpoint? Easy to centralise in middleware.
+- **Object level.** May this identity act on *this specific record*? Cannot be centralised in
+  middleware, because middleware does not know which object the handler is about to load. This
+  is where it fails.
+
+**Sessions versus tokens** is the revocation trade:
+
+<Claim label="fact" source="rfc7519">
+A JWT is a signed set of claims that a recipient can verify without contacting the issuer. There
+is no mechanism in the specification for invalidating a token before its expiry.
+</Claim>
+
+So a self-contained token means no lookup per request and no way to revoke early. A server-side
+session means a lookup per request and instant revocation. The common compromise is short-lived
+access tokens plus a refresh token checked against server state — which reintroduces the lookup,
+but only at refresh.
+
+<Claim label="fact" source="rfc6749">
+OAuth 2.0 is an authorization framework for delegated access: it lets a third party act on a
+resource owner's behalf without receiving their credentials. It is not an authentication
+protocol, which is what OpenID Connect adds on top.
+</Claim>
+
+<C id="rate-limiting" /> bounds consumption per identity. The token bucket allows a burst up to
+a stored allowance and then a sustained rate; the leaky bucket enforces a smooth rate with no
+burst. Bursty API clients usually want the former; a downstream system you are protecting usually
+wants the latter.
+
+<Callout kind="warn" title="Rate limiting on a fleet is approximate unless it is shared">
+Node-local counters mean a caller spread across 50 nodes sees 50 times the intended limit. Shared
+state is exact and adds a round trip to every request. The usual compromise is a local counter
+sized for the fleet, plus a shared check for the largest consumers.
+</Callout>
+
+<Deeper title="Where the edge has to do the work">
+
+Volumetric attacks cannot be filtered at your origin, because filtering requires receiving, and
+receiving is the thing you cannot afford.
+
+<Claim label="convention" source="cloudflare-blog">
+Absorbing volumetric attacks relies on distributing traffic across many locations, typically via
+anycast, so that no single site receives the full volume. Filtering at the origin is ineffective
+against attacks that saturate the origin's connectivity.
+</Claim>
+
+The general principle: **reject as early and as cheaply as possible.** Ordered by cost, cheapest
+first:
+
+1. Dropped at the network edge before reaching your infrastructure.
+2. Rejected at the edge proxy after a header check.
+3. Rejected at the API gateway after authentication.
+4. Rejected in the application after a database lookup.
+5. Served.
+
+An attacker's leverage is the ratio between what a request costs them and what it costs you.
+Anything that requires you to do expensive work before deciding to reject — an unindexed search,
+an expensive authorization query, a password hash on an unauthenticated endpoint — is an
+amplification opportunity, and it will be found.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Layers of rejection, cheapest first, and where authorization actually has to live."
+  columns={[
+    { title: 'Internet', nodes: [{ id: 'edge', label: 'Edge / anycast', note: 'volumetric', tone: 'accent' }] },
+    { title: 'Gateway', nodes: [{ id: 'gw', label: 'API gateway', note: 'authn + rate limit' }] },
+    { title: 'Service', nodes: [{ id: 'svc', label: 'Service', note: 'function-level authz' }] },
+    { title: 'Data access', nodes: [{ id: 'dal', label: 'Data layer', note: 'object-level authz' }] },
+    { title: 'Data', nodes: [{ id: 'db', label: 'Database' }, { id: 'audit', label: 'Audit log', note: 'append only' }] },
+  ]}
+  edges={[
+    { from: 'edge', to: 'gw', label: 'survivors' },
+    { from: 'gw', to: 'svc', label: 'authenticated' },
+    { from: 'svc', to: 'dal' },
+    { from: 'dal', to: 'db', label: 'scoped query' },
+    { from: 'dal', to: 'audit', label: 'who did what' },
+  ]}
+  stages={[
+    {
+      label: 'Authentication only',
+      show: ['gw', 'svc', 'db'],
+      because:
+        'Identity is checked at the door and every handler is trusted afterwards. This is the shape of most systems, and the reason object-level authorization failures are the most common serious vulnerability.',
+    },
+    {
+      label: 'Push authorization into the data layer',
+      show: ['gw', 'svc', 'dal', 'db', 'audit'],
+      because:
+        'Scoping queries by tenant or owner in the layer that builds them makes the check structural rather than remembered. A handler that forgets it gets no rows rather than the wrong rows.',
+    },
+    {
+      label: 'Reject early',
+      show: ['edge', 'gw', 'svc', 'dal', 'db', 'audit'],
+      because:
+        'Each layer outward is cheaper to reject at. Volumetric traffic must be absorbed before your origin, and per-identity limits must apply before expensive work begins.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Few users, trusted',
+      behaviour:
+        'Authentication is enough in practice. Object-level gaps exist and nobody has looked.',
+      firstToBreak: 'Nothing, until someone changes an ID in a URL.',
+    },
+    {
+      scale: 'Public API',
+      behaviour:
+        'Per-identity limits become necessary. Scrapers arrive. Authorization gaps are found by users, not attackers, first.',
+      firstToBreak: 'Capacity, via one enthusiastic integrator with a retry loop.',
+    },
+    {
+      scale: 'Multi-tenant at scale',
+      behaviour:
+        'Tenant isolation must be structural. One tenant must not be able to read or starve another.',
+      firstToBreak:
+        'The noisy neighbour, then trust, when a tenant sees another tenant\'s data.',
+    },
+    {
+      scale: 'Under attack',
+      behaviour:
+        'Volume exceeds what the origin can receive, let alone process. Filtering must happen upstream.',
+      firstToBreak:
+        'Connectivity, before any application logic runs.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Broken object-level authorization',
+      symptom:
+        'A user changes an identifier and sees another account\'s data. Frequently discovered by a curious customer.',
+      cause:
+        'Authentication was centralised and per-object authorization was left to each handler, so one handler forgot.',
+      mitigation:
+        'Enforce scoping where queries are built, so the tenant predicate cannot be omitted. Test with a second tenant, not just a second user.',
+    },
+    {
+      what: 'Rate limit that is not per identity',
+      symptom:
+        'One caller degrades service for everyone while staying under the global limit.',
+      cause:
+        'The limit was global, or per node, so it did not bound any individual consumer.',
+      mitigation:
+        'Limit per API key or account, enforced at the edge, with shared or fleet-adjusted counters.',
+    },
+    {
+      what: 'Revocation that does not take effect',
+      symptom:
+        'A user is removed or demoted and retains access until their token expires.',
+      cause:
+        'Permissions are embedded in a long-lived self-contained token with no revocation mechanism.',
+      mitigation:
+        'Short-lived access tokens with refresh, or server-side sessions. Choose deliberately and state the revocation window.',
+    },
+    {
+      what: 'Expensive work before authorization',
+      symptom:
+        'An unauthenticated or low-privilege endpoint becomes an amplification vector: small request, large cost.',
+      cause:
+        'The handler performs a search, a hash, or a large query before deciding whether the caller is allowed.',
+      mitigation:
+        'Authorize before doing work. Bound the cost of anything reachable without authentication, and rate limit it separately.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use short-lived access tokens with a refresh token, rather than long-lived tokens or server-side sessions"
+  options={[
+    'Server-side sessions: a lookup per request, instant revocation',
+    'Long-lived self-contained tokens: no lookup, no revocation',
+    'Short-lived access tokens plus refresh: no lookup on most requests, bounded revocation delay',
+  ]}
+  why="The choice is between per-request lookup cost and revocation speed, and the middle option bounds both. Most requests verify a signature with no I/O; revocation takes effect within the access token's lifetime rather than never."
+  gain="Services verify identity without a shared dependency, so the auth store is not on the critical path for every request and its outage does not immediately stop everything. Revocation delay is a number you choose."
+  sacrifice="Permissions in the token are stale for up to its lifetime, so a demotion is not immediate. Refresh adds a flow that must itself be secured, and refresh token theft is a real risk requiring rotation and reuse detection."
+  failureModes={[
+    'Access token lifetime set too long, so the revocation window is hours',
+    'Refresh tokens not rotated, so a stolen one is valid indefinitely',
+    'Sensitive permissions embedded in the token rather than checked at use time',
+  ]}
+  operationalBurden="Moderate. Key rotation, token lifetimes, refresh flow, and reuse detection. More moving parts than sessions, and less coupling between services."
+  cost="Minimal infrastructure. Signature verification is cheap; the refresh store is small relative to a full session store."
+  whenNot="When immediate revocation is a hard requirement — banning an abusive user, responding to a compromise, or a regulated environment where access must stop on the instant — server-side sessions are the correct answer and the lookup is the price. Keep the most sensitive authorization decisions out of the token entirely and check them at the point of use."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc8446">
+TLS 1.3 provides confidentiality and integrity for data in transit and authenticates the server.
+Its 0-RTT resumption mode explicitly does not provide replay protection, so it must only be used
+for requests that are safe to repeat.
+</Claim>
+
+<Claim label="convention" source="aws-well-architected">
+Least privilege, defence in depth, and traceability through audit logging are standard security
+design principles in architecture review frameworks. The emphasis is on limiting what a
+compromise can reach rather than on preventing all compromise.
+</Claim>
+
+<Claim label="convention" source="cloudflare-blog">
+Absorbing volumetric attacks depends on distributing traffic across many locations rather than
+filtering at the origin, because an attack large enough to saturate origin connectivity cannot
+be filtered by the origin.
+</Claim>
+
+<Claim label="recommendation">
+Make the audit log append-only and store it separately, with access controls independent of the
+system it audits. An audit trail that a compromised administrator can edit is not evidence.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you treat authorization as an architectural concern rather than a middleware setting, and whether your rate limiting is per identity. Interviewers introduce abuse because it usually invalidates an earlier assumption."
+  depth="Know the authn/authz distinction and why object-level checks are where failures occur. Know the token-versus-session revocation trade. Know that limits must be per identity and enforced early."
+  followUps={[
+    'A user changes the ID in the URL. What stops them seeing someone else\'s data?',
+    'One customer sends 40,000 requests per second. What happens?',
+    'You need to ban a user immediately. Can you?',
+    'Which endpoints are expensive before authentication?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We use JWTs, so authentication is handled.',
+      why: 'It describes how identity is transported and says nothing about whether each handler checks that this identity may act on this object. Object-level authorization is the common failure, and tokens do not address it.',
+      instead:
+        'Say where the object-level check lives and what makes it impossible to forget. "The data layer scopes every query by tenant" is an answer; "we validate the JWT" is not.',
+    },
+    {
+      mistake: 'We have rate limiting.',
+      why: 'Per what? A global limit does not stop one caller consuming everyone\'s capacity, and a per-node limit on a fleet of 50 is effectively 50 times looser than intended.',
+      instead:
+        'Specify the dimension — per API key, per account, per IP — where it is enforced, and how counters are shared across the fleet.',
+    },
+    {
+      mistake: 'Encryption at rest means the data is protected.',
+      why: 'It protects against stolen disks and mis-provisioned storage. It does nothing against a compromised application, which reads through the decryption layer like any legitimate caller.',
+      instead:
+        'State the threat each control addresses. Encryption at rest covers physical and provisioning threats; application compromise is covered by least privilege, isolation and audit.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['authz', 'tenant-isolation']}
+  prompt="Every endpoint validates the token correctly. A customer changes an invoice ID in the URL and sees another company's invoice. What failed, and where should the fix live?"
+  options={[
+    {
+      id: 'a',
+      text: 'Token validation was insufficient; tokens should include allowed resource IDs',
+      implies: 'You are trying to solve authorization at the authentication layer.',
+      why: 'Resource lists do not fit in a token and go stale immediately. The token correctly established who the caller is; the missing step is checking whether that caller owns this particular object, which depends on data the token cannot contain.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Object-level authorization was missing; the check belongs where queries are built, scoping by tenant so it cannot be forgotten',
+      implies: 'You recognise that per-object checks cannot be centralised in middleware and must be structural.',
+      why: 'Middleware does not know which object a handler is about to load, so the check has to be in the handler — and anything relying on every handler remembering will eventually be forgotten. Scoping in the data access layer makes the tenant predicate part of query construction, so a forgotten check returns no rows instead of the wrong ones.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'IDs should be unguessable UUIDs rather than sequential integers',
+      implies: 'You are removing the discoverability of the flaw.',
+      why: 'Worth doing as defence in depth, and it is not a fix. The authorization gap remains, and IDs leak through URLs, exports, referrers and support tickets. Obscurity narrows who finds it, not what happens when they do.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer adds the testing requirement: automated tests that attempt cross-tenant access on every endpoint, run in CI, because this class of bug is introduced by new endpoints rather than by changes to old ones. It also notes that the audit log should make such an access visible after the fact, since prevention is never complete."
+/>
+
+<Check
+  concepts={['rate-limiting', 'token-bucket']}
+  prompt="You add a rate limit of 1,000 requests per minute per API key, enforced with an in-memory counter on each of your 50 application servers. What is the actual limit a caller experiences?"
+  options={[
+    {
+      id: 'a',
+      text: '1,000 per minute, as configured',
+      implies: 'You are assuming counters are shared.',
+      why: 'Each server counts only the requests it sees. A caller whose requests are spread across the fleet by the load balancer accumulates a separate allowance on each server.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Up to 50,000 per minute, because each server counts independently',
+      implies: 'You spotted that node-local state does not aggregate.',
+      why: 'With even distribution, a caller gets the full allowance on every node. The configured limit is off by the fleet size, and it silently gets looser every time you scale out.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Somewhere between, depending on load balancer stickiness',
+      implies: 'You are accounting for uneven distribution.',
+      why: 'Directionally right and it understates the problem: a caller deliberately spreading requests reaches the full 50,000, and an attacker will do exactly that. The upper bound is what matters for a limit.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer gives the practical fix: divide the per-node allowance by fleet size as an approximation, or use shared counters for the largest consumers where exactness matters, accepting the extra round trip only for them. It also notes that the limit must be enforced before expensive work, or the rejection costs nearly as much as the request."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'OAuth 2.0: delegated authorization, not authentication', sourceId: 'rfc6749' },
+    { label: 'JWT structure and the absence of a revocation mechanism', sourceId: 'rfc7519' },
+    { label: 'Absorbing volumetric traffic at the edge', sourceId: 'cloudflare-blog' },
+    {
+      label: 'Next: what all of this costs, and whether it is worth it',
+      href: '/lessons/what-it-costs',
+    },
+  ]}
+/>

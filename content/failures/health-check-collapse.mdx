@@ -1,0 +1,128 @@
+---
+id: health-check-collapse
+title: The Health Check That Caused the Outage
+symptom: A dependency degrades slightly, and moments later every instance is removed from the load balancer.
+category: dependency
+concepts: [health-check, cascading-failure, graceful-degradation, load-shedding, blast-radius, timeout, circuit-breaker]
+sources: [sre-book, aws-builders-library, release-it]
+status: reviewed
+---
+
+## What you see
+
+**03:20** — The user-profile service starts responding slowly. Not failing: p99 goes from 40 ms
+to 2.5 seconds. It is still serving roughly 70% of requests within its normal latency.
+
+**03:21** — The checkout service's readiness endpoint, which calls user-profile to verify it can
+serve, begins timing out.
+
+**03:21:30** — The load balancer removes checkout instances that failed the check. Traffic
+concentrates on the remaining ones.
+
+**03:21:45** — The remaining instances, now carrying more load, fail their checks too.
+
+**03:22** — **Zero checkout instances are in the pool.** The load balancer has nowhere to route.
+Checkout availability is 0%.
+
+The user-profile service could have served 70% of requests throughout. Instead 100% failed,
+because the mechanism designed to route around failure removed all the capacity.
+
+## The mechanism
+
+The readiness check was written to be thorough:
+
+    GET /ready
+      → check database connection
+      → check cache connection
+      → call user-profile /ping
+      → return 200 if all succeed
+
+Every one of those is a **shared** dependency. Every instance checks the same user-profile
+service. So when user-profile degrades, every instance fails the check **at the same instant.**
+
+This is the crucial property: instances do not fail independently. A health check on a shared
+dependency converts an independent-failure mechanism into a correlated one.
+
+<Claim label="inference">
+Health checking assumes instances fail independently — that is the entire basis for removing an
+unhealthy one and routing to a healthy one. A check that depends on something all instances
+share violates that assumption, and the removal mechanism then amplifies the failure instead of
+containing it.
+</Claim>
+
+The second mechanism is load concentration. Removing instances does not reduce traffic; it
+redistributes it onto fewer machines. Those machines are now more loaded, so they are more likely
+to time out on the same check. The removal is self-reinforcing.
+
+## Why the obvious fixes make it worse
+
+**Making the check stricter.** More dependencies checked means more ways for every instance to
+fail simultaneously.
+
+**Shortening the check timeout.** Instances now fail the check under mild load, so the collapse
+happens sooner and more often.
+
+**Restarting the instances.** They start, fail the readiness check because the shared dependency
+is still degraded, and never enter the pool. Now you have zero capacity and no running instances
+either.
+
+## What actually works
+
+**Distinguish liveness from readiness, and keep shared dependencies out of both.**
+
+**Liveness — should this process be restarted?** Checks only local, in-process state: is the
+event loop responsive, are internal invariants intact. It must never check a downstream
+dependency, because restarting your process does not fix somebody else's service.
+
+**Readiness — should this instance receive traffic?** Checks that this instance has finished
+starting: configuration loaded, pools initialised. It may check a dependency **only if** the
+instance is genuinely useless without it *and* other instances might be fine — which, for a
+shared dependency, is never true.
+
+**Fail open at the balancer.** Most load balancers can be configured so that if too large a
+fraction of instances are unhealthy, they are all treated as healthy. The reasoning: if
+everything is unhealthy, the check is more likely to be wrong than the fleet.
+
+**Degrade rather than withdraw.** An instance that cannot reach user-profile should serve
+checkout without the profile data, or with cached profile data, and report that in its error
+rate. That is far more useful than removing itself.
+
+## How to prevent it
+
+- **Health checks depend only on local state.** Write this down as a rule, because the temptation
+  to add a dependency check is constant and each addition looks reasonable in isolation.
+- **Configure fail-open thresholds** on the load balancer, and know what they are.
+- **Treat an all-instances-unhealthy event as a check bug** until proven otherwise. It is far
+  more likely that the check is wrong than that every instance failed independently at the same
+  moment.
+- **Rehearse it.** Degrade a shared dependency in a test environment and confirm the fleet stays
+  in the pool.
+
+## How to detect it early
+
+- **Alert on the number of healthy instances**, not only on error rate. A sharp fall in pool
+  membership is the signal, and it precedes the user-visible outage by seconds.
+- **Alert on correlated health-check failures.** Instances failing together is diagnostic on its
+  own: independent failures do not synchronise.
+- **Track which dependency caused a check to fail**, so the removal has an attributable cause
+  rather than appearing as an unexplained fleet-wide event.
+
+## Related
+
+<Claim label="convention" source="sre-book">
+Separating liveness from readiness, and keeping shared dependencies out of the checks that
+control traffic routing, is documented practice. The failure it prevents is correlated removal of
+every instance in response to one degraded dependency.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Prefer degrading over withdrawing during overload. An instance serving a reduced share of
+requests correctly is more useful in the pool than out of it, and removing capacity during
+overload makes overload worse.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Failure propagation between components is the mechanism by which local problems become systemic.
+Mechanisms intended to isolate failure can propagate it when they depend on the thing that
+failed.
+</Claim>

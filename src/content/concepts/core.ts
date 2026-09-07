@@ -1,0 +1,721 @@
+import type { Concept } from '@/lib/types';
+
+/**
+ * Clusters: fundamentals, network, application.
+ *
+ * Editing rules (docs/02-knowledge-map.md):
+ *  - `requires` is for hard prerequisites only. If a correct explanation is *possible*
+ *    without B, then B does not belong in A.requires. Put it in B.leadsTo instead.
+ *  - `tensionWith` is the edge that teaches judgment. Prefer adding one over adding prose.
+ *  - `oneLiner` is the honest sentence, not a dictionary definition.
+ */
+export const CORE_CONCEPTS: Concept[] = [
+  /* ============================================================ fundamentals */
+  {
+    id: 'latency',
+    name: 'Latency',
+    aliases: ['response time', 'how slow', 'delay', 'slow requests'],
+    oneLiner: 'How long one request takes, from the caller point of view.',
+    cluster: 'fundamentals',
+    leadsTo: ['percentiles', 'tail-latency', 'latency-budget'],
+    tensionWith: ['throughput', 'consistency-generic'],
+    myth: 'Average latency describes user experience.',
+    mythCorrection:
+      'Averages hide the users who are suffering. A 100 ms mean with a 4 s p99 means 1 in 100 requests is unusable, and a single page making 20 calls will feel slow to most users.',
+  },
+  {
+    id: 'throughput',
+    name: 'Throughput',
+    aliases: ['requests per second', 'rps', 'qps', 'capacity'],
+    oneLiner: 'How much work the system completes per unit of time.',
+    cluster: 'fundamentals',
+    leadsTo: ['bottleneck', 'littles-law', 'horizontal-scaling'],
+    tensionWith: ['latency'],
+    myth: 'More throughput always means better performance.',
+    mythCorrection:
+      'Pushing utilisation toward 100% maximises throughput and destroys latency. Queueing delay rises non-linearly as a resource approaches saturation.',
+  },
+  {
+    id: 'percentiles',
+    name: 'Percentiles',
+    aliases: ['p50', 'p99', 'p999', 'tail'],
+    oneLiner: 'The latency that a given fraction of requests come in under.',
+    cluster: 'fundamentals',
+    requires: ['latency'],
+    leadsTo: ['tail-latency', 'sli'],
+    myth: 'You can average percentiles across servers.',
+    mythCorrection:
+      'Averaging p99s from ten machines gives a number that describes nothing. Percentiles must be computed from a merged distribution, which is why histogram-based metrics exist.',
+  },
+  {
+    id: 'tail-latency',
+    name: 'Tail latency',
+    aliases: ['slow tail', 'p99 problem', 'stragglers'],
+    oneLiner:
+      'The slow end of the latency distribution, which dominates user experience once a request touches many services.',
+    cluster: 'fundamentals',
+    requires: ['percentiles'],
+    leadsTo: ['hedged-request', 'fanout-latency-amplification'],
+    myth: 'The tail is rare, so it does not matter.',
+    mythCorrection:
+      'If one page issues 100 parallel calls, the probability that at least one hits the p99 is about 1 - 0.99^100, roughly 63%. Fanout converts a rare event into the common case.',
+  },
+  {
+    id: 'fanout-latency-amplification',
+    name: 'Fanout latency amplification',
+    oneLiner:
+      'A request that waits on N parallel dependencies inherits the slowest of N, not the average.',
+    cluster: 'fundamentals',
+    requires: ['tail-latency'],
+    leadsTo: ['hedged-request', 'timeout'],
+  },
+  {
+    id: 'throughput-vs-goodput',
+    name: 'Goodput',
+    aliases: ['useful throughput', 'wasted work'],
+    oneLiner: 'The share of completed work that anyone actually wanted by the time it finished.',
+    cluster: 'fundamentals',
+    requires: ['throughput'],
+    leadsTo: ['load-shedding', 'timeout'],
+    myth: 'A saturated server doing 50k requests per second is doing useful work.',
+    mythCorrection:
+      'If clients time out at 1 s and the queue is 3 s deep, every response is discarded on arrival. Throughput stays high while goodput goes to zero.',
+  },
+  {
+    id: 'availability',
+    name: 'Availability',
+    aliases: ['uptime', 'nines', 'five nines'],
+    oneLiner: 'The fraction of time the system does the job it promised.',
+    cluster: 'fundamentals',
+    leadsTo: ['availability-math', 'slo', 'redundancy'],
+    tensionWith: ['consistency-generic', 'cost'],
+    myth: 'Availability is a property you add with more servers.',
+    mythCorrection:
+      'Adding components in the request path multiplies failure probability. Redundancy raises availability only when the redundant parts fail independently and failover actually works.',
+  },
+  {
+    id: 'availability-math',
+    name: 'Availability arithmetic',
+    aliases: ['nines calculation', 'error budget minutes'],
+    oneLiner:
+      'Series dependencies multiply availability; independent redundancy multiplies unavailability.',
+    cluster: 'fundamentals',
+    requires: ['availability'],
+    leadsTo: ['error-budget', 'redundancy'],
+  },
+  {
+    id: 'durability',
+    name: 'Durability',
+    aliases: ['data loss', 'persistence'],
+    oneLiner: 'Once you say yes, the data survives, including things you did not plan for.',
+    cluster: 'fundamentals',
+    leadsTo: ['wal', 'replication-generic', 'rpo'],
+    tensionWith: ['latency'],
+    myth: 'Writing to disk means the data is durable.',
+    mythCorrection:
+      'A write can sit in the OS page cache, in a disk write cache, or on one machine that is about to burn. Durability is a claim about how many independent failure domains hold the data.',
+  },
+  {
+    id: 'reliability',
+    name: 'Reliability',
+    oneLiner: 'The system keeps doing the right thing, including when parts of it are wrong.',
+    cluster: 'fundamentals',
+    requires: ['availability'],
+    leadsTo: ['fault-tolerance', 'slo'],
+  },
+  {
+    id: 'fault-tolerance',
+    name: 'Fault tolerance',
+    oneLiner: 'A fault is a component misbehaving; a failure is the system failing its users. Tolerance is stopping the first from becoming the second.',
+    cluster: 'fundamentals',
+    requires: ['reliability'],
+    leadsTo: ['redundancy', 'graceful-degradation', 'blast-radius'],
+  },
+  {
+    id: 'scalability',
+    name: 'Scalability',
+    oneLiner:
+      'The ability to handle growth by adding resources, rather than by rewriting the system.',
+    cluster: 'fundamentals',
+    requires: ['throughput'],
+    leadsTo: ['horizontal-scaling', 'vertical-scaling'],
+    myth: 'Scalable means fast.',
+    mythCorrection:
+      'Scalability is about the shape of the cost curve as load grows. A scalable system can be slower than an unscalable one at low load, and often is.',
+  },
+  {
+    id: 'consistency-generic',
+    name: 'Consistency (informal)',
+    aliases: ['stale data', 'up to date'],
+    oneLiner: 'Whether a reader sees the effects of writes that have already been accepted.',
+    cluster: 'fundamentals',
+    leadsTo: ['linearizability', 'eventual-consistency', 'staleness'],
+    tensionWith: ['availability', 'latency'],
+    myth: 'The C in ACID and the C in CAP are the same thing.',
+    mythCorrection:
+      'ACID consistency means the database preserves your declared invariants. CAP consistency means reads observe the latest committed write. They are unrelated properties that share a word.',
+  },
+  {
+    id: 'correctness',
+    name: 'Correctness',
+    oneLiner: 'The system never produces an answer that violates a rule you actually care about.',
+    cluster: 'fundamentals',
+    leadsTo: ['acid', 'idempotency'],
+    tensionWith: ['availability', 'latency'],
+  },
+  {
+    id: 'elasticity',
+    name: 'Elasticity',
+    oneLiner: 'Capacity that follows demand up and, crucially, back down.',
+    cluster: 'fundamentals',
+    requires: ['scalability'],
+    leadsTo: ['autoscaling', 'cost'],
+    myth: 'Autoscaling handles traffic spikes.',
+    mythCorrection:
+      'Scaling takes minutes; spikes take seconds. Autoscaling handles trends. Spikes are handled by headroom, queues, shedding, and caching.',
+  },
+  {
+    id: 'operability',
+    name: 'Operability',
+    oneLiner: 'How hard it is for humans to keep the system healthy at 3am.',
+    cluster: 'fundamentals',
+    leadsTo: ['observability', 'incident-response', 'operational-burden'],
+    tensionWith: ['scalability'],
+  },
+  {
+    id: 'operational-burden',
+    name: 'Operational burden',
+    aliases: ['ops cost', 'toil'],
+    oneLiner:
+      'The ongoing human cost of running a design: upgrades, capacity, on-call, failure drills.',
+    cluster: 'fundamentals',
+    requires: ['operability'],
+    tensionWith: ['microservices', 'sharding'],
+  },
+  {
+    id: 'maintainability',
+    name: 'Maintainability',
+    oneLiner: 'How cheaply the system can be changed by people who did not build it.',
+    cluster: 'fundamentals',
+    leadsTo: ['modular-monolith', 'service-boundary'],
+  },
+  {
+    id: 'cost',
+    name: 'Cost',
+    aliases: ['money', 'infrastructure spend', 'budget'],
+    oneLiner:
+      'Infrastructure plus engineering time plus operational load. Architecture is a spending decision.',
+    cluster: 'fundamentals',
+    leadsTo: ['capacity-planning', 'cost-optimisation'],
+    tensionWith: ['availability', 'multi-region'],
+  },
+  {
+    id: 'functional-requirements',
+    name: 'Functional requirements',
+    oneLiner: 'What the system must do.',
+    cluster: 'fundamentals',
+    leadsTo: ['non-functional-requirements', 'requirement-clarification'],
+  },
+  {
+    id: 'non-functional-requirements',
+    name: 'Non-functional requirements',
+    aliases: ['nfr', 'quality attributes'],
+    oneLiner:
+      'How well it must do it: latency, availability, durability, consistency, scale, cost, security.',
+    cluster: 'fundamentals',
+    requires: ['functional-requirements'],
+    leadsTo: ['slo', 'capacity-planning'],
+    myth: 'Non-functional requirements are secondary.',
+    mythCorrection:
+      'They are what determines the architecture. Two systems with identical features and different latency targets are different systems.',
+  },
+  {
+    id: 'requirement-clarification',
+    name: 'Requirement clarification',
+    aliases: ['asking questions', 'scoping'],
+    oneLiner:
+      'Turning a vague prompt into a bounded problem by finding the constraints that change the design.',
+    cluster: 'fundamentals',
+    requires: ['non-functional-requirements'],
+    leadsTo: ['back-of-envelope'],
+  },
+  {
+    id: 'back-of-envelope',
+    name: 'Back-of-the-envelope estimation',
+    aliases: ['capacity estimate', 'napkin math', 'sizing'],
+    oneLiner:
+      'Deriving the order of magnitude of load, storage and bandwidth from stated assumptions.',
+    cluster: 'fundamentals',
+    requires: ['throughput'],
+    leadsTo: ['capacity-planning', 'partitioning'],
+    myth: 'Estimation means memorising latency numbers.',
+    mythCorrection:
+      'It means making assumptions explicit and checking whether the answer changes the design. If 10x uncertainty does not change your architecture, stop estimating.',
+  },
+  {
+    id: 'bottleneck',
+    name: 'Bottleneck',
+    aliases: ['limiting resource', 'saturation'],
+    oneLiner: 'The one resource that decides your throughput. Everything else is decoration.',
+    cluster: 'fundamentals',
+    requires: ['throughput'],
+    leadsTo: ['golden-signals', 'horizontal-scaling'],
+  },
+  {
+    id: 'littles-law',
+    name: "Little's law",
+    aliases: ['concurrency formula', 'L = lambda W'],
+    oneLiner:
+      'Concurrent requests equals arrival rate times average time in system. It tells you how many threads, connections, or workers you need.',
+    cluster: 'fundamentals',
+    requires: ['throughput', 'latency'],
+    leadsTo: ['connection-pooling', 'backpressure'],
+  },
+  {
+    id: 'capacity-headroom',
+    name: 'Capacity headroom',
+    oneLiner:
+      'The gap between normal load and the point where latency falls apart. It is the only thing absorbing a spike.',
+    cluster: 'fundamentals',
+    requires: ['bottleneck'],
+    leadsTo: ['capacity-planning', 'autoscaling'],
+    tensionWith: ['cost'],
+  },
+
+  /* ============================================================ network */
+  {
+    id: 'dns',
+    name: 'DNS',
+    aliases: ['domain name', 'name resolution', 'nameserver'],
+    oneLiner: 'A globally cached, hierarchical lookup from names to addresses.',
+    cluster: 'network',
+    leadsTo: ['dns-ttl', 'geo-routing', 'anycast'],
+    myth: 'Changing a DNS record moves traffic immediately.',
+    mythCorrection:
+      'Resolvers, operating systems, and applications all cache. Some ignore your TTL. DNS is a slow, unreliable failover mechanism.',
+  },
+  {
+    id: 'dns-ttl',
+    name: 'DNS TTL',
+    oneLiner:
+      'How long a resolver may cache an answer, and therefore the floor on how fast DNS-based failover can be.',
+    cluster: 'network',
+    requires: ['dns'],
+    leadsTo: ['failover'],
+    tensionWith: ['dns'],
+  },
+  {
+    id: 'ip',
+    name: 'IP',
+    oneLiner: 'Best-effort packet delivery between addresses. No guarantees at all.',
+    cluster: 'network',
+    leadsTo: ['tcp', 'udp', 'anycast'],
+  },
+  {
+    id: 'tcp',
+    name: 'TCP',
+    aliases: ['connection', 'three-way handshake'],
+    oneLiner: 'An ordered, reliable byte stream built on top of unreliable packets.',
+    cluster: 'network',
+    requires: ['ip'],
+    leadsTo: ['keep-alive', 'connection-pooling', 'head-of-line-blocking', 'tls'],
+    tensionWith: ['udp'],
+  },
+  {
+    id: 'udp',
+    name: 'UDP',
+    oneLiner: 'Packets, unordered and unacknowledged. You build the guarantees you need.',
+    cluster: 'network',
+    requires: ['ip'],
+    leadsTo: ['quic'],
+  },
+  {
+    id: 'tls',
+    name: 'TLS',
+    aliases: ['https', 'ssl', 'encryption in transit'],
+    oneLiner: 'Confidentiality, integrity and server identity, negotiated before your bytes flow.',
+    cluster: 'network',
+    requires: ['tcp'],
+    leadsTo: ['tls-termination', 'encryption-in-transit'],
+  },
+  {
+    id: 'tls-termination',
+    name: 'TLS termination',
+    oneLiner: 'Where the encrypted connection ends and plaintext begins inside your network.',
+    cluster: 'network',
+    requires: ['tls', 'reverse-proxy'],
+    leadsTo: ['l4-vs-l7', 'tenant-isolation'],
+  },
+  {
+    id: 'rtt',
+    name: 'Round-trip time',
+    aliases: ['rtt', 'ping'],
+    oneLiner:
+      'The unavoidable floor set by distance and the speed of light in fibre. No amount of compute removes it.',
+    cluster: 'network',
+    requires: ['ip'],
+    leadsTo: ['cdn', 'multi-region', 'latency-budget'],
+  },
+  {
+    id: 'latency-budget',
+    name: 'Latency budget',
+    oneLiner:
+      'Splitting a user-facing latency target across every hop, so each component knows what it may spend.',
+    cluster: 'network',
+    requires: ['rtt', 'latency'],
+    leadsTo: ['timeout', 'slo'],
+  },
+  {
+    id: 'http',
+    name: 'HTTP',
+    aliases: ['request response', 'rest over http'],
+    oneLiner: 'A stateless request/response protocol with well-defined caching and method semantics.',
+    cluster: 'network',
+    requires: ['tcp'],
+    leadsTo: ['http-caching', 'rest', 'idempotency'],
+  },
+  {
+    id: 'http-caching',
+    name: 'HTTP caching',
+    aliases: ['cache-control', 'etag', 'browser cache'],
+    oneLiner:
+      'Standardised freshness and validation rules that let anything between client and server store a response.',
+    cluster: 'network',
+    requires: ['http'],
+    leadsTo: ['cdn', 'cache-invalidation', 'staleness'],
+    tensionWith: ['consistency-generic'],
+  },
+  {
+    id: 'quic',
+    name: 'QUIC',
+    oneLiner:
+      'A transport over UDP with per-stream reliability, so one lost packet does not stall unrelated streams.',
+    cluster: 'network',
+    requires: ['udp', 'tls'],
+    leadsTo: ['head-of-line-blocking'],
+  },
+  {
+    id: 'head-of-line-blocking',
+    name: 'Head-of-line blocking',
+    oneLiner: 'One stuck item at the front delays everything behind it, in queues and in transports alike.',
+    cluster: 'network',
+    requires: ['tcp'],
+    leadsTo: ['quic', 'partition-ordering'],
+  },
+  {
+    id: 'keep-alive',
+    name: 'Keep-alive',
+    aliases: ['persistent connection'],
+    oneLiner: 'Reusing a connection so you stop paying handshake costs on every request.',
+    cluster: 'network',
+    requires: ['tcp'],
+    leadsTo: ['connection-pooling'],
+  },
+  {
+    id: 'connection-pooling',
+    name: 'Connection pooling',
+    oneLiner: 'A bounded set of reusable connections, which is also a bounded concurrency limit.',
+    cluster: 'network',
+    requires: ['keep-alive', 'littles-law'],
+    leadsTo: ['connection-exhaustion', 'backpressure'],
+  },
+  {
+    id: 'proxy',
+    name: 'Proxy',
+    oneLiner: 'A middlebox that forwards traffic on behalf of the client.',
+    cluster: 'network',
+    requires: ['http'],
+    leadsTo: ['reverse-proxy'],
+  },
+  {
+    id: 'reverse-proxy',
+    name: 'Reverse proxy',
+    oneLiner:
+      'A middlebox that forwards traffic on behalf of the server, and becomes the natural home for TLS, routing, caching and rate limiting.',
+    cluster: 'network',
+    requires: ['proxy'],
+    leadsTo: ['load-balancer', 'api-gateway', 'tls-termination'],
+  },
+  {
+    id: 'load-balancer',
+    name: 'Load balancer',
+    aliases: ['lb', 'traffic distribution'],
+    oneLiner:
+      'Spreads requests across interchangeable servers and stops sending traffic to broken ones.',
+    cluster: 'network',
+    requires: ['reverse-proxy'],
+    leadsTo: ['statelessness', 'health-check', 'l4-vs-l7', 'load-distribution'],
+    myth: 'A load balancer makes a system highly available.',
+    mythCorrection:
+      'It removes one failure mode and adds itself as a new one. Availability comes from the balancer being redundant, its health checks being accurate, and the backends failing independently.',
+  },
+  {
+    id: 'l4-vs-l7',
+    name: 'L4 vs L7 load balancing',
+    oneLiner:
+      'L4 moves connections and is cheap and opaque; L7 understands requests and can route, retry and cache.',
+    cluster: 'network',
+    requires: ['load-balancer'],
+    leadsTo: ['api-gateway'],
+  },
+  {
+    id: 'health-check',
+    name: 'Health check',
+    oneLiner: 'The signal that decides whether an instance keeps receiving traffic.',
+    cluster: 'network',
+    requires: ['load-balancer'],
+    leadsTo: ['cascading-failure', 'graceful-degradation'],
+    myth: 'A health check should verify every dependency.',
+    mythCorrection:
+      'A deep health check turns one slow dependency into a fleet-wide outage: every instance reports unhealthy at once and the balancer has nowhere to send traffic.',
+  },
+  {
+    id: 'cdn',
+    name: 'CDN',
+    aliases: ['edge cache', 'content delivery network'],
+    oneLiner: 'Copies of your bytes near your users, so distance stops costing you round trips.',
+    cluster: 'network',
+    requires: ['http-caching', 'rtt'],
+    leadsTo: ['cache-invalidation', 'anycast', 'large-object'],
+    tensionWith: ['staleness'],
+  },
+  {
+    id: 'anycast',
+    name: 'Anycast',
+    oneLiner: 'One address announced from many places; the network routes each user to a near one.',
+    cluster: 'network',
+    requires: ['ip'],
+    leadsTo: ['cdn', 'geo-routing', 'ddos'],
+  },
+  {
+    id: 'geo-routing',
+    name: 'Geographic routing',
+    oneLiner: 'Sending users to the nearest or healthiest region, by DNS, anycast, or both.',
+    cluster: 'network',
+    requires: ['anycast', 'dns'],
+    leadsTo: ['multi-region', 'data-residency'],
+  },
+  {
+    id: 'service-discovery',
+    name: 'Service discovery',
+    oneLiner: 'How a service finds the current, healthy addresses of another service.',
+    cluster: 'network',
+    requires: ['load-balancer'],
+    leadsTo: ['heartbeat', 'control-plane-vs-data-plane'],
+  },
+  {
+    id: 'websocket',
+    name: 'WebSocket',
+    oneLiner:
+      'A long-lived bidirectional connection, which turns a stateless tier into a stateful one.',
+    cluster: 'network',
+    requires: ['http', 'tcp'],
+    leadsTo: ['statelessness', 'connection-exhaustion', 'push-vs-pull'],
+  },
+  {
+    id: 'push-vs-pull',
+    name: 'Push vs pull delivery',
+    oneLiner:
+      'Either the server holds a connection and pushes, or the client asks repeatedly. Both cost, differently.',
+    cluster: 'network',
+    requires: ['websocket'],
+    leadsTo: ['fanout-on-write', 'thundering-herd'],
+  },
+
+  /* ============================================================ application */
+  {
+    id: 'statelessness',
+    name: 'Statelessness',
+    aliases: ['stateless service', 'shared nothing'],
+    oneLiner:
+      'A server that holds nothing a subsequent request needs, so any instance can serve any request.',
+    cluster: 'application',
+    requires: ['load-balancer'],
+    leadsTo: ['horizontal-scaling', 'session-state'],
+    myth: 'Stateless means the system has no state.',
+    mythCorrection:
+      'The state moved, it did not vanish. It now lives in a database, cache or token, and that store becomes the thing you must scale and protect.',
+  },
+  {
+    id: 'session-state',
+    name: 'Session state',
+    oneLiner: 'Per-user data that must survive between requests, and therefore must live somewhere.',
+    cluster: 'application',
+    requires: ['statelessness'],
+    leadsTo: ['distributed-cache', 'jwt', 'sticky-sessions'],
+  },
+  {
+    id: 'sticky-sessions',
+    name: 'Sticky sessions',
+    aliases: ['session affinity'],
+    oneLiner: 'Pinning a user to one server so its local memory stays useful.',
+    cluster: 'application',
+    requires: ['session-state'],
+    tensionWith: ['statelessness', 'load-distribution'],
+    myth: 'Sticky sessions are a scaling technique.',
+    mythCorrection:
+      'They are a way to avoid moving state, at the cost of uneven load, painful deploys, and losing sessions when an instance dies.',
+  },
+  {
+    id: 'monolith',
+    name: 'Monolith',
+    oneLiner: 'One deployable unit. Simple to run, easy to couple.',
+    cluster: 'application',
+    leadsTo: ['modular-monolith', 'microservices'],
+  },
+  {
+    id: 'modular-monolith',
+    name: 'Modular monolith',
+    oneLiner:
+      'Enforced internal boundaries inside one deployable, giving most of the design benefit of services without the distributed-systems bill.',
+    cluster: 'application',
+    requires: ['monolith'],
+    leadsTo: ['service-boundary', 'microservices'],
+    tensionWith: ['microservices'],
+  },
+  {
+    id: 'microservices',
+    name: 'Microservices',
+    oneLiner:
+      'Independently deployable services, bought with network calls, partial failure, and operational overhead.',
+    cluster: 'application',
+    requires: ['modular-monolith', 'service-boundary'],
+    leadsTo: ['distributed-transaction', 'observability', 'api-gateway'],
+    tensionWith: ['operational-burden', 'modular-monolith'],
+    myth: 'Microservices are how you scale.',
+    mythCorrection:
+      'Scaling is achieved by running more copies of something, which a monolith does perfectly well. Microservices scale *teams* and deployment independence, and they cost you consistency, latency and debuggability.',
+  },
+  {
+    id: 'service-boundary',
+    name: 'Service boundary',
+    oneLiner:
+      'A line drawn where data ownership and change frequency change, not where the org chart happens to split.',
+    cluster: 'application',
+    requires: ['maintainability'],
+    leadsTo: ['microservices', 'coupling'],
+  },
+  {
+    id: 'coupling',
+    name: 'Coupling',
+    oneLiner:
+      'How much one component must know about, or wait for, another. It is the real cost driver in distributed design.',
+    cluster: 'application',
+    requires: ['service-boundary'],
+    leadsTo: ['sync-vs-async', 'cascading-failure'],
+  },
+  {
+    id: 'api-design',
+    name: 'API design',
+    oneLiner: 'A contract that outlives every implementation behind it.',
+    cluster: 'application',
+    requires: ['http'],
+    leadsTo: ['rest', 'rpc', 'versioning', 'idempotency'],
+  },
+  {
+    id: 'rest',
+    name: 'REST',
+    oneLiner:
+      'Resource-shaped HTTP that inherits caching, idempotency and intermediaries for free.',
+    cluster: 'application',
+    requires: ['api-design', 'http'],
+    leadsTo: ['http-caching', 'versioning'],
+    tensionWith: ['grpc', 'graphql'],
+  },
+  {
+    id: 'rpc',
+    name: 'RPC',
+    oneLiner: 'Calling a remote function as if it were local, which is a useful lie with sharp edges.',
+    cluster: 'application',
+    requires: ['api-design'],
+    leadsTo: ['grpc', 'timeout'],
+    myth: 'A remote call is like a local call.',
+    mythCorrection:
+      'A local call cannot time out, arrive twice, or half-succeed. Every RPC needs a timeout, a retry policy, and an idempotency story.',
+  },
+  {
+    id: 'grpc',
+    name: 'gRPC',
+    oneLiner:
+      'Schema-first binary RPC over HTTP/2: fast and strongly typed, opaque to HTTP caches and browsers.',
+    cluster: 'application',
+    requires: ['rpc'],
+    tensionWith: ['rest'],
+  },
+  {
+    id: 'graphql',
+    name: 'GraphQL',
+    oneLiner:
+      'A query language that moves shape decisions to the client, and moves the performance problem to the server.',
+    cluster: 'application',
+    requires: ['api-design'],
+    leadsTo: ['n-plus-one'],
+    tensionWith: ['rest', 'http-caching'],
+    myth: 'GraphQL removes over-fetching, so it is faster.',
+    mythCorrection:
+      'It moves fetching into resolvers, where an innocent query can trigger unbounded database work. Cost analysis, depth limits and batching become mandatory.',
+  },
+  {
+    id: 'n-plus-one',
+    name: 'N+1 query problem',
+    oneLiner: 'One query to get a list, then one query per item. The classic accidental fanout.',
+    cluster: 'application',
+    requires: ['query-plan'],
+    leadsTo: ['batching'],
+  },
+  {
+    id: 'batching',
+    name: 'Batching',
+    oneLiner: 'Amortising per-request overhead by doing many things in one round trip.',
+    cluster: 'application',
+    requires: ['rtt'],
+    leadsTo: ['throughput'],
+    tensionWith: ['latency'],
+  },
+  {
+    id: 'sync-vs-async',
+    name: 'Synchronous vs asynchronous',
+    aliases: ['blocking call', 'background job'],
+    oneLiner:
+      'Either the caller waits for the work and owns its failure, or it hands the work off and owns the uncertainty.',
+    cluster: 'application',
+    requires: ['coupling'],
+    leadsTo: ['queue', 'eventual-consistency', 'idempotency'],
+  },
+  {
+    id: 'event-driven',
+    name: 'Event-driven architecture',
+    oneLiner:
+      'Components publish what happened instead of calling who cares, decoupling producers from an unknown set of consumers.',
+    cluster: 'application',
+    requires: ['sync-vs-async', 'pubsub'],
+    leadsTo: ['event-sourcing', 'eventual-consistency', 'observability'],
+    tensionWith: ['operability'],
+  },
+  {
+    id: 'api-gateway',
+    name: 'API gateway',
+    oneLiner:
+      'One entry point that handles auth, rate limiting, routing and shaping, so services do not each reimplement them.',
+    cluster: 'application',
+    requires: ['reverse-proxy'],
+    leadsTo: ['rate-limiting', 'authn', 'blast-radius'],
+  },
+  {
+    id: 'versioning',
+    name: 'API versioning',
+    oneLiner: 'Letting the contract change without breaking clients you cannot redeploy.',
+    cluster: 'application',
+    requires: ['api-design'],
+    leadsTo: ['backward-compatibility', 'expand-contract'],
+  },
+  {
+    id: 'backward-compatibility',
+    name: 'Backward compatibility',
+    oneLiner:
+      'New code must accept old data and old callers, because during any rollout both versions exist at once.',
+    cluster: 'application',
+    requires: ['versioning'],
+    leadsTo: ['schema-migration', 'expand-contract', 'canary'],
+  },
+];

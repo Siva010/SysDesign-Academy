@@ -1,0 +1,444 @@
+---
+id: computing-on-a-stream
+title: Computing on a Stream
+level: 4
+module: l4-moving-work
+order: 3
+summary: A batch job ends, so it can be sure. A stream never ends, so every answer means inventing an ending, and deciding when to stop waiting.
+difficulty: advanced
+minutes: 28
+prerequisites: [the-log-as-a-backbone]
+concepts: [stream-processing, windowing, watermark, stream-join]
+unlocks: [cdc, event-sourcing, cqrs, effectively-once]
+patterns: [cqrs]
+failures: [stalled-partition]
+sources: [ddia, kafka-docs, mapreduce, aws-builders-library, clickhouse-docs]
+status: reviewed
+---
+
+## The problem
+
+The product team wants a counter: how many orders in the last hour, updated live.
+
+It looks like arithmetic. It is not, and the reason is a question nobody asked: **when is the hour
+over?**
+
+At 14:00 you could emit the count for 13:00–14:00. But an order placed at 13:58 on a phone in a
+tunnel arrives at 14:03. A server whose clock is two minutes fast stamped an order 13:59 that it
+actually took at 14:01. A consumer restarted and is four minutes behind.
+
+So you wait. Ten minutes, to be safe. Now the &ldquo;live&rdquo; counter is ten minutes late, and
+the product team asks why it is not live. And an event still turns up eleven minutes late, and the
+number you already published was wrong.
+
+There is no setting that fixes this. There is only a decision about what to be wrong about.
+
+## Intuition
+
+A batch job over yesterday's data has a property that makes everything easy: **yesterday is
+finished.** All the data is there, you can read it twice, and running the job again gives the same
+answer.
+
+A stream has none of those. Data is still arriving, you are reading it once as it goes past, and
+the answer changes depending on when you look.
+
+Every stream question therefore requires you to invent an ending, and there are only two ways to do
+it. Both are uncomfortable in different directions.
+
+**Wait longer, be more correct, be later.** Every extra minute of waiting catches more stragglers
+and delays every answer by a minute.
+
+**Answer sooner, be wrong sometimes, and correct yourself.** Publish quickly, then revise as late
+data arrives. This is usually better — but only if everything downstream can accept a correction,
+which is a property of the whole pipeline rather than of this one step.
+
+The second thing to hold on to: there are two clocks, and they disagree.
+
+- **Event time** is when the thing happened, according to whoever recorded it.
+- **Processing time** is when your code saw it.
+
+Event time gives reproducible results — reprocess the same data and get the same answer — and
+requires waiting for stragglers. Processing time gives immediate results that depend on when you
+happened to run, so reprocessing gives a different answer. Almost every confusing streaming bug is
+a place where someone used one and meant the other.
+
+## Concretely
+
+<Example title="One hour, four answers">
+
+Orders in the 13:00 hour, with the counter emitted at different times.
+
+**Emit at 14:00, event time, no waiting.** 4,812 orders. Then 63 more arrive over the next twenty
+minutes, stamped inside the hour. The published number was 1.3% low, permanently, and nothing
+records that.
+
+**Emit at 14:10, event time, ten-minute watermark.** 4,871. Nearly complete, and every hourly
+figure is ten minutes late. Someone will ask why the dashboard lags.
+
+**Emit at 14:00 and revise.** 4,812 at 14:00, corrected to 4,871 by 14:20. Fast and eventually
+right — provided the dashboard, the alert on it, and anything downstream can handle a number that
+goes up after it was published.
+
+**Emit by processing time.** 4,790, counting whatever arrived between 13:00 and 14:00 by your
+clock, including 41 events that happened in the 12:00 hour and excluding 122 that happened in this
+one. Instant, never revised, and not reproducible: run it again on the same data and you get a
+different number.
+
+Only the fourth is wrong in a way you cannot describe to a user. The first three are three
+positions on one dial, and the job is to choose a position deliberately and write down which.
+
+</Example>
+
+## Formal explanation
+
+<C id="stream-processing" /> is continuous computation over unbounded input. The hard parts are not
+throughput; they are **time, ordering and state** (<Cite id="ddia" />).
+
+<C id="windowing" /> cuts the infinite stream into finite pieces so an aggregate can be produced.
+Three shapes cover nearly everything:
+
+- **Tumbling.** Fixed, non-overlapping — each hour, each minute. Every event belongs to exactly one
+  window. Use for periodic reporting.
+- **Sliding.** Fixed length, overlapping — the last five minutes, recomputed every minute. Each
+  event belongs to several windows, so state and output cost multiply by the overlap factor.
+- **Session.** Bounded by inactivity rather than by the clock — a user's activity until they are
+  quiet for thirty minutes. Window length is data-dependent, so it cannot be sized in advance and a
+  single very active key can produce an enormous window.
+
+A <C id="watermark">watermark</C> is the assertion that no more events with an event time before T will
+arrive. It is a **guess**, derived from observed lateness, and it is where correctness and latency
+are traded against each other explicitly. A conservative watermark waits longer and misses fewer
+events. An aggressive one publishes sooner and drops more.
+
+Two things follow that people miss:
+
+**A watermark drops data silently unless you make it loud.** An event arriving after its window has
+closed is discarded by default, and the discard leaves no trace in the output. Count late arrivals
+by source and alert on them. A watermark you cannot measure the cost of is not a decision, it is a
+default.
+
+**Allowing revision is a pipeline-wide commitment.** Emitting early and correcting later requires
+every downstream consumer to treat results as replaceable — which means aggregates must be
+**derived from keyed records rather than incremented**. An incremented counter cannot be corrected,
+because it no longer knows what it counted. This is the same rule that appears in the attribution
+case study, and it is the highest-leverage structural decision in the whole area.
+
+A <C id="stream-join" /> correlates two streams. It requires holding one side's events in state
+until the other side's arrive, so:
+
+- **State size is roughly event rate times window length.** This is arithmetic you must do before
+  agreeing to a join window, because a rule like &ldquo;within thirty days&rdquo; can turn a
+  feasible design into an infeasible one without anything in the requirement looking technical.
+- **Both streams must be partitioned by the join key.** Events that must meet have to land on the
+  same processor. A stream partitioned for some other reason cannot be joined without repartitioning
+  it, which at high volume is a substantial cost discovered late.
+- **A hot join key cannot be split**, because splitting it means the two sides never meet. The
+  usual answer to a hot key does not apply, and the available answers are capping per-key state and
+  excluding the key.
+
+State also has to survive failure. The standard arrangement is a **changelog** — every state change
+written to a compacted log — plus periodic **snapshots** to bound replay. This produces a
+counter-intuitive rule worth remembering: **the partition count is chosen by recovery time rather
+than by throughput**, because state restores per partition in parallel.
+
+Finally, what &ldquo;exactly-once&rdquo; means when a stream framework offers it. It means the
+offset commit and the state update happen atomically within the framework's own boundary, so a
+crash cannot double-apply a state change. It does **not** cover effects outside that boundary: an
+email, a payment, a call to a third-party API. For those, the answer is unchanged — an idempotency
+key, or an output keyed such that writing it twice is writing it once.
+
+## Architecture
+
+<Arch
+  caption="Time, state and recovery. Everything else in a streaming job is plumbing."
+  columns={[
+    { title: 'Input', nodes: [{ id: 'log', label: 'Event log', note: 'partitioned by key' }] },
+    { title: 'Assign', nodes: [{ id: 'time', label: 'Event time', note: 'and watermark', tone: 'accent' }] },
+    { title: 'Compute', nodes: [{ id: 'win', label: 'Windows' }, { id: 'join', label: 'Join state', note: 'rate x window' }] },
+    { title: 'Durability', nodes: [{ id: 'chg', label: 'Changelog', note: 'compacted' }, { id: 'snap', label: 'Snapshots' }] },
+    { title: 'Output', nodes: [{ id: 'out', label: 'Keyed results', note: 'replaceable', tone: 'accent' }] },
+    { title: 'Consumers', nodes: [{ id: 'agg', label: 'Derived aggregates' }, { id: 'late', label: 'Late-arrival counters' }] },
+  ]}
+  edges={[
+    { from: 'log', to: 'time' },
+    { from: 'time', to: 'win' },
+    { from: 'time', to: 'join' },
+    { from: 'win', to: 'out' },
+    { from: 'join', to: 'out' },
+    { from: 'join', to: 'chg' },
+    { from: 'chg', to: 'snap' },
+    { from: 'out', to: 'agg' },
+    { from: 'time', to: 'late', label: 'past watermark' },
+  ]}
+  stages={[
+    {
+      label: 'Count as it goes past',
+      show: ['log', 'win', 'out', 'agg'],
+      because:
+        'Aggregate by arrival. Immediate, simple, and not reproducible: the same input processed twice gives two different answers, because the grouping depended on when you looked.',
+    },
+    {
+      label: 'Use the time in the event',
+      show: ['log', 'time', 'win', 'out', 'agg', 'late'],
+      because:
+        'Grouping by event time makes results reproducible, and immediately raises the question of when a window is complete. The watermark answers it, and the late-arrival counter is what turns that answer from a hidden default into a measured decision.',
+    },
+    {
+      label: 'Join, and survive a crash',
+      show: ['log', 'time', 'win', 'join', 'chg', 'snap', 'out', 'agg', 'late'],
+      because:
+        'A join holds one side in state until the other arrives, which makes state size a design input and recovery a design constraint. The changelog and snapshots exist so a restart takes minutes rather than replaying the window from the beginning.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'A periodic batch job',
+      behaviour:
+        'Runs every five minutes over a finished interval. Reproducible, trivially backfilled, easy to reason about.',
+      firstToBreak:
+        'Only the latency requirement. If five minutes is acceptable, this is the correct design and streaming is a cost with no buyer.',
+    },
+    {
+      scale: 'Stateless streaming',
+      behaviour:
+        'Filter, enrich, route. No windows, no state, no time semantics. Scales with partitions and fails simply.',
+      firstToBreak: 'The first aggregate anyone asks for, which introduces windows and everything that follows.',
+    },
+    {
+      scale: 'Windowed aggregation',
+      behaviour:
+        'Event time, watermarks and late-data policy all become explicit. State is bounded by window length.',
+      firstToBreak:
+        'Late data. The watermark setting starts showing up as either a stale dashboard or a wrong number, and it is now a product conversation.',
+    },
+    {
+      scale: 'Stateful joins at volume',
+      behaviour:
+        'State is measured in tens or hundreds of gigabytes per job, changelogged and snapshotted, restored in parallel.',
+      firstToBreak:
+        'Recovery time, and hot keys. A restart that takes an hour is an outage, and a key that cannot be split has no standard mitigation.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Late data silently dropped',
+      symptom: 'Totals are consistently a little low for one source, and nothing reports an error.',
+      cause: 'Events arrive after the watermark and are discarded by default, leaving no trace in the output.',
+      mitigation: 'Count late arrivals by source as a first-class metric, and alert when the rate changes. A watermark whose cost is not measured is a default, not a decision.',
+    },
+    {
+      what: 'Processing time used where event time was meant',
+      symptom: 'Reprocessing the same input produces different results, and a backfill disagrees with the original run.',
+      cause: 'Windows were assigned by arrival, so grouping depends on when the job ran.',
+      mitigation: 'Assign windows by event time everywhere reproducibility matters, and treat processing time as acceptable only for monitoring the pipeline itself.',
+    },
+    {
+      what: 'State grows without bound',
+      symptom: 'Memory climbs steadily over days and the job eventually dies, always at a similar uptime.',
+      cause: 'Session windows with no maximum length, or join state whose keys are never expired.',
+      mitigation: 'Cap window length and per-key state explicitly. Every stateful operator needs an answer to "what makes this state go away".',
+    },
+    {
+      what: 'Recovery takes longer than the outage',
+      symptom: 'A one-minute restart causes a forty-minute gap in output.',
+      cause: 'State is rebuilt by replaying source data rather than restored from a changelog, and there are too few partitions to restore in parallel.',
+      mitigation: 'Changelog and snapshot state, and choose the partition count from the recovery time target rather than from throughput.',
+    },
+    {
+      what: 'Corrections cannot be applied',
+      symptom: 'A revised result arrives and the downstream total is now wrong in a new way.',
+      cause: 'A downstream aggregate incremented on arrival, so it cannot un-count the earlier value.',
+      mitigation: 'Emit keyed, replaceable results and derive aggregates from them. Revision has to be designed in at the beginning or it is not available at all.',
+    },
+    {
+      what: 'Hot join key',
+      symptom: 'One partition lags by hours while the rest are current.',
+      cause: 'One key carries a disproportionate share of events, and a join key cannot be split without breaking the join.',
+      mitigation: 'Cap per-key state to what the rule needs, and quarantine keys whose volume is not plausibly real.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Compute continuously over a stream rather than periodically over a batch"
+  options={[
+    'A batch job on a schedule, over a completed interval',
+    'A streaming job with event-time windows and watermarks',
+    'Streaming for the fast path plus batch for the authoritative result',
+    'Incremental updates in the serving database as events arrive',
+  ]}
+  why="Only a latency requirement justifies it. If someone acts on this number within seconds, batch cannot serve them. If the number is looked at every morning, streaming buys nothing and costs a great deal."
+  gain="Results within seconds of the events that produced them. Load is spread continuously rather than concentrated at the top of each interval, which often means smaller peak capacity."
+  sacrifice="Time semantics become explicit and permanent work. State must be made durable and recoverable. Backfilling and reprocessing are harder than re-running a batch job, and every result is provisional until its window closes."
+  failureModes={[
+    'Late data dropped silently',
+    'State growth with no expiry',
+    'Recovery time exceeding tolerable downtime',
+    'Results that cannot be corrected because a downstream consumer incremented',
+  ]}
+  operationalBurden="High. A long-running stateful job with its own failure modes, its own scaling metric, snapshot and changelog storage, and an on-call rotation that must understand watermarks to interpret an incident."
+  cost="Continuous compute and state storage, sized by window length rather than by output volume. A batch job over the same data usually costs a fraction of it."
+  whenNot="When the latency requirement is minutes and nobody can say what they would do differently with a fresher number — a scheduled batch job is reproducible, trivially backfilled, and far cheaper to operate. When the result must be exact and defensible, such as anything financial, batch over immutable inputs is easier to make deterministic. And when the computation needs the whole dataset rather than a window, streaming is the wrong shape entirely, not a harder version of the right one."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="ddia">
+Stream processing must distinguish event time from processing time, because the two differ
+whenever events are delayed or reordered. Windows defined on processing time produce results that
+depend on when the job ran and are therefore not reproducible.
+</Claim>
+
+<Claim label="fact" source="ddia">
+A stream join requires holding state for the duration of the join window, and a system must decide
+explicitly what to do with events arriving after that window has closed.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Compacted topics retain at least the most recent value for each key, which allows an operator's
+state to be reconstructed from a changelog rather than by reprocessing the original input.
+</Claim>
+
+<Claim label="fact" source="mapreduce">
+Batch processing over a finite, immutable input allows a failed task to be re-executed with the
+same result, which is the property that makes batch jobs straightforward to retry and reproduce.
+Streaming over unbounded input has no equivalent by default.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Making an operation idempotent so that repeating it is harmless is described as the practical
+answer to unreliable delivery, in preference to attempting to guarantee that each message is
+delivered exactly once.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage is suited to recomputing aggregates over large event tables, because a
+query reads only the columns it references. This is why a batch recomputation path is often far
+cheaper than intuition suggests.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you ask what latency is actually required before reaching for streaming, and whether you know that windows need a policy for late data. Proposing a streaming pipeline for a daily report is a common over-reach."
+  depth="Be able to distinguish event time from processing time and say which you are using. Be able to size join state from the rate and the window. Have a stated policy for events that arrive after the watermark."
+  followUps={[
+    'What happens to an event that arrives after its window closed?',
+    'How large is your join state, and what makes it go away?',
+    'Would a five-minute batch job be acceptable? What breaks if it is not?',
+    'The job restarts. How long until output resumes, and why that long?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Choosing streaming because the data arrives as a stream.',
+      why: 'The input shape does not determine the processing shape. Events land in a log and a batch job reads a bounded range of that log every five minutes, with all the reproducibility and backfill advantages of batch.',
+      instead:
+        'Let the latency requirement decide, and require someone to say what they would do differently with a fresher number. If nobody can, the requirement is a preference.',
+    },
+    {
+      mistake: 'Treating a watermark as a correctness setting.',
+      why: 'No value is correct. It is a position on a dial between latency and completeness, and moving it does not remove late events, only changes how many are excluded.',
+      instead:
+        'Measure how many events arrive past the watermark, per source. Then the setting becomes a decision with a stated cost, and the product owner can participate in it.',
+    },
+    {
+      mistake: 'Claiming exactly-once processing without qualification.',
+      why: 'Framework guarantees cover atomic offset and state commits inside the framework. They say nothing about an email, a payment or a third-party call, which is where the duplicates users notice actually occur.',
+      instead:
+        'Say exactly which effects are covered. For anything outside the boundary, use an idempotency key or an output keyed so that writing it twice is indistinguishable from writing it once.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['watermark', 'windowing']}
+  prompt="Your hourly count is emitted with a 10-minute watermark. A source starts buffering and its events now arrive 45 minutes late. What happens, and what should you have built?"
+  options={[
+    {
+      id: 'a',
+      text: 'Those events are dropped, the counts are quietly low, and nothing indicates a problem',
+      implies: 'You know the default behaviour and why it is dangerous.',
+      why: 'Events past the watermark are excluded from their window and the output contains no evidence of them. The number is wrong and looks entirely normal. What should exist is a late-arrival counter per source, alerting when the rate changes — which turns an invisible correctness failure into an ordinary alert about one source.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The window stays open until the late events arrive, so counts are correct but delayed',
+      implies: 'You are describing a system that waits indefinitely.',
+      why: 'A window that waits for events that might never come never closes, and its state never releases. The whole purpose of a watermark is to bound that wait, which necessarily means deciding to exclude something.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'They land in the current window instead, inflating the wrong hour',
+      implies: 'You are describing processing-time windowing.',
+      why: 'That is exactly what happens if windows are assigned by arrival rather than by event time — the late events are counted, in the wrong hour, and the error is worse because both hours are now wrong. With event-time windows they are dropped rather than misplaced, which is a different failure with a different fix.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates the mechanism from the policy. The mechanism is the watermark; the policy is what to do with what it excludes — drop and count, or route to a side output for later reconciliation, or reopen the window and emit a correction. It also notes that reopening is only available if downstream consumers can accept a revised value, which is a decision made much earlier, when someone chose between an incremented counter and a derived one."
+/>
+
+<Check
+  concepts={['stream-join']}
+  prompt="You must join a 500,000 events/second stream against a 500 events/second stream, correlating within a 24-hour window. What is the first thing to work out?"
+  options={[
+    {
+      id: 'a',
+      text: 'Which side you hold in state — because holding the high-rate side for 24 hours is roughly 43 billion events',
+      implies: 'You are sizing state before choosing a topology.',
+      why: 'State is rate times window. Holding the fast side is 43 billion events; holding the slow side is 43 million — a thousandfold difference decided by which stream you buffer. That single choice determines whether the job fits on a handful of machines or does not fit at all, and it has to be made before anything else.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'How many partitions to use for throughput',
+      implies: 'You are sizing for the ingest rate.',
+      why: 'Throughput is the easy part; 500,000 events per second across enough partitions is routine. Partition count here is actually driven by state recovery time rather than by throughput, and neither matters if the state does not fit.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Whether the framework guarantees exactly-once processing',
+      implies: 'You are checking delivery semantics first.',
+      why: 'Worth knowing, and not the constraint. Exactly-once semantics do not reduce state by a byte, and a job that cannot hold its join state will not run regardless of how carefully its offsets are committed.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer goes further than choosing the side: if only the most recent value per key is needed, the high-rate side is not a window at all but a compacted table keyed by the join key, whose size is the number of distinct keys rather than the number of events. That converts an unbounded stream into bounded state, and it is the move that makes many apparently impossible joins routine."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Event time, windows, and handling straggler events', sourceId: 'ddia' },
+    { label: 'Compacted topics as a changelog for operator state', sourceId: 'kafka-docs' },
+    { label: 'Why re-executable batch tasks are easy to reason about', sourceId: 'mapreduce' },
+    { label: 'Idempotence as the practical answer to unreliable delivery', sourceId: 'aws-builders-library' },
+    { label: 'Next: what you actually promise a reader', href: '/lessons/what-you-promise-a-reader' },
+  ]}
+/>

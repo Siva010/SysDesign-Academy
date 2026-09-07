@@ -1,0 +1,419 @@
+---
+id: migrating-a-live-system
+title: Migrating a Live System
+level: 8
+module: l8-evolution
+order: 1
+summary: Nobody designs from scratch. The skill is getting from the system you have to the one you need, without an outage and without a two-year rewrite.
+difficulty: staff
+minutes: 28
+prerequisites: [changing-a-running-system, when-the-requirement-is-wrong]
+concepts: [strangler-migration, expand-contract, cdc, backfill, feature-flag, canary, rollback, dual-write, maintainability, operational-burden, resharding]
+unlocks: [control-plane-vs-data-plane, data-residency]
+patterns: [strangler-fig, expand-contract]
+sources: [martin-fowler, building-microservices, ddia, sre-workbook]
+status: reviewed
+---
+
+## The problem
+
+The design interview asks you to build a system from nothing. Your actual job, almost always,
+is different: there is a system, it works, it has real users, and it is now wrong in some
+specific way.
+
+The tempting answer is a rewrite. Build the new one properly, switch over, delete the old one.
+
+Rewrites of live systems fail in a characteristic way, and the mechanism is worth stating
+precisely: **the old system keeps changing while you build the new one.** Features ship, bugs are
+fixed, edge cases accumulate. Your new system is chasing a moving target, and the gap does not
+close because the old system has a team working on it and so does the new one. Meanwhile nothing
+ships from the new system, so it accrues no evidence that it is right.
+
+The alternative is not to build the new system all at once.
+
+## Intuition
+
+**Move traffic, not code.**
+
+Put something in front of the old system that can route each request to either the old
+implementation or the new one. Then migrate one slice at a time:
+
+1. Route everything to the old system. The facade is a no-op, and you have verified it works.
+2. Implement one capability in the new system.
+3. Route that capability's traffic to the new system, for 1% of users, then 10%, then all.
+4. Repeat until the old system receives nothing.
+5. Delete it.
+
+Every step is small, reversible by a routing change, and delivers value. If the project is
+cancelled after step 3, you still have a working system and one capability improved — which is
+not true of a rewrite cancelled at 60%.
+
+This is the **strangler fig** pattern, named for a plant that grows around a tree and eventually
+replaces it while the tree is still standing.
+
+## Concretely
+
+<Example title="Migrating a database, without downtime">
+
+The hardest case, because data cannot be routed the way requests can.
+
+**Phase 1 — dual write.** New writes go to both stores in the same request. The old store remains
+the source of truth. Reads still come from the old store.
+*Risk: the new write fails. It must not fail the request — log and alert instead.*
+
+**Phase 2 — backfill.** Copy historical data into the new store, batched and rate-limited, with
+resumable progress. Runs for as long as it takes.
+*Risk: overwhelming the source. Throttle, and monitor replication lag as you go.*
+
+**Phase 3 — verify.** Read from both, compare, log discrepancies, return the old result. This
+phase is the one people skip and it is the one that catches the bugs — subtle type differences,
+timezone handling, rounding, nulls.
+*Run it until discrepancies are zero for a sustained period, not until they are rare.*
+
+**Phase 4 — switch reads.** Move reads to the new store, a percentage at a time. Keep dual writes.
+*Rollback is a routing change, because the old store is still current.*
+
+**Phase 5 — switch the source of truth.** The new store is authoritative. Keep writing to the old
+one for a defined period, so rollback remains possible.
+
+**Phase 6 — contract.** Stop writing to the old store. Wait. Then delete it.
+
+Six phases, weeks to months, every step reversible. The alternative — a maintenance window and a
+one-shot copy — works until the dataset is large enough that the window exceeds what the business
+will accept, which happens sooner than teams expect.
+
+</Example>
+
+## Formal explanation
+
+Three techniques, applied at different layers:
+
+**<C id="strangler-migration">Strangler fig</C>** — a facade routes requests to old or new. Works
+for anything with a request boundary: endpoints, services, page routes.
+
+**<C id="expand-contract" />** — add the new form, support both, migrate, remove the old. Works
+for schemas, APIs, message formats, configuration.
+
+**<C id="cdc">Change data capture</C>** — derive the new store from the old system's change log,
+so the old system needs no modification at all. Particularly valuable when the old system is one
+you cannot safely change.
+
+All three share one property: **at every moment, there is a working system, and the previous step
+can be undone.**
+
+<Callout kind="warn" title="The step everyone skips is verification">
+Dual write and backfill are mechanical. Comparing outputs across both systems under real traffic
+is where you discover that the new implementation rounds differently, handles nulls differently,
+or interprets a timezone differently.
+
+Skipping verification means discovering those in production after the old system is gone, which
+is the one state the migration was designed to avoid.
+</Callout>
+
+<Deeper title="Why rewrites fail, precisely">
+
+The rewrite argument is always the same: the old system is a mess, we understand the domain now,
+we can build it properly in a fraction of the time.
+
+Four mechanisms defeat it, and none is about engineering skill:
+
+**The old system keeps moving.** It has users and a team. Every feature shipped during the
+rewrite is a feature the new system must also implement, so the target recedes.
+
+**The mess encodes knowledge.** Those strange conditionals are usually years of edge cases: a
+customer with a legacy contract, a regulatory requirement, a bug that became a dependency. A
+clean reimplementation loses them and rediscovers them one support ticket at a time.
+
+**Nothing ships until the end.** No feedback, no evidence, no incremental value. If the project is
+cancelled at 70% — and long projects frequently are — the result is zero.
+
+**The switch-over is one enormous risky event**, usually attempted at the point of maximum
+schedule pressure, with the least tested code path in the project.
+
+Incremental migration inverts all four: the target stops moving one slice at a time, edge cases
+surface while both systems can be compared, value ships continuously, and there is no big-bang
+switch.
+
+<Claim label="recommendation">
+The honest case for a rewrite is narrow: the system is small, the team owns all of it, and it can
+be replaced faster than the old one changes. That is a real situation and it is much rarer than
+the number of rewrites attempted.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="A facade routes; both systems run; the boundary moves one slice at a time."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'client', label: 'Clients', note: 'unchanged' }] },
+    { title: 'Facade', nodes: [{ id: 'router', label: 'Routing facade', note: 'per-capability, per-percentage', tone: 'accent' }] },
+    { title: 'Systems', nodes: [{ id: 'old', label: 'Old system' }, { id: 'new', label: 'New system' }] },
+    { title: 'Data', nodes: [{ id: 'olddb', label: 'Old store', note: 'source of truth' }, { id: 'newdb', label: 'New store' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'router' },
+    { from: 'router', to: 'old', label: '90%' },
+    { from: 'router', to: 'new', label: '10%', tone: 'accent' },
+    { from: 'old', to: 'olddb' },
+    { from: 'new', to: 'newdb' },
+    { from: 'olddb', to: 'newdb', label: 'CDC or dual write', dashed: true },
+  ]}
+  stages={[
+    {
+      label: 'Before',
+      show: ['client', 'old', 'olddb'],
+      because:
+        'One system, working, with users. Any migration plan starts by not breaking this.',
+    },
+    {
+      label: 'Insert the facade',
+      show: ['client', 'router', 'old', 'olddb'],
+      because:
+        'The facade routes everything to the old system and changes nothing. Verifying this step alone is worth doing, because it proves the routing layer is safe before it carries any risk.',
+    },
+    {
+      label: 'Migrate a slice',
+      show: ['client', 'router', 'old', 'new', 'olddb', 'newdb'],
+      because:
+        'One capability moves, for a small percentage of traffic, with data flowing between the stores. Rollback is a routing change rather than a deploy.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One service, small data',
+      behaviour: 'A maintenance window and a copy is genuinely viable. Be honest that it is.',
+      firstToBreak: 'Nothing. Ceremony here is waste.',
+    },
+    {
+      scale: 'Live service, large data',
+      behaviour:
+        'The copy exceeds any acceptable window. Dual write and backfill become necessary.',
+      firstToBreak: 'The maintenance window, which the business stops granting.',
+    },
+    {
+      scale: 'Several dependent services',
+      behaviour:
+        'Consumers must migrate too, and you may not control all of them. The contract step recedes.',
+      firstToBreak:
+        'The removal of the old path, which is often abandoned. Systems accumulate permanent dual-running.',
+    },
+    {
+      scale: 'Cross-organisation',
+      behaviour:
+        'Some consumers will never migrate. The old interface becomes permanent, maintained as a compatibility layer.',
+      firstToBreak:
+        'The assumption that migration ends. Plan for the old path to persist and budget for it.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Verification skipped',
+      symptom:
+        'After the switch, subtle discrepancies appear: wrong rounding, timezone shifts, nulls treated differently.',
+      cause:
+        'Outputs were never compared under real traffic, because dual write and backfill felt like the whole job.',
+      mitigation:
+        'Run a shadow phase: read both, compare, log differences, return the old result. Continue until discrepancies are zero for a sustained period.',
+    },
+    {
+      what: 'Contract phase never happens',
+      symptom:
+        'Years of dual writes, two stores, and code nobody dares remove.',
+      cause:
+        'The migration was declared done when the new path worked, and the cleanup had no owner or date.',
+      mitigation:
+        'Schedule the removal as part of the original plan, with an owner and a date. Track dual-running as debt with an expiry.',
+    },
+    {
+      what: 'Backfill overwhelms the source',
+      symptom:
+        'Copying historical data degrades the live system it is copying from.',
+      cause: 'Unthrottled bulk reads and writes competing with production traffic.',
+      mitigation:
+        'Batch, throttle, monitor lag, and define abort criteria before starting. Treat the backfill as a production change.',
+    },
+    {
+      what: 'Rollback becomes impossible mid-migration',
+      symptom:
+        'A problem appears at 60% traffic and the old system can no longer serve, because it has not seen recent writes.',
+      cause: 'Dual writes were stopped too early, so the old store went stale.',
+      mitigation:
+        'Keep writing to the old store until you are certain, and define "certain" in advance as a duration and a set of metrics rather than as a feeling.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Migrate incrementally behind a facade rather than rewriting and switching over"
+  options={[
+    'Rewrite and switch over in one event',
+    'Incremental migration behind a routing facade',
+    'Leave it alone and build new capabilities alongside',
+  ]}
+  why="A live system keeps changing while a rewrite is built, so the target moves. Incremental migration stops the target moving one slice at a time, and keeps a working system at every step."
+  gain="Every step is reversible by a routing change. Value ships continuously. Edge cases surface while both implementations can be compared. Cancellation at any point leaves a working system with some improvements."
+  sacrifice="Both systems run simultaneously, which costs infrastructure and cognitive load. The facade is a new component. The migration takes longer in calendar time, though it delivers value throughout."
+  failureModes={[
+    'The contract phase never happens, leaving permanent dual-running',
+    'The facade becomes a permanent piece of architecture nobody planned',
+    'Data divergence between the two stores during the dual-write phase',
+  ]}
+  operationalBurden="Higher during the migration: two systems, a facade, and a comparison pipeline. Substantially lower risk per step, which is the trade."
+  cost="Duplicate infrastructure for the duration, plus engineering time on the facade and the verification. Cheaper than a failed rewrite by a wide margin."
+  whenNot="When the system is genuinely small and can be replaced faster than it changes — a single service with one team and a week of work — the ceremony costs more than the risk it removes. Also when the old system cannot be modified at all to support dual writes; there, change data capture is the route in, and if even that is unavailable, a window may be the only option."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="martin-fowler">
+The strangler fig pattern is documented as an approach to replacing a legacy system incrementally
+by routing capabilities to a new implementation over time, rather than by attempting a
+simultaneous replacement.
+</Claim>
+
+<Claim label="convention" source="building-microservices">
+Extracting functionality from a monolith is described as an incremental process with a facade,
+dual-running and verification, and the guidance is explicit that the removal of the old path must
+be planned rather than assumed.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Change data capture allows a derived store to be built from an existing system's change log
+without modifying the source, which makes it particularly useful when the source cannot safely be
+changed.
+</Claim>
+
+<Claim label="recommendation" source="sre-workbook">
+Progressive rollout with automated verification at each stage is standard practice, and the same
+reasoning applies at the scale of a migration: small reversible steps with evidence between them.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can evolve a system rather than only design one. Senior and staff interviews frequently include a legacy constraint precisely to see whether the candidate reaches for a rewrite."
+  depth="Know the strangler pattern and the database migration phases in order. Being able to name the verification phase, and why it is the one people skip, is a strong signal."
+  followUps={[
+    'There is an existing system with 10 million users. How do you get from it to your design?',
+    'How do you migrate the database without downtime?',
+    'You are at 50% migrated and something is wrong. What do you do?',
+    'When would a rewrite actually be the right call?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will rewrite it properly this time.',
+      why: 'The old system keeps shipping features, so the target moves. The mess you are replacing encodes years of edge cases. Nothing ships until the end, and the switch-over is the riskiest event in the project attempted under the most schedule pressure.',
+      instead:
+        'Put a facade in front, migrate one capability at a time, and keep both running until the old one receives nothing. If a rewrite really is right — small system, one team, faster than it changes — say why those conditions hold.',
+    },
+    {
+      mistake: 'We will migrate the data during a maintenance window.',
+      why: 'It works until the dataset is large enough that the copy exceeds what the business will accept, and that threshold arrives sooner than teams expect. It is also all-or-nothing: a problem discovered mid-window has no good options.',
+      instead:
+        'Dual write, backfill, verify, switch reads, switch the source of truth, contract. Every phase reversible.',
+    },
+    {
+      mistake: 'The migration is done, the new system is serving all traffic.',
+      why: 'While the old system still exists and is still written to, you have two systems, two sets of costs, and code nobody will remove because it is load-bearing for a rollback nobody will take.',
+      instead:
+        'Schedule the contract phase with an owner and a date at the start, and treat dual-running as debt with an expiry.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['strangler-migration', 'cdc', 'dual-write']}
+  prompt="You must replace a 12-year-old billing system that processes real money daily. The team that wrote it has left. What is your approach?"
+  options={[
+    {
+      id: 'a',
+      text: 'Rewrite it from the specification, test thoroughly, and switch over during a quiet period',
+      implies: 'You are treating the old system as fully specified.',
+      why: 'There is no specification that matches a 12-year-old billing system. Its behaviour includes years of edge cases, legacy contracts and bug-compatible workarounds, and none of them are written down — the people who knew have left. A clean reimplementation will be subtly wrong in ways discovered one invoice at a time.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Facade in front, implement one billing capability in the new system, run both and compare outputs on real traffic, and move traffic gradually once they agree',
+      implies: 'You are treating the old system as the specification and verifying against it.',
+      why: 'The old system is the only accurate specification available, and comparing outputs on real traffic is how you extract it. Running both and diffing surfaces exactly the edge cases nobody documented, while the old system remains authoritative and money keeps moving correctly.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Leave it alone and build new features in a separate service',
+      implies: 'You are avoiding the migration entirely.',
+      why: 'Sometimes correct — an old system that works and rarely changes is not automatically a problem. But if it genuinely needs replacing, deferring means the knowledge gap widens and the eventual migration is harder.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer emphasises that with money involved, the comparison phase must run for a long time and to zero discrepancies, not to 'rare' ones. It also notes that billing has monthly and annual cycles, so a month of comparison may not exercise the annual paths — and that the migration timeline has to account for waiting to see those."
+/>
+
+<Check
+  concepts={['expand-contract', 'rollback', 'backfill']}
+  prompt="You are 40% migrated to the new store. Reads are split, dual writes are running. A subtle data problem is found in the new store. What is the safest response?"
+  options={[
+    {
+      id: 'a',
+      text: 'Route all reads back to the old store, investigate with no time pressure, and fix the new store from the old data',
+      implies: 'You are using the property the migration was designed to preserve.',
+      why: 'Because dual writes are still running, the old store is fully current and can serve everything immediately. Rollback is a routing change, not a deploy or a restore. That removes all time pressure from the investigation, which is exactly what the incremental approach bought you.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Fix forward in the new store while it continues serving 40% of reads',
+      implies: 'You are prioritising forward progress.',
+      why: 'It keeps 40% of users on a store with a known data problem while you work under pressure. Rolling back costs nothing here and converts an incident into an investigation.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Pause the migration and stop the dual writes to prevent further bad data',
+      implies: 'You are trying to contain the spread.',
+      why: 'Stopping dual writes is the one thing you must not do: the old store immediately begins going stale, which destroys the rollback you are relying on. Stop reading from the new store, and keep writing to both.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer states the general rule: dual writes are what make rollback real, so they are the last thing to stop and the first thing to protect. It also notes that the new store must be repaired from the old before reads resume, which is only possible because the old store stayed authoritative throughout."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'The strangler fig pattern', sourceId: 'martin-fowler' },
+    { label: 'Extracting services from a monolith incrementally', sourceId: 'building-microservices' },
+    { label: 'Change data capture and derived data', sourceId: 'ddia' },
+    {
+      label: 'Next: why the organisation ends up in the system diagram',
+      href: '/lessons/people-shape-architecture',
+    },
+  ]}
+/>

@@ -1,0 +1,401 @@
+---
+id: the-contract-between-client-and-server
+title: The Contract Between Client and Server
+level: 0
+module: l0-lifecycle
+order: 2
+summary: HTTP is not a transport detail. Its method semantics decide whether you are allowed to retry, and that decision reaches all the way into your database.
+difficulty: intro
+minutes: 24
+prerequisites: [http, tcp]
+concepts: [http, api-design, rest, idempotency, http-caching]
+unlocks: [rpc, retry, cache-invalidation]
+sources: [rfc9110, rfc9111, mdn-http, stripe-eng]
+status: reviewed
+---
+
+## The problem
+
+A user taps &ldquo;Place order&rdquo;. The request goes out. Their phone loses signal for four
+seconds, then reconnects. The app, quite reasonably, sends the request again.
+
+Did they just buy two sofas?
+
+You cannot answer that from the network layer. TCP guarantees the bytes arrive in order; it
+says nothing about whether sending them twice is a good idea. The answer lives in the contract
+between client and server — what each request *means* — and getting that contract wrong is how
+systems end up charging people twice, sending duplicate emails, and double-decrementing
+inventory.
+
+## Intuition
+
+Think about the difference between these three instructions to a shop assistant:
+
+- &ldquo;Tell me the price of that sofa.&rdquo;
+- &ldquo;Set the price of that sofa to £400.&rdquo;
+- &ldquo;Add £400 to the price of that sofa.&rdquo;
+
+If you are not sure whether the assistant heard you, the first is completely safe to repeat.
+The second is safe too: setting the price to £400 twice leaves it at £400. The third is not —
+repeat it and the sofa costs £800.
+
+That is the entire idea. Some operations can be repeated without changing the outcome, and
+some cannot. HTTP names this property, and the name is **idempotency**.
+
+The mistake is treating this as a networking curiosity. It is not. It determines whether your
+client library may retry, whether a proxy may replay a request, whether a load balancer may
+send the request to a second server when the first goes quiet — and, ultimately, how you have
+to shape your database writes.
+
+## Concretely
+
+<Example title="The same operation, three ways">
+
+Say you are building the endpoint that places an order.
+
+**Not safe to repeat.** `POST /orders` with the order in the body. Each call creates a new
+order. Two calls, two sofas. The server cannot tell the second call apart from a genuine
+second order, because there is nothing in the request that says &ldquo;this is the same
+intent as before&rdquo;.
+
+**Safe to repeat, client-generated key.** The client generates an identifier before sending —
+say a UUID — and sends `POST /orders` with an `Idempotency-Key` header. The server stores the
+key alongside the result. A second request with the same key returns the first result rather
+than creating a second order.
+
+**Safe to repeat, resource-shaped.** `PUT /orders/{client-chosen-id}` with the order as the
+body. The client names the resource, so sending it twice writes the same resource twice, which
+leaves the same single order.
+
+All three do the same business thing. Only the second and third survive an unreliable network,
+and that is the entire difference between a design that works in a demo and one that works on
+a train.
+
+</Example>
+
+## Formal explanation
+
+<Claim label="fact" source="rfc9110">
+HTTP defines request methods as **safe** if they are essentially read-only, and **idempotent**
+if the intended effect of several identical requests is the same as the effect of a single
+one. GET, HEAD and OPTIONS are safe. PUT and DELETE are idempotent but not safe. POST is
+neither.
+</Claim>
+
+Two consequences follow, and they are the reason these definitions exist at all:
+
+1. **Automatic retry is only legitimate for idempotent methods.** Clients, proxies and
+   libraries retry idempotent requests on their own. If you implement a state-changing
+   operation behind GET, something in the path will eventually replay it, and you will not
+   find out politely.
+2. **Caching is only legitimate for safe methods, by default.** An intermediary is entitled to
+   store a GET response and serve it to somebody else. If your GET has side effects, those
+   side effects are now invisible and unrepeatable.
+
+<Callout kind="warn" title="The one that bites everyone">
+POST is not idempotent, and this is not a defect in HTTP. It is a description of reality: an
+operation that creates something new is genuinely not repeatable. The fix is not to pretend
+otherwise but to add the missing piece — a caller-supplied key that lets the server recognise
+a repeat.
+</Callout>
+
+<C id="rest" /> is the style that leans on all of this: resources with identity, methods with
+defined semantics, and responses that intermediaries can reason about. Its practical value is
+not architectural purity but that you inherit caching, retry behaviour and a shared vocabulary
+for free.
+
+<Deeper title="Idempotent is not the same as identical response">
+
+An idempotent operation has the same *effect* when repeated. It does not have to return the
+same response.
+
+`DELETE /orders/42` is idempotent: after the first call the order is gone, and after the
+second it is still gone. But the first may return 204 and the second 404. The state is
+unchanged; the answer differs. That is fine and expected.
+
+This distinction matters when you write a client. Treating 404 on a retried DELETE as a
+failure will cause you to report errors for operations that succeeded.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Where the contract is enforced, and who is allowed to repeat a request."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client', note: 'may retry' }] },
+    { title: 'Edge', nodes: [{ id: 'cdn', label: 'CDN', note: 'caches safe methods' }, { id: 'lb', label: 'Load balancer', note: 'may re-dispatch' }] },
+    { title: 'Service', nodes: [{ id: 'api', label: 'API service', tone: 'accent' }] },
+    { title: 'State', nodes: [{ id: 'keys', label: 'Idempotency keys' }, { id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'cdn', label: 'GET' },
+    { from: 'cdn', to: 'lb' },
+    { from: 'lb', to: 'api' },
+    { from: 'api', to: 'keys', label: 'seen this key?' },
+    { from: 'api', to: 'db', label: 'write once' },
+  ]}
+  stages={[
+    {
+      label: 'Just the contract',
+      show: ['client', 'api', 'db'],
+      because:
+        'At its simplest the contract is between two parties: the client says what it means, the server does it once.',
+    },
+    {
+      label: 'With intermediaries',
+      show: ['client', 'cdn', 'lb', 'api', 'db'],
+      because:
+        'Every box between client and server is entitled to act on the method semantics: cache a GET, retry an idempotent request, re-dispatch when a backend goes quiet. They will do this whether or not your handlers can tolerate it.',
+    },
+    {
+      label: 'With deduplication',
+      show: ['client', 'cdn', 'lb', 'api', 'keys', 'db'],
+      because:
+        'Non-idempotent operations need somewhere to record that a given intent has already been carried out. That store is the thing that makes POST safe to retry.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'A few requests a second',
+      behaviour:
+        'Duplicates are rare enough that you may never see one in testing. The bug exists; it is simply not firing yet.',
+      firstToBreak: 'Nothing. This is why the problem reaches production.',
+    },
+    {
+      scale: 'Thousands a second',
+      behaviour:
+        'Duplicates become a daily occurrence. Mobile clients on flaky networks retry constantly.',
+      firstToBreak:
+        'Support load, then data integrity. Somebody notices duplicate rows before your monitoring does.',
+    },
+    {
+      scale: 'With retries at several layers',
+      behaviour:
+        'The client retries, the SDK retries, the load balancer re-dispatches. One user action can become many server-side operations.',
+      firstToBreak:
+        'Any operation with an external side effect: charges, emails, inventory decrements.',
+    },
+    {
+      scale: 'With an idempotency store',
+      behaviour:
+        'Duplicates are absorbed, but the key store is now on the write path for every mutation.',
+      firstToBreak:
+        'The key store itself. It needs the same availability as the service it protects, and a retention policy.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'State-changing operation exposed behind GET',
+      symptom:
+        'Records change without anyone submitting anything. Often traced to a crawler, a link preview generator, or a browser prefetch.',
+      cause:
+        'GET is defined as safe, so anything in the path may fetch it speculatively or repeatedly.',
+      mitigation:
+        'Never mutate on GET. If a link must trigger an action, make it a form that POSTs, or require a token that is consumed once.',
+    },
+    {
+      what: 'Idempotency key stored after the side effect',
+      symptom:
+        'Duplicates still occur, but only occasionally and only under load or during deploys.',
+      cause:
+        'The window between performing the effect and recording the key. A crash in that window loses the record but keeps the effect.',
+      mitigation:
+        'Record the key and the intent in the same transaction as the state change. Where the effect is external, record intent first, then act, then record the outcome.',
+    },
+    {
+      what: 'Idempotency key scoped too broadly',
+      symptom:
+        'A legitimate second order is silently rejected as a duplicate, and the customer is confused rather than double charged.',
+      cause:
+        'The key was derived from stable data (user plus amount) rather than generated per intent.',
+      mitigation:
+        'Generate the key per user action, client-side, before the first attempt. Reuse it only across retries of that same attempt.',
+    },
+    {
+      what: 'The key store grows without bound',
+      symptom: 'Storage cost climbs steadily; eventually the deduplication lookup gets slow.',
+      cause: 'No retention policy on a table that receives a row per mutation, forever.',
+      mitigation:
+        'Expire keys after a window that comfortably exceeds any client retry policy — 24 hours is typical — and say what happens to a request that arrives after expiry.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Require a client-supplied idempotency key on all state-changing endpoints"
+  options={[
+    'No deduplication: rely on clients not retrying',
+    'Server-side deduplication using a natural key derived from the request contents',
+    'Client-supplied idempotency key, stored with the result',
+  ]}
+  why="Only the client knows whether two similar requests represent one intent or two. A key generated at the moment of the user's action captures exactly that, and nothing derived server-side can reconstruct it."
+  gain="Retries become safe at every layer, which in turn makes aggressive retry policies safe, which is what you need for reliability on unreliable networks."
+  sacrifice="Every client must participate. An API consumer who ignores the header gets no protection, so the guarantee is only as good as your client library and your documentation."
+  failureModes={[
+    'The key store becomes a new dependency on the write path',
+    'Keys stored after the effect leave a duplicate window',
+    'Concurrent requests with the same key need a unique constraint, not a check-then-write',
+  ]}
+  operationalBurden="Low to moderate. One table, one uniqueness constraint, one expiry job. The subtlety is entirely in the ordering of writes, not in the infrastructure."
+  cost="A row per mutation for the retention window, plus one lookup per write. Negligible next to the cost of one duplicate charge and the support conversation that follows."
+  whenNot="For genuinely idempotent operations that are already keyed by the client, such as PUT to a client-chosen path, the machinery is redundant. And for internal, low-value operations where a duplicate is harmless and cheap to clean up, the added coupling to a key store may not be worth it — but be honest about whether the duplicate really is harmless."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="stripe-eng">
+Client-supplied idempotency keys on mutating API requests are established practice in payment
+APIs, where the operation is irreversible and the network between client and server is
+untrusted. Stripe's engineering writing describes this pattern in detail, and it has been
+widely adopted across financial APIs.
+</Claim>
+
+<Claim label="fact" source="rfc9111">
+HTTP caching is defined in terms of these same semantics: a cache stores responses to safe
+methods and must invalidate stored responses when it forwards a request with an unsafe method
+to the same resource. Getting the method wrong therefore corrupts caching, not just retries.
+</Claim>
+
+The practical consequence for design discussions: when someone proposes retrying a failed
+call, the first question is not &ldquo;how many times?&rdquo; but &ldquo;is this operation safe
+to repeat, and if not, what makes it safe?&rdquo;
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that retries and correctness are the same conversation. Candidates who add retries for reliability without mentioning idempotency have a gap that shows up in every subsequent failure question."
+  depth="Know the method semantics, know what an idempotency key is and where it must be written relative to the effect. You do not need to recite RFC section numbers, but you should be able to explain why POST is not idempotent without sounding like you are reciting."
+  followUps={[
+    'Your service retries a failed call to a payment provider. What must be true for that to be safe?',
+    'Where exactly do you write the idempotency key, and why does the order matter?',
+    'Two requests with the same key arrive at two servers simultaneously. What happens?',
+    'How long do you keep idempotency keys, and what happens after that?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We check whether the order already exists before creating it.',
+      why: 'Between the check and the create, another request can do the same check. Both see nothing, both create. This is the canonical read-modify-write race and it happens far more often under load than intuition suggests.',
+      instead:
+        'Make the check and the write one atomic operation: a unique constraint on the idempotency key, with the duplicate insert failing. Let the database adjudicate, because it is the only component that sees both requests.',
+    },
+    {
+      mistake: 'We use POST for everything, it is simpler.',
+      why: 'You give up caching, you give up safe automatic retry, and you make every operation something that intermediaries must treat as dangerous. Simplicity at the endpoint is paid for at every layer above it.',
+      instead:
+        'Use the method that describes what the operation does. Where POST is genuinely correct because you are creating something new, add the idempotency key rather than pretending the problem does not exist.',
+    },
+    {
+      mistake: 'Idempotency is a database concern, not an API concern.',
+      why: 'By the time the request reaches the database, the information needed to recognise a duplicate — that these two requests represent one user intent — has been lost. Only the client had it.',
+      instead:
+        'Treat the key as part of the API contract, generated at the moment of intent, carried through every layer, and enforced at the point of persistence.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['idempotency', 'http']}
+  prompt="Your mobile client retries any request that does not respond within 5 seconds. Which of these endpoints is dangerous as written?"
+  options={[
+    {
+      id: 'a',
+      text: 'GET /orders/42',
+      implies: 'You are looking for state changes, but this one does not have any.',
+      why: 'A GET is safe by definition. Repeating it costs a little load and changes nothing. This is the endpoint you never have to think about.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'POST /orders with the order in the body and no idempotency key',
+      implies: 'You have identified the operation that creates something new each time it is called.',
+      why: 'Each retry creates a distinct order, because nothing in the request tells the server that this is the same intent as the previous attempt. A 5-second timeout on a mobile network will fire regularly, so this is not a rare edge case.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'PUT /orders/9f2c with the order in the body',
+      implies: 'You may be treating any write as unsafe.',
+      why: 'PUT to a client-chosen identifier is idempotent: writing the same resource twice leaves one resource. This is the shape you want when the client can name the thing it is creating.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer notes that the timeout itself is part of the problem. A response that has not arrived in 5 seconds may still be in flight, so the retry can race the original. Making the operation idempotent is what allows an aggressive timeout to be safe — the two decisions are linked, not independent."
+/>
+
+<Check
+  concepts={['idempotency-key', 'atomicity']}
+  prompt="You add idempotency keys. Where do you write the key relative to performing the operation?"
+  options={[
+    {
+      id: 'a',
+      text: 'Write the key after the operation succeeds, so failed operations do not consume a key',
+      implies: 'You are optimising for not blocking a legitimate retry after a genuine failure.',
+      why: 'It leaves a window: if the process dies after the effect and before the key is written, the retry sees no key and performs the effect a second time. That window is small and will be hit, because crashes concentrate under exactly the load that produces retries.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Write the key and the state change in a single transaction',
+      implies: 'You recognise that a duplicate window is created by any gap between the two writes.',
+      why: 'Committing both together means there is no state in which the effect happened but the key did not. This is the correct answer whenever the effect is a write to the same database.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Write the key first, then perform the operation',
+      implies: 'You are protecting against duplicates by claiming the key up front.',
+      why: 'This prevents duplicates but introduces a different problem: if the operation then fails, the key is consumed and a legitimate retry is refused. It is the right shape when the effect is external and cannot join your transaction, but then the key must record an indeterminate state rather than success.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer distinguishes the two cases. When the effect is a write to your own database, commit the key with it. When the effect is external — charging a card, sending an email — you cannot have one transaction, so you write the intent first, act, then record the outcome, and you need a reconciliation process for attempts that never reached a terminal state."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'HTTP method semantics: safe, idempotent, cacheable',
+      sourceId: 'rfc9110',
+      note: 'The definitions themselves, which are shorter and clearer than most summaries of them.',
+    },
+    {
+      label: 'HTTP caching, and how unsafe methods invalidate stored responses',
+      sourceId: 'rfc9111',
+    },
+    {
+      label: 'Idempotency as a system property, not an endpoint property',
+      href: '/concepts/idempotency',
+      note: 'The same idea reappears at Level 4 for message delivery, where it is the load-bearing part of every queue design.',
+    },
+    {
+      label: 'The transactional outbox: idempotency when the effect crosses a boundary',
+      href: '/concepts/outbox',
+    },
+  ]}
+/>

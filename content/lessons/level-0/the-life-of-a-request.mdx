@@ -1,0 +1,428 @@
+---
+id: the-life-of-a-request
+title: The Life of a Request
+level: 0
+module: l0-lifecycle
+order: 1
+summary: Before you can design a system, you have to know what a single request actually does and where its time goes.
+difficulty: intro
+minutes: 22
+prerequisites: []
+concepts: [dns, tcp, tls, http, rtt, latency]
+unlocks: [latency-budget, http-caching, connection-pooling]
+sources: [rfc9110, rfc9112, rfc9113, rfc9000, rfc9293, rfc8446, rfc1035, hpbn, mdn-http]
+status: reviewed
+---
+
+## The problem
+
+Someone in São Paulo taps a link to your site. Two and a half seconds later, the page appears.
+Your server logs say the request took 40 milliseconds.
+
+Both numbers are correct. The gap between them is where system design lives.
+
+If you cannot account for those missing 2.46 seconds, every optimisation you attempt is a
+guess. You will add a cache to a system whose problem was three sequential network round
+trips. You will buy faster servers to fix a delay that happened before any server was
+involved.
+
+So: what actually happens between the tap and the pixels?
+
+## Intuition
+
+Sending a request over the internet is less like calling a function and more like sending a
+courier to another city.
+
+Before the courier can carry anything, several things must happen. You need the address —
+someone has to look it up. The courier has to travel there, and physically cannot arrive
+faster than the road allows. If the contents are private, you and the recipient must first
+agree on a sealed envelope, which itself takes a trip or two. Only then does your actual
+message travel.
+
+Each of those steps is a round trip. The distance is fixed by geography. Your code runs at
+the very end, and often accounts for the smallest part of the total.
+
+This is the single most important reframing in this whole curriculum: **most of the time in
+a request is spent waiting, not computing.** Design accordingly.
+
+## Concretely
+
+<Example title="One tap, step by step">
+
+A user in São Paulo requests `https://example.com/dashboard`. The server is in Virginia,
+roughly 7,600 km away.
+
+1. **Is it cached locally?** The browser checks its own cache. A hit here costs microseconds
+   and the story ends. Assume a miss.
+2. **What address?** The browser asks a DNS resolver for `example.com`. If the answer is
+   cached nearby, this is fast. If not, the resolver walks the DNS hierarchy — root, then
+   `.com`, then the domain's own nameservers — which can be several round trips.
+3. **Open a connection.** TCP requires a handshake before any application data flows: one
+   round trip.
+4. **Agree on encryption.** TLS 1.3 completes its handshake in one further round trip on a
+   fresh connection.
+5. **Send the request.** Now, finally, the HTTP request travels: another half round trip out.
+6. **The server works.** Parse, authenticate, query the database, render. This is the 40 ms
+   in your logs.
+7. **The response returns.** Half a round trip back, plus however long the bytes take to
+   stream at the available bandwidth.
+8. **The browser renders**, discovers it needs three more files, and — depending on what
+   those are and where they live — may repeat parts of this whole process.
+
+</Example>
+
+The physical floor for step 3 onward is set by the distance. Light in optical fibre travels
+at roughly two-thirds of its speed in vacuum, about 200,000 km per second.
+
+<Formula
+  expression="one-way delay ≈ distance ÷ 200,000 km/s"
+  where={[
+    { symbol: '7,600 km', meaning: 'São Paulo to Virginia, roughly, as the fibre runs' },
+    { symbol: '≈ 38 ms', meaning: 'theoretical one-way minimum' },
+    { symbol: '≈ 76 ms', meaning: 'theoretical minimum round trip' },
+  ]}
+/>
+
+<Claim label="inference">
+Real measured round-trip times on this path are typically well above the theoretical floor,
+because fibre does not run in straight lines and every router adds queueing and processing
+delay. The floor is what matters for design: it is the part you cannot optimise away.
+</Claim>
+
+Now count the round trips before the application sees anything: DNS (assume it is cached, so
+zero), TCP (one), TLS (one), request/response (one). That is three round trips at roughly
+76 ms each, or about 230 ms — before your 40 ms of server work.
+
+<Claim label="fact" source="rfc8446">
+TLS 1.3 reduces the full handshake to one round trip, and offers a zero-round-trip resumption
+mode for repeat connections. The specification also states that 0-RTT data does not carry
+replay protection, which is why it must only be used for requests that are safe to repeat.
+</Claim>
+
+## Formal explanation
+
+A request passes through a stack of layers, each of which solves a problem the layer below
+does not.
+
+- **<C id="dns" /> — naming.** Humans use names; the network routes to addresses. DNS is a
+  distributed, aggressively cached lookup from one to the other. Its caching is the reason it
+  is usually fast and the reason changes propagate slowly.
+- **<C id="ip" /> — addressing and routing.** IP moves packets between addresses on a
+  best-effort basis. Packets may be dropped, duplicated, or delivered out of order. IP
+  promises nothing.
+- **<C id="tcp" /> — a reliable stream.** TCP builds an ordered, reliable byte stream on top
+  of that unreliability, using sequence numbers, acknowledgements and retransmission. This
+  requires establishing shared state first: the handshake.
+- **<C id="tls" /> — confidentiality and identity.** TLS negotiates keys and verifies the
+  server's certificate before your data flows.
+- **<C id="http" /> — semantics.** HTTP defines what a request *means*: which resource, which
+  method, and what an intermediary is allowed to do with the response.
+
+<C id="rtt">Round-trip time</C> is the currency of all of this. Every layer that requires
+agreement before it can proceed costs at least one RTT, and RTT is bounded below by distance.
+
+<Deeper title="Why the handshakes cannot simply be removed">
+
+Each handshake exists to establish state that both ends need before they can safely proceed.
+
+TCP's handshake synchronises sequence numbers so that both sides can detect loss and
+reordering. Without it, an attacker could trivially inject data into a stream, and neither
+side would know where a byte belonged.
+
+TLS's handshake establishes keys and proves the server's identity. Skipping it means you have
+no idea who you are talking to.
+
+QUIC — the transport behind HTTP/3 — reduces this cost by combining the transport and
+cryptographic handshakes into a single exchange rather than performing them in sequence. The
+round trips did not become free; they were merged.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Where a single request actually spends its time."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'browser', label: 'Browser', note: 'local cache first' }] },
+    { title: 'Naming', nodes: [{ id: 'dns', label: 'DNS resolver', note: 'usually cached' }] },
+    { title: 'Network', nodes: [{ id: 'transport', label: 'TCP + TLS', note: '2 RTT to set up' }] },
+    { title: 'Origin', nodes: [{ id: 'server', label: 'Your server', tone: 'accent' }] },
+    { title: 'Data', nodes: [{ id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'browser', to: 'dns', label: 'name → address' },
+    { from: 'dns', to: 'transport', label: 'connect' },
+    { from: 'transport', to: 'server', label: 'HTTP request' },
+    { from: 'server', to: 'db', label: 'query' },
+    { from: 'db', to: 'server', dashed: true },
+    { from: 'server', to: 'browser', label: 'response', dashed: true },
+  ]}
+  stages={[
+    {
+      label: 'What you think happens',
+      show: ['browser', 'server', 'db'],
+      because:
+        'The mental model most people start with: the browser asks the server, the server asks the database. It is not wrong, it is just missing everything that costs time.',
+    },
+    {
+      label: 'What actually happens',
+      show: ['browser', 'dns', 'transport', 'server', 'db'],
+      because:
+        'Naming and connection setup are separate steps, each with their own latency and their own failure modes. On a cold connection they cost more than your application code does.',
+    },
+  ]}
+/>
+
+## Scaling
+
+A single request is a story about latency. Many requests turn it into a story about
+resources — and the first resource to run out is rarely CPU.
+
+<ScaleTable
+  rows={[
+    {
+      scale: '1 request',
+      behaviour: 'Latency is dominated by round trips. Server time is a rounding error.',
+      firstToBreak: 'Nothing. This is the case everyone designs for.',
+    },
+    {
+      scale: '100 concurrent',
+      behaviour:
+        'Each connection holds a socket and some memory. Connection setup cost starts to matter in aggregate.',
+      firstToBreak: 'Nothing yet, but connection reuse is now worth real money.',
+    },
+    {
+      scale: '10,000 concurrent',
+      behaviour:
+        'Open sockets, file descriptors and TLS session memory become significant. Handshake CPU cost is now visible.',
+      firstToBreak:
+        'File descriptor limits and TLS handshake CPU, long before request-handling CPU.',
+    },
+    {
+      scale: '1,000,000 concurrent',
+      behaviour:
+        'Connections must be terminated close to users and multiplexed. A single origin cannot hold them.',
+      firstToBreak:
+        'The connection tier. This is why edge termination exists as a product category.',
+    },
+  ]}
+/>
+
+The important observation: at every scale above one, **the cost of establishing connections
+grows faster than the cost of serving requests**. That is why keep-alive, connection pooling
+and edge termination exist, and it is why they appear early in every serious architecture.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'DNS resolution fails or returns a stale answer',
+      symptom:
+        'Some users cannot reach the site at all, while others are fine. Often geographically clustered, and it "fixes itself" after a while.',
+      cause:
+        'Resolvers cache aggressively, and some ignore short TTLs. After a change, the old and new answers coexist for as long as the longest cache in the path.',
+      mitigation:
+        'Never rely on DNS for fast failover. Keep the old endpoint serving until caches expire, and use anycast or a load balancer for traffic movement that must be quick.',
+    },
+    {
+      what: 'The connection is established but no data arrives',
+      symptom:
+        'Requests hang until the client gives up. The server shows no errors, because it never saw the request.',
+      cause:
+        'A dropped connection with no notification. TCP will retransmit patiently, and the client may wait far longer than any human will.',
+      mitigation:
+        'Set explicit timeouts on every network call at every layer. A missing timeout is not a fast path, it is an unbounded one.',
+    },
+    {
+      what: 'TLS certificate expires',
+      symptom: 'Every client fails at once, hard, with a security warning.',
+      cause: 'A certificate reached its expiry date and nothing renewed it.',
+      mitigation:
+        'Automated renewal, plus alerting on days-until-expiry rather than on failure. This is a scheduled outage that you can see coming for 90 days and still miss.',
+    },
+    {
+      what: 'A middlebox rewrites or blocks the traffic',
+      symptom:
+        'A small percentage of users on particular networks see broken or truncated responses.',
+      cause:
+        'Corporate proxies, captive portals and some ISP equipment inspect and modify traffic.',
+      mitigation:
+        'Encrypt end to end, do not assume the network is transparent, and measure from real client networks rather than only from your own monitoring.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Terminate TLS at the edge, close to users, rather than at the origin server"
+  options={[
+    'Terminate at the origin: one place to configure, full end-to-end encryption to your own machine',
+    'Terminate at an edge network, then use a separate connection to the origin',
+    'Terminate at the edge and re-encrypt to the origin',
+  ]}
+  why="Handshakes cost round trips, and round trips cost distance. Moving termination close to the user removes two long round trips from every new connection, while the edge holds a warm, reused connection to the origin."
+  gain="Dramatically lower connection setup latency for distant users; handshake CPU moved off your origin; a natural place for caching, rate limiting and DDoS absorption."
+  sacrifice="The edge sees your plaintext. You have added a third party to your trust boundary and a dependency you do not operate."
+  failureModes={[
+    'The edge provider has an outage and you have no direct path for users to reach the origin',
+    'Certificate management is split across two systems and drifts',
+    'The edge caches something user-specific because a header was misconfigured',
+  ]}
+  operationalBurden="Moderate: another system to configure and monitor, and a second place where routing rules live. Debugging now requires correlating logs across two providers."
+  cost="Usually billed per request and per gigabyte egressed. Cheap at small scale, and a significant line item at large scale — often more than the origin servers."
+  whenNot="When users are geographically concentrated near your origin, when regulatory constraints forbid a third party holding plaintext, or when your traffic is low enough that the added dependency is a bigger availability risk than the latency it saves."
+/>
+
+## In production
+
+<RealWorld>
+
+Connection reuse is not a micro-optimisation; it is one of the highest-leverage changes
+available on a latency-sensitive path.
+
+<Claim label="fact" source="rfc9112">
+HTTP/1.1 makes persistent connections the default, so a connection is reused for subsequent
+requests unless a party signals otherwise. This removes the setup cost from every request
+after the first.
+</Claim>
+
+<Claim label="fact" source="rfc9113">
+HTTP/2 goes further and multiplexes concurrent requests over a single connection, removing
+the need to open several connections in parallel to achieve concurrency.
+</Claim>
+
+<Claim label="fact" source="rfc9000">
+QUIC, which HTTP/3 runs over, provides per-stream reliability. A lost packet stalls only the
+stream it belongs to, rather than every stream sharing the connection — the head-of-line
+blocking problem that TCP-based multiplexing cannot avoid.
+</Claim>
+
+The practical consequence for a design discussion: if a service makes many small calls to
+another service, the connection strategy is part of the design, not an implementation detail.
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that latency is dominated by round trips and distance rather than by computation. Candidates who jump straight to caching and load balancers without mentioning the network are revealing the boundary of their mental model."
+  depth="You should be able to enumerate the steps and say roughly what each costs. You do not need to recite TCP state transitions unless you are interviewing for a network-adjacent role, in which case you should offer to go deeper and let the interviewer decide."
+  followUps={[
+    'The p99 is 3 seconds but the server p99 is 30 ms. Where is the time going?',
+    'Users in one region complain. What do you check first?',
+    'How would you make the second request from the same client faster than the first?',
+    'What breaks if you set a DNS TTL of 30 seconds to enable fast failover?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will add a CDN to make the API faster.',
+      why: 'A CDN removes distance for cacheable responses. An authenticated, per-user API response is generally not cacheable, so the CDN saves nothing on the response itself.',
+      instead:
+        'Say what the CDN actually buys here: terminating TLS near the user removes two long round trips from connection setup, and the connection to the origin is warm and reused. That is a real gain, and it is a different gain from caching.',
+    },
+    {
+      mistake: 'Latency is a server problem, so we need bigger servers.',
+      why: 'On a cold connection to a distant user, the server may account for well under a fifth of the total. Doubling server speed halves a small number.',
+      instead:
+        'Measure where the time goes before spending. Split the budget: DNS, connection setup, request transfer, server time, response transfer, rendering. Optimise the largest term.',
+    },
+    {
+      mistake: 'We use HTTPS, so the connection is secure.',
+      why: 'It is a claim about the transport, not about the system. It says nothing about who holds the plaintext at each hop, whether the certificate is verified, or whether an edge provider sits in the middle.',
+      instead:
+        'State where encryption starts and ends, and who is inside the trust boundary at each hop.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['rtt', 'latency']}
+  prompt="A page loads in 2.5 seconds. The server logs say the request was handled in 40 ms. The user is 7,600 km from the origin, on a fresh connection, and the page pulls in 6 additional resources from the same origin. What is the most likely dominant cost?"
+  options={[
+    {
+      id: 'a',
+      text: 'Server processing that is not being logged correctly',
+      implies: 'You suspect the measurement rather than the network.',
+      why: 'Worth checking, and occasionally right — but the arithmetic already explains the gap without it. Three round trips of connection setup plus seven request/response cycles at roughly 80 ms each accounts for well over a second on their own.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Sequential round trips: connection setup plus one exchange per resource',
+      implies: 'You are counting round trips, which is the correct unit for this question.',
+      why: 'At roughly 80 ms per round trip, TCP plus TLS is about 160 ms before anything useful moves. Seven resources fetched with limited concurrency adds several hundred milliseconds more. Distance times number of exchanges is the dominant term.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Insufficient bandwidth for the payload',
+      implies: 'You are thinking about throughput rather than latency.',
+      why: 'Bandwidth matters for large payloads, but a typical page of HTML and JSON is small enough that transfer time is minor compared with the round trips required to request each piece. Bandwidth becomes dominant for video and large images, not for many small requests.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the fix as well as the cause: reuse one connection for all seven resources (HTTP/2 multiplexing), terminate TLS at the edge so setup costs a short round trip instead of a long one, and reduce the number of sequential dependencies in the page rather than trying to make each one faster."
+/>
+
+<Check
+  concepts={['dns']}
+  prompt="You set your DNS TTL to 30 seconds so you can fail over quickly. During an incident, you change the record. What actually happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'Traffic moves within 30 seconds',
+      implies: 'You expect resolvers to honour the TTL you publish.',
+      why: 'Many do. But operating systems, browsers and application runtimes each cache independently, and some resolvers enforce their own minimum TTL. A meaningful tail of clients will keep using the old address for far longer than you specified.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Most traffic moves quickly, but a long tail persists on the old address',
+      implies: 'You understand that DNS caching is layered and not fully under your control.',
+      why: 'This is the observed behaviour. The practical consequence is that the old endpoint must keep serving correctly during and after a failover, which means DNS is a traffic *management* tool rather than a failover mechanism.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Nothing changes, because DNS is fully cached',
+      implies: 'You have over-corrected from the naive answer.',
+      why: 'Caches do expire, and most traffic will move. The point is not that DNS is useless, but that its tail is long and outside your control.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer notes the cost of the short TTL itself: every expiry forces a fresh lookup, which adds latency for users and load on your nameservers. It then proposes anycast or a load balancer as the mechanism for fast traffic movement, leaving DNS for changes that can take minutes."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'HTTP semantics: what a method and status code actually promise',
+      sourceId: 'rfc9110',
+      note: 'The authority for method idempotency and safety, which becomes load-bearing when you start retrying requests.',
+    },
+    {
+      label: 'TLS 1.3 handshake and the 0-RTT replay caveat',
+      sourceId: 'rfc8446',
+    },
+    {
+      label: 'Latency, bandwidth, and why they are not the same resource',
+      sourceId: 'hpbn',
+    },
+    {
+      label: 'Next: how a name becomes an address',
+      href: '/concepts/dns',
+      note: 'The naming layer, and why its caching behaviour shapes your failover strategy.',
+    },
+  ]}
+/>

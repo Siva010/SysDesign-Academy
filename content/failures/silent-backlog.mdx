@@ -1,0 +1,130 @@
+---
+id: silent-backlog
+title: The Silent Backlog
+symptom: Every dashboard is green, no errors are logged, and customers are receiving emails about orders they placed six hours ago.
+category: capacity
+concepts: [queue-depth, backpressure, consumer-group, partition-ordering, poison-message, dead-letter-queue, load-shedding, littles-law]
+sources: [kafka-docs, aws-builders-library, ddia]
+status: reviewed
+---
+
+## What you see
+
+Nothing. That is the defining feature.
+
+- Error rate: **0%.**
+- API latency: **normal.**
+- CPU on the workers: **60%.**
+- Consumer processes: **all running, all processing messages.**
+
+Then support escalates: customers are receiving order confirmation emails hours after ordering.
+Some received a shipping notification before the confirmation. One received a confirmation for an
+order they had already cancelled.
+
+The queue depth graph — which nobody had alerted on — shows a line rising steadily for eleven
+hours.
+
+## The mechanism
+
+Consumers are processing successfully. They are simply processing more slowly than messages
+arrive.
+
+- Arrival rate: **1,200 messages per second.**
+- Service rate: **1,050 messages per second.**
+
+The difference is 150 per second, which is 540,000 messages in an hour. Nothing errors, because
+nothing is failing. The system is working exactly as designed, at a rate slightly below what is
+required, and the gap accumulates.
+
+<Claim label="inference">
+This failure is silent by construction. Every component reports success, because every component
+is succeeding. The only observable is a queue growing, and the only user-visible symptom is
+staleness — which reaches support long before it reaches monitoring, unless the queue is
+monitored deliberately.
+</Claim>
+
+Why the service rate dropped is usually mundane: a downstream API added latency, a new message
+field made deserialisation slower, or an added consumer group increased broker load. In this case
+the email provider's p99 rose from 80 ms to 140 ms, which was enough.
+
+The ordering symptom has a separate cause. When some messages are hours old and others are
+recent, related events arrive out of order relative to each other — a shipping notification from
+a fast partition overtaking a confirmation stuck behind a backlog in a slow one.
+
+## Why the obvious fixes make it worse
+
+**Adding consumers.** Correct instinct, and frequently ineffective. In a partitioned log,
+parallelism within a consumer group is capped by the number of partitions. Adding consumers
+beyond that leaves them idle. Adding partitions is a change with its own consequences for
+ordering.
+
+**Adding consumers when the downstream is the bottleneck.** If the email provider rate-limits
+you, more consumers just means more of them waiting. The queue keeps growing and you have added
+load to a system that was already the constraint.
+
+**Purging the queue.** Fast, and it discards work customers are waiting for. Sometimes the right
+answer for low-value messages; never the right answer without deciding, per message type,
+whether the work still matters.
+
+## What actually works
+
+**First, determine which constraint you are hitting.** Three possibilities, three different
+fixes:
+
+1. **Consumers are CPU-bound** → add consumers, up to the partition count.
+2. **Parallelism is capped by partitions** → add partitions, accepting the ordering consequences.
+3. **A downstream dependency is the bottleneck** → adding consumers does nothing. Either raise
+   the downstream limit, batch requests, or shed the lowest-value messages.
+
+**Then decide what the backlog is worth.** Six-hour-old order confirmations may still be worth
+sending. Six-hour-old analytics events are probably not. Shedding selectively is legitimate, and
+it is far better made as an explicit decision than as a purge.
+
+## How to prevent it
+
+**Alert on the age of the oldest unprocessed message, not on queue depth.**
+
+Depth is misleading in both directions. A queue with 500,000 messages that drains in 40 seconds
+is healthy. A queue with 300 messages whose oldest is four hours old is not — something is stuck.
+
+**Age maps directly to the user-visible symptom.** Depth does not.
+
+Other preventive measures:
+
+- **Alert on consumer lag per partition**, not aggregated. One stuck partition is invisible in an
+  aggregate that includes 31 healthy ones.
+- **Dead-letter after bounded retries**, and alert on dead letters. A poison message that always
+  fails will otherwise block its partition indefinitely.
+- **Monitor service rate against arrival rate.** The ratio crossing 1 is the earliest possible
+  signal, and it is available before the backlog is large enough to matter.
+- **Bound the queue.** An unbounded queue converts an overload problem into a latency problem and
+  then a storage problem. A bounded one forces the conversation about what to shed while there is
+  still time to have it.
+
+## How to detect it early
+
+- **Oldest message age**, per partition, alerted with a threshold tied to what users would
+  notice.
+- **Arrival rate versus completion rate**, which crosses well before the backlog is visible.
+- **End-to-end freshness probes.** Inject a synthetic message periodically and measure how long
+  it takes to be processed. This measures the thing users experience, rather than a proxy for it.
+
+## Related
+
+<Claim label="fact" source="kafka-docs">
+In a partitioned log, ordering is guaranteed within a partition and parallelism within a consumer
+group is bounded by the number of partitions. Adding consumers beyond the partition count leaves
+them idle.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Queue depth and message age are standard operational signals, and age maps more directly to user
+impact. Systems that alert only on depth routinely miss backlogs that matter and page for ones
+that do not.
+</Claim>
+
+<Claim label="recommendation" source="ddia">
+A queue absorbs bursts, not sustained excess arrival rate. When arrivals exceed service rate on
+average, the queue postpones the problem rather than solving it, and every message that
+eventually completes may already be irrelevant.
+</Claim>

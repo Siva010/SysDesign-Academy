@@ -1,0 +1,399 @@
+---
+id: caching-a-bet-on-time
+title: Caching, and the Price You Pay for It
+level: 2
+module: l2-less-work
+order: 1
+summary: A cache is a bet that the world changes more slowly than you read it. Every cost follows from that bet being wrong, or from the cache vanishing.
+difficulty: core
+minutes: 30
+prerequisites: [page-cache, many-machines-one-service]
+concepts: [cache-generic, cache-aside, write-through, ttl, cache-invalidation, distributed-cache, hit-rate, eviction]
+unlocks: [cache-stampede, local-cache, hot-key, staleness]
+patterns: [cache-aside, read-through-edge]
+failures: [cold-cache-collapse]
+sources: [redis-docs, rfc9111, aws-builders-library, ddia]
+status: reviewed
+---
+
+## The problem
+
+Your product page takes 300 ms because it runs six database queries. You put the rendered
+result in a cache with a five-minute TTL. Page load drops to 12 ms. Database load drops by
+95%. Everyone is delighted.
+
+Three weeks later, three things have happened:
+
+- A merchant changed a price and customers saw the old one for four minutes, which turned into
+  a complaint and then a refund.
+- During a deploy, the cache restarted, and the database — which had been serving 5% of read
+  traffic for weeks — received 100% of it and fell over.
+- One product went viral, and the single cache node holding that key saturated its network
+  interface.
+
+None of these are bugs in the cache. Each is a direct, predictable consequence of what a cache
+*is*.
+
+## Intuition
+
+A cache is a bet.
+
+You are betting that the answer you computed a moment ago is still good enough to give to the
+next person who asks. If the world changes more slowly than people ask, you win: you do the
+work once and serve it many times.
+
+Three things follow immediately, and they are the entire subject:
+
+- **You will sometimes be wrong.** The world changed and you served the old answer. How wrong
+  you are willing to be is the TTL, and it is a product decision wearing a technical costume.
+- **The bet only pays while the cache holds the answer.** When it does not — restart,
+  eviction, expiry — the full cost lands on whatever is behind it, all at once.
+- **The system is now sized for the cache being there.** The database behind a 95%-hit cache
+  is serving 5% of the real traffic. It has probably never been able to serve 100%, and nobody
+  has checked.
+
+## Concretely
+
+<Example title="The arithmetic that matters">
+
+Peak read traffic: 200,000 requests per second. Cache hit rate: 95%. Database capacity at
+acceptable latency: 10,000 queries per second.
+
+**Normal operation.** The database sees 200,000 × 0.05 = 10,000 queries per second. It is
+exactly at capacity, which nobody noticed because latency looked fine.
+
+**Hit rate drops to 90%.** The database now sees 20,000 per second — twice its capacity. A
+five-point drop in hit rate doubled the load. Hit rate is not a linear dial.
+
+**Cache is empty.** The database sees 200,000 per second: twenty times capacity. It does not
+degrade gracefully; it stops.
+
+The number worth writing on the design document is **the overload factor with a cold cache**:
+peak request rate divided by origin capacity. If it is above 1, then a cache restart is an
+outage, and no amount of cache reliability changes that — it only changes how often you find
+out.
+
+</Example>
+
+## Formal explanation
+
+<C id="cache-aside" /> is the common pattern: the application checks the cache; on a miss it
+reads the source, populates the cache, and returns. Simple, explicit, and it puts the
+application in control of what is cached and for how long.
+
+The alternatives trade differently. **Write-through** updates cache and store together, so the
+cache is never stale but every write pays for both. **Write-back** updates the cache and
+flushes later, which is fast and risks losing writes if the cache dies.
+
+Three properties determine whether caching helps:
+
+**<C id="hit-rate" /> depends on whether the hot set fits.** Caches work because access is
+skewed: a small fraction of keys receive most requests. As long as that fraction fits in
+memory, hit rate is high. When it stops fitting, hit rate does not decline gently — eviction
+starts removing entries that are about to be requested, and the rate falls sharply.
+
+**<C id="ttl" /> is your staleness budget, stated explicitly.** It is the simplest form of
+invalidation and usually the right one, because it requires no coordination and fails safe.
+
+**<C id="cache-invalidation">Invalidation</C> on write is more precise and much harder.** The
+cache does not know what changed; something must tell it, and that something can fail, race
+with a concurrent read, or miss a derived key that nobody remembered depends on the changed
+data.
+
+<Callout kind="info" title="The first question is not 'where do we cache'">
+It is "why is this read expensive?" A query that is slow because it lacks an index should get
+the index. Caching it instead means you have added staleness, a stampede risk and a new
+dependency in order to avoid writing one line of DDL — and the first miss still pays the full
+cost.
+</Callout>
+
+<Deeper title="Why invalidation is genuinely hard">
+
+Consider a cached product page derived from: the product row, the merchant's shipping policy,
+the current promotion, the stock level, and three recent reviews.
+
+When the merchant updates their shipping policy, which cache keys are now wrong?
+
+Every product page for that merchant. Possibly thousands. Nothing in the write path knows
+that, because the write touched a merchant row and the cache holds product pages.
+
+The general approaches, and their costs:
+
+- **TTL only.** Accept staleness up to the TTL. Simple, robust, and the answer far more often
+  than people expect.
+- **Explicit invalidation.** The write path knows which keys to delete. Precise, and it
+  requires the write path to know about every derived view — a coupling that decays as the
+  system grows.
+- **Versioned keys.** Include a version in the key, and bump the version on write. Old
+  entries are never read again and expire naturally. Elegant, and it wastes memory on entries
+  nobody will read.
+- **Change data capture.** Derive invalidations from the database's own change log, so the
+  write path does not need to know. Robust and considerably more machinery.
+
+There is a race in the second option worth knowing: a read that misses can be overtaken by a
+write, so a stale value is written into the cache *after* the invalidation. Guarding against it
+requires either a short TTL as a backstop or a compare-and-set on the cache write.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Each cache layer answers a different question and fails differently."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'browser', label: 'Browser cache', note: 'per user' }] },
+    { title: 'Edge', nodes: [{ id: 'cdn', label: 'CDN', note: 'per location' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'App instance', note: 'local cache', tone: 'accent' }] },
+    { title: 'Shared', nodes: [{ id: 'redis', label: 'Shared cache', note: 'one view' }] },
+    { title: 'Origin', nodes: [{ id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'browser', to: 'cdn', label: 'miss' },
+    { from: 'cdn', to: 'app', label: 'miss' },
+    { from: 'app', to: 'redis', label: 'miss' },
+    { from: 'redis', to: 'db', label: 'miss' },
+  ]}
+  stages={[
+    {
+      label: 'No cache',
+      show: ['browser', 'app', 'db'],
+      because:
+        'Every request does the full work. Correct, simple, and eventually too slow or too expensive.',
+    },
+    {
+      label: 'Shared cache',
+      show: ['browser', 'app', 'redis', 'db'],
+      because:
+        'One cache that every instance sees, so all users get the same answer. This is where most systems start, and it is the layer with the most invalidation control.',
+    },
+    {
+      label: 'Every layer',
+      show: ['browser', 'cdn', 'app', 'redis', 'db'],
+      because:
+        'Each layer serves what the one outside it could not, and each has less invalidation control than the layer beneath. The browser cache is the fastest and the one you can least take back.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Hot set fits easily in memory',
+      behaviour: 'High hit rate, stable. The cache does its job invisibly.',
+      firstToBreak: 'Nothing, which is why nobody measures the cold-cache overload factor.',
+    },
+    {
+      scale: 'Hot set approaches cache size',
+      behaviour:
+        'Eviction begins removing entries that are about to be requested. Hit rate falls faster than the size gap suggests.',
+      firstToBreak: 'Hit rate, and therefore origin load, non-linearly.',
+    },
+    {
+      scale: 'Traffic concentrated on a few keys',
+      behaviour:
+        'A shared cache partitions by key, so one popular key lives on one node and that node saturates.',
+      firstToBreak: 'The single node holding the hot key, regardless of cluster size.',
+    },
+    {
+      scale: 'Cache restarts under peak load',
+      behaviour:
+        'Every request becomes a miss simultaneously. Origin load jumps to the full request rate.',
+      firstToBreak:
+        'The origin, immediately, unless the cold-cache overload factor is below 1 or shedding is in place.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Cold cache overwhelms the origin',
+      symptom:
+        'The cache restarts or is flushed, and the database saturates within seconds. Recovery is slow because the origin cannot serve enough misses to refill the cache.',
+      cause:
+        'The origin was sized for the miss rate, not the request rate. This is true of essentially every system with a high hit rate.',
+      mitigation:
+        'Compute the cold-cache overload factor. If it exceeds 1, add request coalescing, load shedding, and a warming procedure. Consider persistence on the cache so a restart does not empty it.',
+    },
+    {
+      what: 'Synchronised expiry',
+      symptom:
+        'Regular latency spikes at a fixed interval, matching the TTL. Origin load is sawtoothed.',
+      cause:
+        'Many keys populated at the same moment expire at the same moment, so misses arrive in waves.',
+      mitigation:
+        'Add jitter to the TTL, so expiry spreads over a window rather than landing on an instant.',
+    },
+    {
+      what: 'Stale write after invalidation',
+      symptom:
+        'A value is updated, the cache is invalidated, and moments later the old value is back in the cache.',
+      cause:
+        'A read missed before the write, was slow, and populated the cache with the pre-write value after the invalidation.',
+      mitigation:
+        'Use a short TTL as a backstop, or a compare-and-set write into the cache, or a versioned key so the stale write lands under a key nobody reads.',
+    },
+    {
+      what: 'Caching negative results, or failing to',
+      symptom:
+        'Requests for non-existent keys bypass the cache entirely and hit the origin every time. Trivially exploitable by an attacker generating random keys.',
+      cause: 'Only successful lookups are cached, so "not found" is never remembered.',
+      mitigation:
+        'Cache absence with a short TTL, and use a Bloom filter in front where the key space is large and mostly empty.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Introduce a shared cache tier in front of the primary database"
+  options={[
+    'No cache: fix the queries, add indexes, add a read replica',
+    'Shared cache tier with cache-aside and TTL',
+    'In-process cache on each instance',
+    'Materialised view or denormalised table maintained by the write path',
+  ]}
+  why="When reads are far more frequent than writes, and the same answers are requested repeatedly, computing each one once and serving it many times is the largest available saving. Nothing else changes the cost of a read by two orders of magnitude."
+  gain="Read latency drops from a query to a memory lookup over the network. Origin load falls by the hit rate, which is usually the difference between needing one database and needing many."
+  sacrifice="Staleness up to the TTL, a new dependency on the request path, and a system that is now sized for the cache existing. Debugging gets harder: 'is this stale?' becomes a question you must ask about every wrong value."
+  failureModes={[
+    'Cold cache overwhelming the origin, which is the one that causes outages',
+    'Stampede on a popular key at expiry',
+    'A hot key saturating one cache node',
+    'Invalidation missing a derived key, producing wrong data that persists',
+  ]}
+  operationalBurden="Moderate. Another system to run, monitor, secure and upgrade. It needs hit-rate and eviction monitoring, and a documented answer to what happens when it is empty."
+  cost="Memory sized for the hot set, not for the whole dataset — usually modest. The larger cost is the engineering and operational attention, which is routinely underestimated."
+  whenNot="When the read is only slow because of a missing index, fix the index. When the data changes as often as it is read, the hit rate will be poor and you have added staleness for nothing. And when correctness requires the latest value — balances, permissions, inventory at the point of sale — a cache is the wrong tool and the argument should stop there."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="redis-docs">
+Redis supports several eviction policies, including approximated LRU and LFU, and the choice
+matters for workloads with different access patterns. It also supports optional persistence,
+which changes what a restart means for the cache's contents.
+</Claim>
+
+<Claim label="fact" source="rfc9111">
+HTTP defines cache freshness and validation, including stale-while-revalidate, which allows a
+cache to serve a stale response while it refreshes in the background. This is a
+standards-level answer to the stampede problem for HTTP-cacheable content.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Design for the cache being empty. A system whose origin cannot survive its full request rate
+has a scheduled outage waiting for the next restart, deploy or eviction event. Request
+coalescing and load shedding are the mitigations that make a cold cache survivable.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you treat a cache as a trade rather than an improvement. The reliable differentiator is whether you volunteer what happens when the cache is empty — most candidates never mention it."
+  depth="Know the patterns, know that hit rate is non-linear, and be able to compute origin load from hit rate out loud. Naming the stampede and its mitigations is a strong signal."
+  followUps={[
+    'What is your hit rate, and what happens to the database at 90% instead of 95%?',
+    'The cache restarts at peak. Walk me through the next 60 seconds.',
+    'How do you invalidate when the underlying data changes?',
+    'One key gets 2 million requests per second. Does your cache help?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will add a cache to make it faster.',
+      why: 'It says nothing about what is slow or why. If the cost is a missing index, caching hides it and the first miss still pays it. If the data changes constantly, the hit rate will be poor.',
+      instead:
+        'State what is expensive, why it is expensive, what the read/write ratio is, and what staleness is acceptable. Then decide whether a cache is the cheapest fix.',
+    },
+    {
+      mistake: 'The cache is highly available, so the cold-start problem does not apply.',
+      why: 'Availability is not the only way a cache empties. Deploys, configuration changes, evictions, key-space changes and failovers all produce cold or partially cold caches while the cache itself is perfectly healthy.',
+      instead:
+        'Compute the cold-cache overload factor and design for it, independently of the cache tier\'s uptime.',
+    },
+    {
+      mistake: 'We invalidate on write, so the cache is never stale.',
+      why: 'Invalidation races with in-flight reads, misses derived keys nobody remembered, and fails silently when the invalidation itself fails. "Never stale" is a much stronger claim than the mechanism supports.',
+      instead:
+        'Invalidate on write for precision and keep a TTL as a backstop. Assume some staleness will happen and decide what it costs.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<EstimateCheck
+  concepts={['hit-rate', 'cache-generic']}
+  prompt="Peak traffic is 120,000 reads per second with a 96% cache hit rate. The hit rate drops to 92%. How many queries per second now reach the database?"
+  unit="queries/sec"
+  answer={9600}
+  tolerance={0.15}
+  derivation={[
+    'At 96% hit rate: 120,000 × 0.04 = 4,800 queries per second reach the origin.',
+    'At 92% hit rate: 120,000 × 0.08 = 9,600 queries per second.',
+    'A four-point drop in hit rate doubled origin load.',
+    'This is why hit rate must be monitored as a first-class signal: small movements produce large origin swings.',
+  ]}
+  stronger="A stronger answer states the design consequence: the origin must be provisioned for a hit rate meaningfully below the one you observe, because hit rate degrades under exactly the conditions where you can least afford extra load — a hot new item, a cache resize, a partial eviction."
+/>
+
+<Check
+  concepts={['cache-invalidation', 'staleness']}
+  prompt="A merchant updates their shipping policy. Product pages for that merchant are cached, rendered from several underlying tables. What is the honest description of your invalidation problem?"
+  options={[
+    {
+      id: 'a',
+      text: 'Delete the merchant cache key when the merchant row changes',
+      implies: 'You are invalidating what was written rather than what was derived from it.',
+      why: 'The stale entries are the product pages, not the merchant record. The write path touched a merchant row and has no idea which derived views depend on it — which may be thousands of product pages.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Every derived key that used that merchant data is now stale, and the write path does not know which those are',
+      implies: 'You have identified that invalidation requires knowledge the write path does not possess.',
+      why: 'This is the actual difficulty. The options are: tag cached entries with their dependencies so you can invalidate by tag, use a version in the key so old entries become unreachable, derive invalidations from a change log, or accept TTL-bounded staleness.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Flush the whole cache to be safe',
+      implies: 'You are trading correctness for a cold cache.',
+      why: 'Correct in the narrow sense and usually catastrophic: you have just created the cold-cache condition deliberately, at an arbitrary moment, and the origin receives the full request rate.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer picks a specific mechanism and names its cost: versioned keys are simple and waste memory on unreachable entries; dependency tags are precise and require maintaining the tag set; change data capture is robust and is a whole additional pipeline. It also asks the product question first — how stale is too stale? — because if the answer is 'a few minutes is fine', a TTL removes the entire problem."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Eviction policies, persistence and clustering', sourceId: 'redis-docs' },
+    {
+      label: 'HTTP caching: freshness, validation and stale-while-revalidate',
+      sourceId: 'rfc9111',
+      note: 'The standards answer to several problems people re-solve badly in application code.',
+    },
+    { label: 'Designing for the cache being empty', sourceId: 'aws-builders-library' },
+    {
+      label: 'Next: the stampede, and what a hot key does to all of this',
+      href: '/concepts/cache-stampede',
+    },
+  ]}
+/>

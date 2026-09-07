@@ -1,0 +1,409 @@
+---
+id: copies-and-what-they-cost
+title: Copies, and What They Cost
+level: 3
+module: l3-replication
+order: 1
+summary: Replication buys durability, read capacity and locality. It charges in staleness, and every anomaly users report lives inside the lag window.
+difficulty: core
+minutes: 28
+prerequisites: [wal, what-the-database-promises]
+concepts: [replication-generic, leader-follower, replication-lag, replication-for-reads, sync-vs-async-replication, read-your-writes, backup]
+unlocks: [failover, multi-leader, leaderless, quorum, monotonic-reads]
+failures: [split-brain]
+sources: [ddia, postgres-docs, mysql-docs, sre-book]
+status: reviewed
+---
+
+## The problem
+
+You add a read replica. Read capacity doubles. Everyone is pleased.
+
+Then the support tickets start, and they are all variations of one complaint:
+
+- A user updates their profile, the page reloads, and the old name is there.
+- A comment is posted, disappears on refresh, and reappears a moment later.
+- A dashboard shows a total that does not match the sum of the rows beneath it.
+
+Nothing is broken. Each replica is faithfully applying the writes it has received. The problem
+is that &ldquo;has received&rdquo; is a different point in time for each of them, and your
+application forgot that.
+
+## Intuition
+
+Replication is photocopying, continuously.
+
+The original is the leader. Every change is written there, and a stream of changes flows to
+each copy. Copies are useful: they survive the original burning down, they let many people read
+at once, and one can sit in another country so local readers do not wait.
+
+But a copy is always at least slightly behind. The question is only how far, and what happens
+in that window.
+
+Two decisions define everything:
+
+**Where can writes happen?** One place (simple, and that place is your write ceiling and your
+failure point), several places (available and fast everywhere, and now two people can change
+the same thing in two places), or no fixed place at all (quorum-based, flexible, and
+complicated).
+
+**Does a write wait for its copies?** If yes, you pay latency on every write and you fail when
+a replica is unreachable. If no, writes are fast and a failover can lose the ones that had not
+arrived.
+
+There is no configuration in which you avoid choosing.
+
+## Concretely
+
+<Example title="Where the lag actually shows up">
+
+A user updates their display name. The write goes to the leader and returns. The page reloads
+and the read is routed to a replica that is 80 ms behind. The old name appears.
+
+Eighty milliseconds sounds harmless. It is not, because a page reload after a form submission
+lands inside that window almost every time.
+
+The general shape: **any read that closely follows a write by the same user will land in the
+lag window.** This is not an edge case; it is the most common user interaction there is.
+
+Three session guarantees fix specific symptoms:
+
+- **<C id="read-your-writes" />** — a user always sees their own updates. Route that user's
+  reads to the leader for a short period after they write, or track the write position and
+  require a replica to have caught up to it.
+- **<C id="monotonic-reads" />** — time never appears to run backwards for one user. Pin a user
+  to one replica so they cannot bounce between a fresher and a staler copy.
+- **Consistent prefix** — a user never sees an effect before its cause, which matters when
+  reading across partitions replicated independently.
+
+Note what these have in common: they are all *per-user* guarantees. They make eventual
+consistency feel correct without paying for global consistency, and that is usually the right
+trade.
+
+</Example>
+
+## Formal explanation
+
+<C id="leader-follower" /> replication designates one node to accept writes and stream them to
+followers, usually by shipping the <C id="wal">write-ahead log</C>. It is the default in most
+relational systems because it is simple to reason about: there is one authoritative order of
+writes.
+
+<C id="sync-vs-async-replication">Synchronous or asynchronous</C> is the load-bearing choice:
+
+- **Synchronous** — the leader waits for at least one follower to acknowledge before
+  confirming the commit. No committed write is lost on failover. Write latency now includes a
+  round trip to the follower, and if the follower is unreachable, writes stall.
+- **Asynchronous** — the leader confirms immediately. Fast, and a failover can lose writes that
+  had not yet been shipped. That loss window is your <C id="rpo">RPO</C>.
+- **Semi-synchronous** — wait for one follower, not all. The usual compromise: bounded loss,
+  bounded latency cost.
+
+<C id="replication-lag" /> is how far behind a follower is. It is not constant. It grows under
+write bursts, during long-running queries on the follower, and after any network hiccup — which
+means it is largest precisely when the system is busiest.
+
+<Callout kind="warn" title="Replicas are not backups">
+Replication faithfully copies your DELETE to every replica in milliseconds. It protects against
+a machine failing, not against a bad migration, a buggy deploy, or someone running an UPDATE
+without a WHERE clause. Only an independent copy that is not continuously synchronised does
+that, and only if you have tested restoring it.
+</Callout>
+
+<Deeper title="Read replicas do not scale writes, and each one costs the leader">
+
+The arithmetic is worth being explicit about, because &ldquo;add a replica&rdquo; is offered
+as a general scaling answer far more often than it should be.
+
+Every replica applies **every** write. If the leader sustains 5,000 writes per second, each
+replica must also sustain 5,000 writes per second just to keep up. Adding replicas therefore
+does not increase write capacity at all — and in a single-threaded replication implementation,
+a replica can fall behind a leader that is using many cores to accept writes in parallel.
+
+Each replica also adds load to the leader: another stream to ship, another connection to
+maintain.
+
+So the honest statement is: **read replicas scale reads, at the cost of staleness, and they
+make the write ceiling very slightly worse.** When writes are the constraint, replicas are not
+the answer — partitioning is.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="One authoritative order of writes; several copies at different points in it."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'w', label: 'Writers' }, { id: 'r', label: 'Readers' }] },
+    { title: 'Routing', nodes: [{ id: 'route', label: 'Query router', note: 'reads vs writes', tone: 'accent' }] },
+    { title: 'Primary', nodes: [{ id: 'leader', label: 'Leader', note: 'all writes' }] },
+    { title: 'Copies', nodes: [{ id: 'sync', label: 'Sync replica', note: 'RPO zero' }, { id: 'async', label: 'Async replicas', note: 'lag varies' }] },
+    { title: 'Elsewhere', nodes: [{ id: 'backup', label: 'Backups', note: 'not a replica' }] },
+  ]}
+  edges={[
+    { from: 'w', to: 'route' },
+    { from: 'r', to: 'route' },
+    { from: 'route', to: 'leader', label: 'writes' },
+    { from: 'route', to: 'async', label: 'most reads' },
+    { from: 'leader', to: 'sync', label: 'wait for ack' },
+    { from: 'leader', to: 'async', label: 'stream', dashed: true },
+    { from: 'leader', to: 'backup', label: 'periodic' },
+  ]}
+  stages={[
+    {
+      label: 'One node',
+      show: ['w', 'r', 'leader'],
+      because:
+        'Everything reads and writes the same copy. Perfectly consistent, and a single point of failure with a hard read ceiling.',
+    },
+    {
+      label: 'Add read replicas',
+      show: ['w', 'r', 'route', 'leader', 'async'],
+      because:
+        'Reads spread across copies that are slightly behind. Read capacity rises; staleness appears; write capacity is unchanged.',
+    },
+    {
+      label: 'Bound the loss, and keep a real backup',
+      show: ['w', 'r', 'route', 'leader', 'sync', 'async', 'backup'],
+      because:
+        'A synchronous replica bounds what a failover can lose. Backups are separate, because replication copies your mistakes as faithfully as your data.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One replica, low write rate',
+      behaviour: 'Lag in the low milliseconds. Anomalies are rare enough to be dismissed as flukes.',
+      firstToBreak: 'Nothing visible, which is why read-your-writes is not handled.',
+    },
+    {
+      scale: 'Several replicas, read-heavy',
+      behaviour:
+        'Read capacity scales nearly linearly. Users bounce between replicas at different positions.',
+      firstToBreak:
+        'Monotonic reads: a user sees a value, refreshes, and it disappears because they hit a staler replica.',
+    },
+    {
+      scale: 'Write bursts',
+      behaviour:
+        'Lag spikes exactly when traffic is highest. Replicas may fall seconds or minutes behind.',
+      firstToBreak:
+        'Any feature that reads recent writes from a replica, and any failover attempted during the burst.',
+    },
+    {
+      scale: 'Writes approaching the leader’s ceiling',
+      behaviour:
+        'Replicas struggle to apply the stream as fast as the leader accepts it, so lag grows without bound.',
+      firstToBreak:
+        'Replication itself. At this point replicas are no longer a scaling tool and partitioning is the conversation.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'User does not see their own write',
+      symptom:
+        'A form submits successfully and the next page shows the old value. Intermittent and hard to reproduce locally.',
+      cause: 'The write went to the leader and the immediately following read went to a replica.',
+      mitigation:
+        'Route reads to the leader for a short window after that user writes, or carry the write position and require the replica to have caught up.',
+    },
+    {
+      what: 'Lag spikes under load',
+      symptom:
+        'Stale-data complaints cluster during peak hours, and a failover during peak would lose far more than the usual amount.',
+      cause:
+        'A replica applying a write stream serially cannot keep up with a leader accepting writes in parallel, and long queries on the replica delay application further.',
+      mitigation:
+        'Monitor lag in seconds and in bytes, alert on it, and make routing lag-aware so a badly lagging replica is removed from the read pool.',
+    },
+    {
+      what: 'Data loss on failover',
+      symptom:
+        'After promoting a replica, recently confirmed writes are missing. Users saw a success message for work that no longer exists.',
+      cause:
+        'Asynchronous replication: the leader confirmed writes that had not yet reached the promoted replica.',
+      mitigation:
+        'Decide the RPO deliberately. Use a synchronous or semi-synchronous replica if the answer is zero, and accept the write latency cost that comes with it.',
+    },
+    {
+      what: 'Replicas mistaken for backups',
+      symptom:
+        'A bad migration or an accidental deletion is replicated everywhere within milliseconds, and there is nothing to restore from.',
+      cause: 'Replication is designed to copy changes faithfully, including the ones you regret.',
+      mitigation:
+        'Keep point-in-time backups, and test the restore. An untested backup is a belief, not a capability.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Serve most reads from asynchronous replicas, with read-your-writes routing for recent writers"
+  options={[
+    'All reads from the leader: consistent, and the leader is the ceiling',
+    'All reads from async replicas: maximum capacity, visible staleness',
+    'Async replicas with per-user routing to the leader after a write',
+    'Synchronous replication so replicas are never behind',
+  ]}
+  why="Most reads have no relationship to a recent write by the same user, and for those, a few tens of milliseconds of staleness is invisible. The small fraction that do follow a write are exactly the ones users notice, and those can be routed specially."
+  gain="Read capacity scales with replica count, while the anomaly users actually notice is eliminated. The leader is freed to spend its capacity on writes."
+  sacrifice="Routing complexity: something must track who wrote recently, and that state has to live somewhere. Other users still see stale data, which is usually fine and occasionally is not."
+  failureModes={[
+    'The routing window is too short and the replica has not caught up',
+    'Reads for one user land on different replicas, so values appear to move backwards',
+    'A badly lagging replica stays in the read pool because lag is not monitored',
+  ]}
+  operationalBurden="Moderate. Lag must be monitored and used for routing decisions. The routing state — who wrote recently — is a small piece of shared state with its own failure mode."
+  cost="One machine per replica, plus its storage. Cheap relative to the read capacity gained, and the cheapest read scaling available before partitioning."
+  whenNot="When every read must reflect the latest write — balances, permissions, inventory at point of sale — routing to a replica is a correctness problem rather than a performance trade. And when writes are the bottleneck, replicas do not help at all: each one applies every write, so the ceiling is unchanged."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL supports streaming replication with synchronous, asynchronous and quorum-based
+commit modes, and exposes replication lag so applications and routers can make decisions based
+on it.
+</Claim>
+
+<Claim label="fact" source="mysql-docs">
+MySQL replication is asynchronous by default, with semi-synchronous available. Replication
+delay can grow when a replica applies changes less parallel than the source produced them.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+RPO and RTO should be stated explicitly rather than inherited from defaults. Asynchronous
+replication implies a non-zero RPO, and the size of that window is a business decision that
+belongs in the design, not in the configuration file.
+</Claim>
+
+<Claim label="recommendation">
+Test the failover, on a schedule, in production-like conditions. A failover path that has never
+been exercised is a hypothesis, and it will be tested for the first time during an incident.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know that replicas buy read capacity and not write capacity, and whether you volunteer the staleness consequence. Read-your-writes is the specific detail that separates candidates who have shipped this from those who have read about it."
+  depth="Know the sync/async trade and its RPO implication, know that lag spikes under load, and know at least two session guarantees by name. Replication protocol internals are rarely required."
+  followUps={[
+    'A user updates their profile and immediately sees the old value. Why?',
+    'Writes are the bottleneck. Do replicas help?',
+    'Your leader dies. What have you lost?',
+    'Why is a replica not a backup?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We added a replica to scale the database.',
+      why: 'It scales reads only. Every replica applies every write, so write capacity is unchanged and the leader takes slightly more load shipping the extra stream.',
+      instead:
+        'Say which side is the bottleneck. If it is reads, replicas are the right answer and you should name the staleness consequence. If it is writes, this is the wrong tool entirely.',
+    },
+    {
+      mistake: 'Replication gives us high availability.',
+      why: 'It gives you a candidate to promote. Availability depends on detecting the failure, promoting correctly without split brain, redirecting traffic, and losing an acceptable amount of data — none of which replication provides by itself.',
+      instead:
+        'Describe the whole failover path with its timings, and state the RPO and RTO it delivers.',
+    },
+    {
+      mistake: 'We have replicas in three regions, so we are backed up.',
+      why: 'All three will faithfully apply a destructive statement within milliseconds. Replication protects against machine loss, not against you.',
+      instead:
+        'Keep point-in-time backups that are not continuously synchronised, and rehearse the restore so you know how long it takes.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['replication-for-reads', 'replication-lag']}
+  prompt="Your database sustains 4,000 writes and 40,000 reads per second, and the leader is at capacity. You add four read replicas. What happens to the write ceiling?"
+  options={[
+    {
+      id: 'a',
+      text: 'It roughly triples, since the load is spread over more machines',
+      implies: 'You are treating replicas as additional write capacity.',
+      why: 'Replicas do not accept writes. Every write still goes to the leader, and each replica must apply all 4,000 per second just to keep up. Nothing about the write path got more capacity.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'It is unchanged, and slightly worse: the leader now ships four streams instead of none',
+      implies: 'You recognise that replication scales reads and adds a small cost to the leader.',
+      why: 'All writes still land on the leader, and it now maintains four replication streams. The gain is entirely on the read side — 40,000 reads spread across replicas — which is real and valuable, but it is not the write ceiling.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'It improves because the leader no longer serves reads',
+      implies: 'You are counting the read load removed from the leader.',
+      why: 'Partly right and worth saying: relieving the leader of read work does free capacity, which can help. But the ceiling on write throughput itself is set by the leader\'s ability to apply writes, and that is unchanged.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer states the next step: if writes are the constraint, the options are a bigger leader, reducing write volume through batching or write-behind, or partitioning so writes divide across leaders. It also notes that replicas struggling to keep up with 4,000 writes per second will show growing lag, which makes the read path stale exactly when the system is busiest."
+/>
+
+<Check
+  concepts={['sync-vs-async-replication', 'rpo']}
+  prompt="Your leader fails suddenly and you promote an asynchronous replica. What have you lost, and what would have prevented it?"
+  options={[
+    {
+      id: 'a',
+      text: 'Nothing, because the replica had all the data',
+      implies: 'You are assuming replication had caught up at the moment of failure.',
+      why: 'Asynchronous replication means the leader confirms writes before the replica has them. Whatever was in flight at the moment of failure is gone, and the amount depends on the lag at that instant — which is largest under load, which is when failures cluster.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Every write confirmed but not yet shipped; a synchronous replica would have bounded that to zero, at the cost of write latency',
+      implies: 'You connected the replication mode to the recovery point objective.',
+      why: 'This is exactly the trade. Async gives fast writes and a non-zero RPO equal to the lag at failure. Sync gives an RPO of zero and adds a round trip to every write, plus a new failure mode: writes stall when the synchronous replica is unreachable.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Only uncommitted transactions, which is expected behaviour',
+      implies: 'You are applying single-node crash semantics.',
+      why: 'On one node, only uncommitted work is lost. With async replication, *committed and confirmed* writes can be lost, because the confirmation did not require the replica to have them. That is a materially different promise to have broken.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the middle option and the operational consequence: semi-synchronous replication waits for one replica rather than all, bounding loss without making write availability depend on every replica. It also notes that a synchronous replica must be close by, or the write latency cost becomes a cross-region round trip on every commit."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Replication models and their consistency implications', sourceId: 'ddia' },
+    { label: 'Streaming replication and commit modes', sourceId: 'postgres-docs' },
+    { label: 'Setting RPO and RTO deliberately', sourceId: 'sre-book' },
+    {
+      label: 'Next: when one machine can no longer hold the data',
+      href: '/lessons/splitting-the-data',
+    },
+  ]}
+/>

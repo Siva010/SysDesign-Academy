@@ -1,0 +1,445 @@
+---
+id: transactions-across-machines
+title: Transactions Across Machines
+level: 3
+module: l3-transactions
+order: 2
+summary: One database commits atomically because one process decides. Across machines someone must decide and everyone must obey, and they can crash in between.
+difficulty: advanced
+minutes: 30
+prerequisites: [what-the-database-promises, splitting-the-data]
+concepts: [distributed-transaction, two-phase-commit, saga, distributed-lock, strict-serializability, external-consistency]
+unlocks: [outbox, dual-write, idempotency-key, fencing-token, linearizability]
+patterns: [saga, transactional-outbox, idempotency-key]
+sources: [ddia, spanner, cockroach-docs, postgres-docs, mit-6584, martin-fowler]
+status: reviewed
+---
+
+## The problem
+
+An order is placed. The code does two things:
+
+    db.insert(order)
+    queue.publish(OrderPlaced)
+
+It reads like one action. It is two, and there are four possible outcomes. Two of them are fine.
+One leaves an order that nobody downstream ever hears about — no confirmation email, no warehouse
+pick, no invoice. The other publishes an event about an order that does not exist, and every
+consumer of it fails on a missing row.
+
+Nobody wrote a distributed transaction. Nobody discussed one. But two systems now have to agree,
+and there is no mechanism making them.
+
+This is the most common distributed transaction in software, and it usually appears in code
+review as two ordinary lines.
+
+## Intuition
+
+A transaction on one machine is atomic for a very ordinary reason: **one process decides, and it
+writes the decision down before telling anyone.** The commit record hits the log, and after that
+the outcome is a fact that survives a crash. Recovery reads the log and knows what happened.
+
+Involve a second machine and you need two properties that are now separate:
+
+- Somebody must **decide** the outcome.
+- Everybody must **obey** the decision.
+
+Between those two moments, any participant can crash, and the network can stop delivering. A
+machine that promised to commit and then lost contact cannot decide for itself: committing might
+contradict the group, and aborting might too. It must wait. That waiting — while holding whatever
+locks it took to make the promise — is the fundamental cost, and it is not an implementation
+weakness that a better protocol removes.
+
+So there are three honest strategies, and choosing between them is the content of this lesson:
+
+1. **Avoid it.** Arrange the data so the transaction fits on one machine. Almost always the best
+   answer, and it is a decision about boundaries made long before the code.
+2. **Coordinate it.** Two-phase commit gives real atomicity and pays in availability and blocking.
+3. **Give up atomicity, keep the outcome.** A sequence of local transactions with compensating
+   actions. No isolation, more code, and it stays available.
+
+## Concretely
+
+<Example title="One booking, three strategies">
+
+A trip books a flight, a hotel and a car, each owned by a different service.
+
+**Two-phase commit.** All three prepare, promising they can commit and holding their reservations.
+The coordinator commits. Either the whole trip books or none of it does, and no user ever sees a
+half-booked trip. If the coordinator dies after the prepare, all three sit holding reservations
+they can neither release nor confirm, until a human intervenes. If any one service is down, no trip
+can be booked at all.
+
+**A saga.** Book the flight and commit. Book the hotel and commit. Book the car — and it fails. Now
+run compensations: cancel the hotel, cancel the flight. The trip did not happen and nothing is
+stranded. But for about four seconds the user had a flight and a hotel and no car, and if they
+refreshed the page they saw it. And the flight cancellation may cost a fee, because compensation
+is not rollback.
+
+**Avoid it.** If all three were rows in one database, this would be a single transaction with none
+of the above. That is not always possible — three vendors are genuinely three systems — but the
+question &ldquo;why is this data in three places?&rdquo; is the one to ask first, because
+frequently the answer is a service boundary drawn for organisational reasons that nobody has
+revisited.
+
+</Example>
+
+## Formal explanation
+
+<C id="distributed-transaction" /> means one atomic outcome across participants that do not share a
+log.
+
+**<C id="two-phase-commit" />** is the standard protocol. A coordinator asks every participant to
+*prepare*: a participant that votes yes has durably recorded its intent and taken whatever locks
+are needed, and has given up the right to abort. Once every vote is yes, the coordinator records
+the commit and tells everyone.
+
+It is correct, and it costs three things:
+
+- **Latency.** Two round trips plus a durable write at every participant, on the critical path.
+- **Availability that multiplies.** The transaction commits only if every participant is up.
+  Five participants at 99.9% give 99.5% for the transaction, so the design has made itself less
+  available than any of its parts.
+- **Blocking.** This is the one that matters. A participant that voted yes and then lost the
+  coordinator **cannot decide alone**, because committing might contradict the group and so might
+  aborting. It waits, holding its locks. If the coordinator has crashed with its log, that wait ends
+  when a human reads the participant logs and decides. Rows stay locked and unrelated traffic
+  touching them stalls.
+
+**<C id="saga" />** abandons atomicity and keeps the business outcome. Each step is a local
+transaction that commits immediately; each has a **compensating action** that semantically undoes
+it. On failure, run the compensations for the completed steps in reverse.
+
+Three consequences follow, and the third is the one that bites:
+
+- **No isolation.** Intermediate states are visible. Another process can see a half-completed saga
+  and act on it. The usual remedy is a *semantic lock* — an explicit `pending` state that other
+  operations know to refuse — which is isolation you implement yourself, in the domain.
+- **Compensation is not rollback.** It is a new action with its own effects. Cancelling a booking
+  may cost a fee; an email cannot be unsent, only apologised for.
+- **Some steps cannot be compensated.** Money leaving for a third party, a message delivered, a
+  physical item dispatched. So **ordering is a design decision**: put every reversible step first
+  and the irreversible step last, so that a failure never strands you after the point of no return.
+
+**<C id="distributed-lock" />** is the tempting third option, and it solves a different problem.
+A lock gives mutual exclusion, not atomicity — it stops two processes acting at once and does
+nothing to make one process's multi-machine writes all-or-nothing. It also brings the lease
+problem: a holder can be paused past its expiry and act while another holder is active, so a lock
+is only safe when the protected resource checks a fencing token. Before reaching for one, ask
+whether a **conditional write against the single authority** would do the job — it usually would,
+it is atomic by construction, and it needs no additional service.
+
+**<C id="strict-serializability" />** — sometimes called <C id="external-consistency" /> — is
+serializability plus real-time order: if A completes before B begins, every observer sees A first.
+It is the strongest practical guarantee and it is expensive in a specific way worth knowing.
+Spanner achieves it using bounded clock uncertainty and **waiting out the error bar** before
+acknowledging a commit, so that timestamp order and real-time order cannot disagree
+(<Cite id="spanner" />). Commit latency is therefore a function of how well your clocks are
+synchronised, which is a striking illustration that the strongest consistency has a physical price
+rather than merely an algorithmic one.
+
+<Callout kind="info" title="The pattern that removes most of these problems">
+For the specific case of a database write plus a message, there is a standard answer that needs no
+distributed transaction at all. Write the business change **and the outgoing message** into the
+same local database, in one ordinary transaction. A separate process reads unpublished messages
+and publishes them.
+
+The two writes are now one atomic local write. Publication becomes at-least-once, which is a
+problem you already know how to solve with an idempotent consumer. Almost every dual write in an
+ordinary system can be removed this way, and it is why the transactional outbox pattern is worth
+knowing before two-phase commit is.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="Three answers to the same requirement, in increasing order of what they give up."
+  columns={[
+    { title: 'Caller', nodes: [{ id: 'api', label: 'Booking API' }] },
+    { title: 'Coordination', nodes: [{ id: 'coord', label: 'Coordinator', note: '2PC, blocking' }, { id: 'orch', label: 'Saga orchestrator', note: 'steps and compensations', tone: 'accent' }] },
+    { title: 'Participants', nodes: [{ id: 'flight', label: 'Flight' }, { id: 'hotel', label: 'Hotel' }, { id: 'car', label: 'Car' }] },
+    { title: 'Local atomicity', nodes: [{ id: 'outbox', label: 'Outbox table', note: 'same transaction' }] },
+    { title: 'Downstream', nodes: [{ id: 'bus', label: 'Message bus' }] },
+  ]}
+  edges={[
+    { from: 'api', to: 'coord' },
+    { from: 'coord', to: 'flight', label: 'prepare' },
+    { from: 'coord', to: 'hotel' },
+    { from: 'coord', to: 'car' },
+    { from: 'api', to: 'orch' },
+    { from: 'orch', to: 'flight', label: 'commit each' },
+    { from: 'orch', to: 'outbox' },
+    { from: 'outbox', to: 'bus', label: 'publish later' },
+  ]}
+  stages={[
+    {
+      label: 'Two writes and hope',
+      show: ['api', 'flight', 'bus'],
+      because:
+        'Write the row, publish the message. Two systems, no agreement between them, and a crash between the two lines leaves a state nothing will reconcile. Most dual writes in production look exactly like this.',
+    },
+    {
+      label: 'Make the two writes one',
+      show: ['api', 'flight', 'outbox', 'bus'],
+      because:
+        'The message is written into the same database in the same transaction, and published afterwards by a separate reader. Atomicity is now local, and delivery becomes at-least-once, which an idempotent consumer already handles.',
+    },
+    {
+      label: 'Several owners, no shared database',
+      show: ['api', 'coord', 'orch', 'flight', 'hotel', 'car', 'outbox', 'bus'],
+      because:
+        'When participants genuinely cannot share a transaction, choose: two-phase commit for real atomicity with blocking and multiplied unavailability, or a saga for availability with visible intermediate states and compensations you must write.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One database',
+      behaviour: 'Ordinary transactions. Atomic, isolated, and nothing in this lesson applies.',
+      firstToBreak: 'Nothing. Staying here as long as possible is the strategy, not the absence of one.',
+    },
+    {
+      scale: 'One database plus a message bus',
+      behaviour:
+        'The dual-write problem appears immediately, usually unnoticed, and is solved by an outbox in the same transaction.',
+      firstToBreak: 'Consistency between the database and downstream consumers, in the small window around a crash.',
+    },
+    {
+      scale: 'A few services with their own stores',
+      behaviour:
+        'Sagas with explicit compensations. Intermediate states become part of the domain model and appear in the user interface.',
+      firstToBreak:
+        'Compensation logic, which is written once and tested rarely, and runs for the first time during an incident.',
+    },
+    {
+      scale: 'Many participants per operation',
+      behaviour:
+        'Coordination cost dominates. Two-phase commit becomes unusable as availability multiplies; sagas grow long chains of compensations.',
+      firstToBreak:
+        'The premise. At this point the boundaries are wrong, and the fix is to move data so that a transaction fits in one place again.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Coordinator dies after prepare',
+      symptom: 'Rows stay locked indefinitely. Unrelated queries touching them hang. Nothing times out.',
+      cause: 'Participants that voted yes may not decide alone, so they wait for a coordinator that is not coming back.',
+      mitigation: 'Make the coordinator durable and recoverable, or do not use two-phase commit. Any manual resolution procedure must exist and be rehearsed before it is needed at 3am.',
+    },
+    {
+      what: 'Dual write divergence',
+      symptom: 'An order exists with no downstream effect, or an event references a row that is not there.',
+      cause: 'A database write and a message publish are two operations with no atomicity between them.',
+      mitigation: 'Write the message into the same transaction as the business change and publish it asynchronously. Never treat two writes to two systems as one action.',
+    },
+    {
+      what: 'Compensation fails',
+      symptom: 'A saga is stuck half-undone, and the state is neither the before nor the after.',
+      cause: 'The compensating action failed, or was never written for that step.',
+      mitigation: 'Compensations must be idempotent and retried indefinitely. A saga that cannot complete forward or backward needs an alert and a documented manual path.',
+    },
+    {
+      what: 'Irreversible step done too early',
+      symptom: 'Money has left, the later step failed, and there is nothing to compensate with.',
+      cause: 'Step ordering ignored reversibility.',
+      mitigation: 'Reversible steps first, irreversible last. If two steps are both irreversible, the design needs a reservation model so that neither commits until both can.',
+    },
+    {
+      what: 'Distributed lock without fencing',
+      symptom: 'Two processes act on the same resource while both believe they hold the lock.',
+      cause: 'One was paused past its lease expiry and resumed after another acquired it.',
+      mitigation: 'A monotonically increasing token checked by the protected resource. Without that check, a lock service provides advice rather than exclusion.',
+    },
+    {
+      what: 'Intermediate state acted upon',
+      symptom: "A user sees a partially completed operation and takes an action that the saga's compensation then invalidates.",
+      cause: 'Sagas provide no isolation, and no semantic lock prevented reads of the in-progress state.',
+      mitigation: 'Model an explicit pending state that other operations refuse to act on, and show it in the interface rather than hiding it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use a saga with compensations instead of a distributed transaction"
+  options={[
+    'Redesign so the transaction fits in one database',
+    'Two-phase commit across participants',
+    'A saga of local transactions with compensating actions',
+    'Accept eventual consistency with periodic reconciliation and no compensation',
+  ]}
+  why="Two-phase commit makes availability the product of every participant's availability and can block indefinitely on coordinator failure. A saga keeps each step independently committed, so no participant is ever waiting on a decision that may never arrive."
+  gain="Every step commits locally and releases its locks immediately. No coordinator to fail. The system stays available when a participant is briefly down, because retry is a normal part of the flow."
+  sacrifice="Atomicity and isolation. Intermediate states are visible and other operations may act on them. Compensation logic must be written, tested and maintained for every step, and it is not the same as rolling back."
+  failureModes={[
+    'Compensation itself failing, leaving a half-undone saga',
+    'An irreversible step ordered before a step that can fail',
+    'Another process acting on a visible intermediate state',
+    'Compensations that are never exercised outside incidents, and therefore do not work',
+  ]}
+  operationalBurden="Significant. Sagas need state tracking, a stuck-saga alert, idempotent and infinitely retryable compensations, and a manual resolution path. The code is roughly double, because every forward step has a backward one."
+  cost="Engineering time rather than infrastructure. The recurring cost is that compensation paths are rarely executed, so they rot quietly and are first exercised when something is already wrong."
+  whenNot="When the operation genuinely requires isolation — nobody may observe the intermediate state — a saga cannot provide it and a semantic lock is a partial substitute at best. When all participants share one database, a plain transaction is correct and infinitely simpler. And when the number of steps is large, the compensation matrix becomes the dominant complexity in the system, which is a signal that the service boundaries are wrong rather than that the saga needs more machinery."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="ddia">
+Two-phase commit is blocking: a participant that has voted to commit cannot unilaterally decide the
+outcome and must wait for the coordinator, holding its locks. If the coordinator fails, that wait
+continues until it recovers or a human intervenes.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Writing to two systems without a shared transaction produces states where one write succeeded and
+the other did not, and no amount of ordering or retrying removes the window; it only changes which
+inconsistency is more likely.
+</Claim>
+
+<Claim label="fact" source="spanner">
+Spanner provides externally consistent transactions by assigning commit timestamps and waiting out
+the bound on clock uncertainty before making a commit visible, so that timestamp order matches real
+time order. Commit latency therefore depends directly on the clock uncertainty bound.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL supports prepared transactions for two-phase commit, and documents that a prepared
+transaction holds its locks until it is committed or rolled back, so a forgotten prepared
+transaction blocks other work and consumes resources indefinitely.
+</Claim>
+
+<Claim label="convention" source="cockroach-docs">
+Distributed SQL systems keep transactions that span ranges possible but note that cross-range
+transactions cost additional coordination, so schema and key design that keeps related data
+together materially improves performance.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+The saga pattern is described as a sequence of local transactions with compensating actions, and
+is presented as trading atomicity and isolation for availability rather than as a drop-in
+replacement for a transaction.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you notice a distributed transaction you did not intend to write. The dual write is present in most candidate designs and mentioned by few, and spotting it is a strong signal."
+  depth="Know why two-phase commit blocks and what that does to unrelated traffic. Know that compensation is not rollback. Be able to order saga steps by reversibility and say why."
+  followUps={[
+    'You write to the database and publish an event. What if the process dies between them?',
+    'The coordinator crashes after all participants voted yes. What is the state of the system?',
+    'Your saga fails at step four. What does the user see while it is unwinding?',
+    'Which of your steps cannot be compensated, and where is it in the order?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Writing to the database and then publishing an event.',
+      why: 'These are two operations across two systems. A crash in between leaves an order nobody hears about or an event about an order that does not exist, and no retry strategy closes the window.',
+      instead:
+        'Write the event into the same database in the same transaction and publish it from there. Atomicity becomes local, and delivery becomes an at-least-once problem you already know how to solve.',
+    },
+    {
+      mistake: 'Reaching for a distributed lock to make an operation safe.',
+      why: 'A lock provides mutual exclusion, not atomicity, so multi-machine writes are still not all-or-nothing. And without a fencing token checked by the resource, a paused holder can act after its lease expired.',
+      instead:
+        'Ask whether a conditional write against the one authority would do it. It usually would, it is atomic by construction, and it removes a service from the design.',
+    },
+    {
+      mistake: 'Treating compensation as rollback.',
+      why: 'Rollback erases; compensation adds a new action with its own effects and its own failure modes. Some steps have no compensation at all, and discovering that during design is much cheaper than discovering it during an incident.',
+      instead:
+        'For each step, write down its compensation and whether it can fail. Order the steps so that everything irreversible happens last.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['two-phase-commit']}
+  prompt="In a two-phase commit, all participants vote to commit and the coordinator crashes before sending the decision. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'Participants hold their locks and wait, because a participant that voted yes cannot decide alone',
+      implies: 'You understand why the protocol blocks.',
+      why: 'A yes vote surrendered the right to abort, so committing might contradict a group decision to abort and aborting might contradict a commit. With no coordinator there is no information that resolves it, and the locks stay held — which is why unrelated queries touching those rows also stop. The wait ends when the coordinator recovers its log, or when a person decides manually.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'They time out and abort, so the transaction is safely rolled back',
+      implies: 'You are expecting a timeout to resolve the ambiguity.',
+      why: 'A timeout would be unsafe: the coordinator may have already recorded a commit and told one participant before dying, so aborting would break atomicity in exactly the way the protocol exists to prevent. This is why the blocking is inherent rather than a missing feature.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'They elect a new coordinator and continue',
+      implies: 'You are reaching for consensus to remove the blocking.',
+      why: 'That is a real technique and is roughly what a consensus-backed commit protocol does — replicate the coordinator state so the decision survives its failure. It removes the blocking and costs additional round trips and a consensus group to operate, which is a genuine trade rather than a free improvement.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the collateral damage as the real problem: the locks held by a stuck prepared transaction block unrelated traffic touching the same rows, so one hung transaction degrades the whole database rather than only its own operation. That is why prepared transactions need monitoring with an age alarm, and why most systems avoid the protocol rather than operate it well."
+/>
+
+<Check
+  concepts={['saga']}
+  prompt="A saga books a flight, charges a card, then reserves a hotel. The hotel step fails. What is the design problem?"
+  options={[
+    {
+      id: 'a',
+      text: 'The irreversible step is in the middle. Charging should be last, after everything that can fail.',
+      implies: 'You are ordering steps by reversibility.',
+      why: 'Refunding a card is a new transaction with its own delay, its own failure modes and possible fees, and in some payment flows it is not fully available. Reserving the hotel first means the failure happens before any money moves, and the compensation is a cancellation rather than a refund. Ordering by reversibility is the single most useful rule in saga design.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The saga needs a distributed transaction so that all three commit atomically',
+      implies: 'You are reaching for atomicity across a third-party payment processor.',
+      why: 'A payment provider will not enlist in your transaction; it has no knowledge of your coordinator and no reason to hold a prepared state on your behalf. Two-phase commit is not available across an organisational boundary, which is precisely why sagas exist.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'The compensation for the charge must be a refund, and it must be retried until it succeeds',
+      implies: 'You are making the compensation robust.',
+      why: 'Necessary and true — compensations must be idempotent and retried indefinitely, and a stuck one needs an alert. But it treats the symptom. Reordering the steps means the refund is never needed, and the best compensation is the one you do not have to run.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer generalises to the reservation pattern: when two steps are both irreversible, order alone cannot save you, and each participant must offer a two-stage operation — hold, then confirm — so the irreversible part happens only once every hold has succeeded. That is two-phase commit re-expressed in domain terms, built from ordinary API calls, and it is what payment authorisation and capture already are."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Two-phase commit, its blocking behaviour, and the dual-write problem', sourceId: 'ddia' },
+    { label: 'External consistency and the cost of waiting out clock uncertainty', sourceId: 'spanner' },
+    { label: 'Prepared transactions and why a forgotten one is dangerous', sourceId: 'postgres-docs' },
+    { label: 'Sagas as an availability trade rather than a transaction substitute', sourceId: 'martin-fowler' },
+    { label: 'Next: when a relational database is the wrong tool', href: '/lessons/other-shapes-of-store' },
+  ]}
+/>

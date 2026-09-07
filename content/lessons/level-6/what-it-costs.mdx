@@ -1,0 +1,415 @@
+---
+id: what-it-costs
+title: What It Costs
+level: 6
+module: l6-economics
+order: 1
+summary: Architecture is a spending decision. A technically better design can be a worse engineering decision, and unit economics is how you say so credibly.
+difficulty: advanced
+minutes: 24
+prerequisites: [seeing-inside, capacity-planning]
+concepts: [cost, cost-optimisation, capacity-planning, capacity-headroom, operational-burden, elasticity, autoscaling, retention, downsampling, maintainability]
+unlocks: [control-plane-vs-data-plane, strangler-migration]
+sources: [aws-well-architected, sre-book, gcp-arch, datadog-eng]
+status: reviewed
+---
+
+## The problem
+
+Two designs for the same system.
+
+**Design A:** a modular monolith on four large servers, one managed database with a replica, one
+cache, one queue. Roughly $4,000 a month. Two engineers can run it. New features take days.
+
+**Design B:** eleven services, a sharded database, a streaming platform, a service mesh, a
+tracing backend. Roughly $31,000 a month. Four engineers spend most of their time on the
+platform. New features take weeks and cross three services.
+
+Design B is more scalable. It has better isolation, independent deployment, and it will handle
+100x the traffic.
+
+The product has 40,000 users and grows 20% a year.
+
+Design B is technically better and it is the wrong decision, and being able to say that
+precisely — with numbers rather than taste — is one of the more valuable things an engineer can
+do.
+
+## Intuition
+
+Architecture consumes four budgets, and only one of them appears on the cloud bill:
+
+**Infrastructure.** Servers, storage, transfer, managed services. Visible, measurable, and
+usually the smallest of the four.
+
+**Engineering time to build.** Weeks of work. Visible in planning and rarely attributed to the
+architecture that caused it.
+
+**Operational burden.** On-call load, upgrades, capacity work, incident response. Recurring,
+compounding, and almost never estimated.
+
+**Developer velocity.** How long a feature takes forever after. The largest and least measured
+of the four, and the one that determines whether the product survives.
+
+The failure mode is optimising the visible budget while spending the invisible ones. A design
+that halves the infrastructure cost and doubles feature lead time is almost always a bad trade
+for a growing product — and it will look like a win in the only report anyone reads.
+
+**The principle:** the simplest system that satisfies the actual requirements. Not the
+requirements you might have. The ones you have, plus a plausible growth curve.
+
+## Concretely
+
+<Example title="Where the money actually goes">
+
+Cloud bills are usually concentrated in a small number of places, and they are rarely the ones
+teams expect. Worth checking, in roughly this order:
+
+**Idle capacity.** Provisioned for peak, running at peak all the time. Often the single largest
+line, and the one with the clearest fix.
+
+**Data transfer.** Especially cross-zone, cross-region and egress to the internet. Frequently a
+surprise, because it is invisible in architecture diagrams — every arrow crossing a boundary has
+a price.
+
+**Storage nobody chose to keep.** Logs, metrics, backups and old data with no retention policy.
+Grows monotonically until someone looks.
+
+**Observability cardinality.** One high-cardinality metric label can multiply the bill, as
+covered in the observability lesson.
+
+**Over-provisioned managed services.** Sized during a load test two years ago and never revisited.
+
+<Claim label="recommendation">
+Compute your cost per unit of business value — per active user, per order, per gigabyte
+served — and track it over time. Absolute cost always grows with the business, so it is
+uninformative. Unit cost tells you whether the architecture is improving or decaying.
+</Claim>
+
+</Example>
+
+## Formal explanation
+
+<C id="cost-optimisation" /> starts from unit economics: cost per request, per stored gigabyte
+per month, per gigabyte egressed, per active user. Without those numbers, every cost
+conversation is anecdote.
+
+Three structural levers, in descending order of typical impact:
+
+**Right-sizing and elasticity.** Most systems are provisioned for peak and run at a fraction of
+it. <C id="autoscaling" /> recovers some of that, with the caveat from Level 1: it handles
+trends, not spikes, so it must be paired with <C id="capacity-headroom">headroom</C> rather than
+replacing it.
+
+**Storage tiering and retention.** Data has a value curve that decays sharply with age. Recent
+data must be fast; year-old data usually needs only to be retrievable. Tiering and
+<C id="downsampling" /> are frequently the largest single saving available, and they are
+uncontroversial once someone asks who needs the old data at full resolution.
+
+**Reducing data movement.** Transfer between zones and regions is billed, and it accumulates
+silently. Colocating chatty components and avoiding unnecessary cross-region replication can
+materially change a bill without changing what the system does.
+
+<Callout kind="warn" title="The largest cost is usually not on the bill">
+An engineer costs more per month than a substantial amount of infrastructure. An architecture
+that requires two extra engineers to operate has a monthly cost most cost reviews never
+attribute to it — and that cost compounds, because those engineers are not building the product.
+</Callout>
+
+<Deeper title="Reversibility is worth paying for">
+
+Some decisions are cheap to reverse and some are not, and the distinction should change how much
+analysis each deserves.
+
+**Cheap to reverse:** instance sizes, cache configuration, whether a job runs hourly or daily.
+Decide quickly, measure, adjust.
+
+**Expensive to reverse:** the partition key, the service boundaries, the data model, the choice
+to use a managed service that shapes your data. These deserve real analysis, because the cost of
+being wrong is a migration project.
+
+<Claim label="recommendation">
+Spend analysis proportional to reversibility, not to visibility. Teams routinely spend a week
+choosing an instance type — trivially reversible — and an afternoon on a partition key, which is
+a multi-quarter migration to change.
+</Claim>
+
+The same logic applies to buying versus building. A managed service costs more per unit and
+saves engineering time and operational burden. Early, that trade is almost always worth it,
+because engineering time is the scarce resource and the volume is low. At scale the arithmetic
+can invert — but by then you have a working product and much better information about what you
+actually need, which is a far better position from which to build.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The four budgets, and which one shows up on the bill."
+  columns={[
+    { title: 'Decision', nodes: [{ id: 'arch', label: 'Architecture choice', tone: 'accent' }] },
+    { title: 'Visible', nodes: [{ id: 'infra', label: 'Infrastructure', note: 'on the bill' }] },
+    { title: 'Invisible', nodes: [{ id: 'build', label: 'Build time' }, { id: 'ops', label: 'Operational burden', note: 'recurring' }, { id: 'vel', label: 'Feature velocity', note: 'compounding' }] },
+  ]}
+  edges={[
+    { from: 'arch', to: 'infra' },
+    { from: 'arch', to: 'build' },
+    { from: 'arch', to: 'ops' },
+    { from: 'arch', to: 'vel' },
+  ]}
+  stages={[
+    {
+      label: 'What gets reviewed',
+      show: ['arch', 'infra'],
+      because:
+        'Cloud spend is measurable and someone owns it, so it is the budget that gets optimised — usually the smallest of the four.',
+    },
+    {
+      label: 'What actually gets spent',
+      show: ['arch', 'infra', 'build', 'ops', 'vel'],
+      because:
+        'Operational burden recurs and velocity compounds. A design that saves infrastructure while doubling feature lead time is losing on the budget nobody measures.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Early stage',
+      behaviour:
+        'Infrastructure cost is negligible next to salaries. Engineering time is the only scarce resource.',
+      firstToBreak:
+        'The product, if engineering time goes into platform work instead of learning what users want.',
+    },
+    {
+      scale: 'Growing',
+      behaviour:
+        'Infrastructure becomes a visible line item. Unit costs start mattering more than totals.',
+      firstToBreak: 'Margin, if unit cost is flat while revenue per user is not.',
+    },
+    {
+      scale: 'Large',
+      behaviour:
+        'Infrastructure is a major expense. Dedicated efficiency work has a clear return.',
+      firstToBreak:
+        'The cost of change: by now the architecture is expensive to alter, so inefficiency is locked in.',
+    },
+    {
+      scale: 'Very large',
+      behaviour:
+        'Building rather than buying can be justified at the margin. Custom hardware and bespoke systems become rational.',
+      firstToBreak:
+        'Nothing, but only a small number of organisations are genuinely at this point, and many more believe they are.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Optimising infrastructure while spending engineering time',
+      symptom:
+        'The cloud bill falls 20% and feature delivery slows noticeably. Nobody connects the two.',
+      cause:
+        'Only the measured budget was optimised, because it was the only one anyone reports on.',
+      mitigation:
+        'Include engineering and operational cost in the comparison explicitly, even as a rough estimate. A rough estimate beats an implicit zero.',
+    },
+    {
+      what: 'Retention nobody chose',
+      symptom:
+        'Storage costs grow steadily and nobody can say who needs the old data.',
+      cause:
+        'Default retention settings, and no owner for the decision.',
+      mitigation:
+        'Set retention per data class deliberately, with a named owner. Tier old data to cheaper storage rather than deleting it if anyone objects.',
+    },
+    {
+      what: 'Cross-region traffic nobody accounted for',
+      symptom:
+        'Data transfer is a top-three line item, and no design document mentions it.',
+      cause:
+        'Chatty components placed in different zones or regions. Every arrow crossing a boundary is billed, and diagrams do not show prices.',
+      mitigation:
+        'Colocate chatty components. Measure transfer per component. Treat cross-boundary calls as having a price, because they do.',
+    },
+    {
+      what: 'Autoscaling that never scales down',
+      symptom:
+        'Capacity ratchets up after each traffic spike and never returns.',
+      cause:
+        'Aggressive scale-up and conservative scale-down policies, sometimes deliberately, then forgotten.',
+      mitigation:
+        'Verify scale-down actually happens. Alert on sustained capacity well above the load that justifies it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use managed services rather than self-hosting infrastructure components"
+  options={[
+    'Self-host everything: lowest unit cost, highest operational burden',
+    'Managed services for stateful components, self-host stateless',
+    'Fully managed and serverless: highest unit cost, lowest operational burden',
+  ]}
+  why="Engineering time is usually the scarcer resource, and stateful systems — databases, brokers, search — carry the highest operational burden per unit of value. Buying those back is where the trade is most favourable."
+  gain="No upgrades, no backup machinery to build, no on-call rotation for that component. Engineers work on the product. Failure modes are the vendor's problem and are usually better tested than yours would be."
+  sacrifice="Higher unit cost, sometimes several times. Less control over tuning and version timing. A dependency on a vendor whose outage is your outage and whose pricing you do not set."
+  failureModes={[
+    'Vendor outage that you cannot mitigate or even diagnose',
+    'A pricing change that alters your unit economics with limited notice',
+    'A missing tuning knob that you need and cannot reach',
+    'Migration cost that grows with your data, so the option to leave narrows over time',
+  ]}
+  operationalBurden="Substantially lower, which is the entire point. Replaced by vendor management, cost monitoring and understanding a system you cannot see inside."
+  cost="Typically a multiple of self-hosted infrastructure per unit, and frequently cheaper once engineering and on-call time are included at realistic rates."
+  whenNot="At very large scale the arithmetic can invert: when a component's managed cost exceeds the fully-loaded cost of a team to run it, self-hosting is rational. It is also wrong when you need control the service does not expose, or when regulation prevents the data leaving your infrastructure. Both are real, and both are claimed far more often than they apply."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-well-architected">
+Cost optimisation is treated as a first-class architecture concern alongside reliability,
+security and performance, with an emphasis on measuring cost against business outcomes rather
+than in absolute terms.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Capacity planning based on measured per-unit cost, with deliberate headroom for variability, is
+standard practice. Provisioning from intuition tends to produce systems that are simultaneously
+over-provisioned and fragile.
+</Claim>
+
+<Claim label="convention" source="datadog-eng">
+Observability cost is driven primarily by cardinality and retention rather than by request
+volume, which is why a single high-cardinality label can change the bill dramatically without
+any change in traffic.
+</Claim>
+
+<Claim label="recommendation" source="gcp-arch">
+Tier storage by access pattern. Data that must be fast and data that must merely be retrievable
+have very different cost profiles, and separating them is usually the largest single saving
+available.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you treat architecture as a resource-allocation decision. Senior candidates volunteer cost and operational burden unprompted; this is one of the clearest markers of staff-level thinking."
+  depth="Be able to identify the dominant cost drivers in your design and say roughly what it costs to run and to operate. Precision is not expected; awareness is."
+  followUps={[
+    'What does this cost to run, roughly?',
+    'How many people does it take to operate?',
+    'What is the cheapest design that meets the requirement, and what does it sacrifice?',
+    'Which of these decisions would be expensive to reverse?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Cost is not an engineering concern.',
+      why: 'Architecture determines cost more than any procurement decision does. Choosing to replicate across three regions, to retain logs for a year, or to run eleven services are all spending decisions made by engineers.',
+      instead:
+        'State the rough cost of your design and its main drivers. It takes one sentence and materially changes how the design is received.',
+    },
+    {
+      mistake: 'We will optimise cost later.',
+      why: 'Some costs are structural: a partition key that forces cross-region traffic, a data model that prevents tiering, a design that needs a large platform team. Those are not tuned away afterwards.',
+      instead:
+        'Distinguish tunable costs — instance sizes, retention — which genuinely can wait, from structural ones, which cannot.',
+    },
+    {
+      mistake: 'This design is better because it scales further.',
+      why: 'Scaling further is only valuable if you get there, and the cost is paid now. A design that handles 100x traffic at the price of halved delivery speed may prevent you ever reaching 2x.',
+      instead:
+        'Name the scale at which the simpler design breaks and what it would take to migrate. If that point is years away and the migration is tractable, simpler wins.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['cost', 'operational-burden', 'maintainability']}
+  prompt="A team proposes splitting a working monolith into eleven services. Traffic is 400 requests per second and growing 20% a year. The team has six engineers. What is the strongest objection?"
+  options={[
+    {
+      id: 'a',
+      text: 'The infrastructure will cost more',
+      implies: 'You are arguing from the visible budget.',
+      why: 'True and the weakest of the objections. Infrastructure differences at this scale are small compared with salaries, and the proposal will survive this argument easily.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Six engineers now own eleven deployables, distributed transactions and a tracing requirement, for a workload one process handles comfortably',
+      implies: 'You are costing the operational and velocity budgets rather than only the bill.',
+      why: '400 requests per second is well within a single process. The split buys deployment independence — which matters when teams block each other, and six engineers do not — and charges network calls, partial failure, lost transactions, and a platform to operate. The scarce resource here is engineering attention.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Microservices are an anti-pattern',
+      implies: 'You are rejecting the pattern rather than the fit.',
+      why: 'They solve a real problem — teams blocking each other on releases — and are correct at the scale where that problem exists. Rejecting them categorically is as unreasoned as adopting them categorically.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer offers the alternative rather than only the objection: enforce module boundaries inside the monolith so the seams exist and are testable, and extract a service only when a specific component has genuinely different scaling, isolation or team-ownership needs. That preserves the option to split later at a much lower cost than splitting now."
+/>
+
+<Check
+  concepts={['cost-optimisation', 'retention']}
+  prompt="Your cloud bill has grown 60% in a year while traffic grew 25%. Where do you look first?"
+  options={[
+    {
+      id: 'a',
+      text: 'Negotiate a better rate with the provider',
+      implies: 'You are treating this as a procurement problem.',
+      why: 'Worth doing eventually, and it does not explain why unit cost rose. A discount lowers everything proportionally and leaves the underlying divergence intact, so the same problem returns next year.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Cost per unit of traffic rose, so look for costs that grow with time rather than with load: retention, cardinality, and capacity that scaled up and never down',
+      implies: 'You noticed that the two growth rates diverged and asked what grows independently of traffic.',
+      why: 'Traffic-proportional costs would have grown 25%. The extra 35% comes from something else, and the usual suspects are accumulating storage with no retention policy, growing metric cardinality, and autoscaling that ratchets up without scaling back down.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Move to cheaper instance types',
+      implies: 'You are optimising unit price.',
+      why: 'A legitimate lever and premature. Without knowing which line items grew, you may optimise a component that is not the problem while the real driver continues to compound.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes the durable fix: track cost per active user or per request as a monitored metric, broken down by service and by cost category, so divergence between cost growth and traffic growth is visible in the month it starts rather than in an annual review."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Cost optimisation as an architecture pillar', sourceId: 'aws-well-architected' },
+    { label: 'Capacity planning and measured per-unit cost', sourceId: 'sre-book' },
+    { label: 'Storage tiering by access pattern', sourceId: 'gcp-arch' },
+    {
+      label: 'Next: composing all of this into a real design',
+      href: '/levels/7',
+    },
+  ]}
+/>

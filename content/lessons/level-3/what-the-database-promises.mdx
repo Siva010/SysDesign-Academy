@@ -1,0 +1,403 @@
+---
+id: what-the-database-promises
+title: What the Database Actually Promises
+level: 3
+module: l3-transactions
+order: 1
+summary: Isolation levels are a menu of anomalies you agree to tolerate. Most defaults permit lost updates, and almost nobody chose that deliberately.
+difficulty: advanced
+minutes: 30
+prerequisites: [two-requests-at-once, mvcc]
+concepts: [isolation-levels, snapshot-isolation, mvcc, write-skew, serializability, two-phase-locking, deadlock]
+unlocks: [distributed-transaction, saga, linearizability]
+sources: [postgres-docs, mysql-docs, ddia, database-internals]
+status: reviewed
+---
+
+## The problem
+
+A hospital rota requires that at least one doctor is on call at all times. Two doctors, both on
+call, both feeling unwell, both open the app at the same moment.
+
+Each transaction reads the rota, counts two doctors on call, concludes that removing one still
+leaves cover, and removes itself. Both commit.
+
+Nobody is on call.
+
+Each transaction was correct in isolation. Both ran under a transaction. Neither overwrote the
+other's data — they wrote to *different rows*. And on most databases, at their default
+isolation level, this succeeds.
+
+This is <C id="write-skew" />, and it is the anomaly that survives the fixes people usually
+reach for.
+
+## Intuition
+
+Two transactions each read some state, each decide something based on it, each write. The
+classic <C id="lost-update">lost update</C> happens when they write the *same* thing — and
+version checks or conditional updates catch that, because there is a collision to detect.
+
+Write skew is subtler: they write *different* things, so nothing collides. The invariant that
+was violated — &ldquo;at least one doctor on call&rdquo; — is not a property of any single row.
+It is a property of a set of rows, and no per-row mechanism can see it.
+
+Which brings us to the honest description of isolation levels:
+
+**An isolation level is a list of the ways concurrent transactions are allowed to surprise
+you.** Stronger levels permit fewer surprises and cost more concurrency. You are not choosing
+between correct and incorrect; you are choosing which anomalies you accept and, implicitly,
+which invariants you promise to protect some other way.
+
+## Concretely
+
+<Example title="The anomalies, in the order you meet them">
+
+**Dirty read** — seeing another transaction's uncommitted write. Essentially every modern
+engine prevents this by default, so it is mostly of historical interest.
+
+**Non-repeatable read** — reading a row twice in one transaction and getting different values,
+because someone committed in between. Permitted at Read Committed.
+
+**Lost update** — two read-modify-write cycles overlap and one disappears. Permitted at Read
+Committed. This is the ticket-overselling bug.
+
+**Write skew** — two transactions read an overlapping set, each write something legal alone,
+and together violate an invariant across rows. Permitted even at Snapshot Isolation, which is
+what makes it the interesting one.
+
+**Phantom** — a transaction re-runs a query and finds rows that were not there before, which is
+what makes write skew possible: the condition you checked no longer describes the same set.
+
+The pattern worth internalising: **each stronger level removes one class of surprise, and
+Snapshot Isolation — the level most people think of as &ldquo;strong&rdquo; — still permits
+write skew.**
+
+</Example>
+
+## Formal explanation
+
+<C id="mvcc" /> underlies most modern implementations. Instead of blocking readers, the engine
+keeps multiple versions of each row, and each transaction reads the version that was current
+when its snapshot was taken. Readers never block writers; writers never block readers.
+
+The cost is that old versions must be retained until no transaction can still need them, and
+then cleaned up. A long-running transaction pins the retention horizon, which is why a report
+left open in a session can make a whole database grow.
+
+<C id="snapshot-isolation" /> falls naturally out of MVCC: the transaction sees a consistent
+point-in-time view of the entire database. It eliminates dirty reads, non-repeatable reads and
+phantoms *as observed by that transaction*. It does not prevent write skew, because both
+transactions legitimately saw a state in which their own write was fine.
+
+<C id="serializability" /> is the guarantee that the outcome is equivalent to running the
+transactions one at a time in *some* order. It is the only level that prevents write skew in
+general. Two ways to get it:
+
+- **<C id="two-phase-locking">Two-phase locking</C>** — acquire locks as you go, release only
+  at commit. Correct, and readers and writers block each other.
+- **Serializable snapshot isolation** — run optimistically under snapshot isolation, track
+  read and write sets, and abort transactions whose commit would break serializability.
+  Excellent under low contention; abort rates rise as contention does.
+
+<Disagreement
+  about="what a default transaction protects you from"
+  positions={[
+    { source: 'postgres-docs', says: 'defaults to Read Committed; each statement sees a fresh snapshot, so lost updates and write skew are both possible' },
+    { source: 'mysql-docs', says: 'InnoDB defaults to Repeatable Read, a different level with different permitted anomalies' },
+  ]}
+  takeaway="There is no portable answer to 'is my transaction safe'. Name the invariant you are protecting, then either raise the isolation level explicitly, take an explicit lock, or restructure so the invariant lives in a single row where a constraint can enforce it."
+/>
+
+<Deeper title="Materialising the conflict">
+
+When an invariant spans rows, one practical technique is to give it a row of its own — so that
+the conflict the database cannot see becomes one it can.
+
+For the on-call rota: instead of counting doctors across rows, keep a single row per shift
+holding the count of doctors on call. Now both transactions update the same row, and every
+mechanism you already have — a conditional update, a version check, row locking — works.
+
+    UPDATE shifts SET on_call_count = on_call_count - 1
+    WHERE shift_id = ? AND on_call_count > 1
+
+This is sometimes called materialising the conflict. The trade is that you have introduced a
+row that every transaction for that shift must touch, which serialises them and creates a
+potential hot row.
+
+It is worth noting what has happened conceptually: an invariant that spanned a set has been
+relocated into a single object, where single-object mechanisms apply. That relocation is the
+same move used later for distributed systems — the reason a single-partition transaction is
+cheap and a cross-partition one is not.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Where an invariant lives determines what can enforce it."
+  columns={[
+    { title: 'Transactions', nodes: [{ id: 't1', label: 'Transaction A' }, { id: 't2', label: 'Transaction B' }] },
+    { title: 'Isolation', nodes: [{ id: 'snap', label: 'Snapshot', note: 'no conflict seen' }, { id: 'ser', label: 'Serializable', note: 'conflict detected', tone: 'accent' }] },
+    { title: 'Data', nodes: [{ id: 'rows', label: 'Many rows', note: 'invariant spans them' }, { id: 'guard', label: 'Guard row', note: 'invariant lives here' }] },
+  ]}
+  edges={[
+    { from: 't1', to: 'snap' },
+    { from: 't2', to: 'snap' },
+    { from: 'snap', to: 'rows', label: 'both commit' },
+    { from: 't1', to: 'ser' },
+    { from: 'ser', to: 'guard', label: 'one aborts' },
+  ]}
+  stages={[
+    {
+      label: 'Write skew',
+      show: ['t1', 't2', 'snap', 'rows'],
+      because:
+        'Both transactions read a consistent snapshot, write different rows, and commit. Nothing collided, so nothing was detected, and the invariant across rows is now violated.',
+    },
+    {
+      label: 'Two ways to prevent it',
+      show: ['t1', 't2', 'snap', 'ser', 'rows', 'guard'],
+      because:
+        'Either raise isolation so the engine detects the read-write conflict and aborts one, or move the invariant into a single row so ordinary row-level mechanisms can see the collision.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Low concurrency',
+      behaviour:
+        'Anomalies are possible but rarely observed. The code appears correct and passes every test.',
+      firstToBreak: 'Nothing visible. The bug is present and dormant.',
+    },
+    {
+      scale: 'Moderate concurrency, spread across rows',
+      behaviour:
+        'Occasional anomalies. Usually reported as impossible data rather than as errors.',
+      firstToBreak:
+        'Data integrity, quietly. Nobody correlates it with concurrency because nothing failed.',
+    },
+    {
+      scale: 'High contention on a small set of rows',
+      behaviour:
+        'Serializable isolation produces frequent aborts. Two-phase locking produces queueing and deadlocks.',
+      firstToBreak:
+        'Throughput on the contended rows, which caps the feature regardless of server count.',
+    },
+    {
+      scale: 'Across partitions or services',
+      behaviour:
+        'No single component sees both transactions, so no local mechanism can adjudicate.',
+      firstToBreak:
+        'The assumption that a transaction can cover the operation. This is where sagas and idempotency replace atomicity.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Write skew violating a cross-row invariant',
+      symptom:
+        'Data that should be impossible: no doctor on call, two bookings for one slot, a balance below zero when every individual withdrawal was checked.',
+      cause:
+        'The invariant spans rows, both transactions saw a valid state, and they wrote different rows so nothing collided.',
+      mitigation:
+        'Serializable isolation, an explicit lock on a row representing the invariant, or restructuring so the invariant lives in one row a constraint can enforce.',
+    },
+    {
+      what: 'Long-running transaction blocking cleanup',
+      symptom:
+        'Table and index sizes grow steadily with no growth in row count. Query performance degrades across the whole database.',
+      cause:
+        'Under MVCC, old row versions cannot be removed while any transaction might still see them. One long-open transaction pins the horizon for everything.',
+      mitigation:
+        'Set a statement and idle-in-transaction timeout. Never hold a transaction across an external call or user think-time. Alert on the oldest open transaction.',
+    },
+    {
+      what: 'Deadlock under two-phase locking',
+      symptom:
+        'Intermittent transaction failures under load, often correlated with a specific pair of operations.',
+      cause: 'Two transactions acquire the same locks in opposite orders.',
+      mitigation:
+        'Acquire locks in a consistent global order. Keep transactions short. Retry the victim, because the database resolves deadlocks by killing one.',
+    },
+    {
+      what: 'High abort rate under serializable isolation',
+      symptom:
+        'Serialization failures rise sharply with load, and throughput falls as retries multiply.',
+      cause:
+        'Optimistic serializability aborts transactions whose commit would violate serializability, and contention makes that common.',
+      mitigation:
+        'Reduce the transaction footprint, shorten transactions, or restructure the hot data. Retry with backoff, and treat a persistently high abort rate as a data model problem rather than a tuning one.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use serializable isolation for transactions that protect a cross-row invariant"
+  options={[
+    'Default isolation plus careful application-level checks',
+    'Explicit row locking on a representative row',
+    'Serializable isolation for the transactions that need it',
+    'Restructure so the invariant lives in one row with a database constraint',
+  ]}
+  why="Write skew cannot be prevented by any per-row mechanism, because no single row is in conflict. Either the engine tracks read-write dependencies across rows, or you relocate the invariant to somewhere a row-level mechanism can see it."
+  gain="Correctness by construction for invariants that span rows, without the application having to reason about every possible interleaving. New code inherits the guarantee automatically."
+  sacrifice="Throughput under contention, and transactions that abort and must be retried. Application code must handle serialization failures everywhere, which is easy to forget in a code path added later."
+  failureModes={[
+    'Abort rates rising steeply with contention, converting a correctness fix into a throughput problem',
+    'Retry loops without backoff amplifying load at the worst moment',
+    'Developers catching and swallowing serialization failures, silently reintroducing the anomaly',
+  ]}
+  operationalBurden="Low infrastructure cost, real cognitive cost. Everyone touching the code must know that transactions can fail and must be retried, and that retry means re-reading rather than resubmitting."
+  cost="No infrastructure cost. Wasted work from aborts under contention, which is only material when contention is high — at which point the data model deserves attention."
+  whenNot="When the invariant fits naturally in a single row, a constraint or conditional update is simpler, faster and impossible to forget. And when contention on the affected rows is severe, serializable isolation degrades badly — there the answer is to change the data model so the contention is spread, not to strengthen isolation over a hot spot."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL implements Serializable Snapshot Isolation: transactions run optimistically under
+snapshot isolation, and those whose commit would violate serializability are aborted with a
+serialization failure. Applications using this level must be prepared to retry.
+</Claim>
+
+<Claim label="fact" source="mysql-docs">
+InnoDB's default isolation level is Repeatable Read, and it uses next-key locking to prevent
+some phantom reads. The behaviour differs meaningfully from PostgreSQL's default, so
+application code that is safe on one is not automatically safe on the other.
+</Claim>
+
+<Claim label="recommendation">
+Write down the invariants your system must never violate, then for each one name what enforces
+it. If the answer is "the application checks first", the invariant is not enforced — it is
+hoped for, and concurrency will eventually test the hope.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know what a transaction actually guarantees, and whether you can spot an invariant that spans rows. Very few candidates raise write skew unprompted, and it is a strong signal when they do."
+  depth="Know the main anomalies and which levels permit them. Know that defaults differ between engines. Being able to explain write skew with an example is more valuable than reciting the full anomaly taxonomy."
+  followUps={[
+    'Two users book the last slot at the same moment. What actually happens?',
+    'What does your database guarantee by default?',
+    'How would you enforce "at least one admin must remain" across a table?',
+    'What is the cost of serializable isolation here?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'It is in a transaction, so it is safe.',
+      why: 'A transaction gives atomicity and durability unconditionally, and isolation only to the degree the level specifies. At the common defaults, another transaction can commit between your read and your write.',
+      instead:
+        'Name the invariant and the mechanism enforcing it. "Serializable, and we retry on serialization failure" is an answer. "It is in a transaction" is not.',
+    },
+    {
+      mistake: 'We use ACID databases, so we do not have these problems.',
+      why: 'ACID is a bundle of four unrelated properties, and the isolation one has a dial that most deployments leave at a setting permitting lost updates.',
+      instead:
+        'Talk about the specific level in use, the anomalies it permits, and the invariants that need more than it provides.',
+    },
+    {
+      mistake: 'We will just use serializable everywhere.',
+      why: 'Under contention this trades a correctness problem for a throughput and abort-rate problem, and it obscures which invariants actually mattered.',
+      instead:
+        'Use the strongest level where an invariant genuinely requires it, and prefer moving the invariant into a single row when that is natural. Reserve serializable for the cases where the invariant genuinely spans rows.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['write-skew', 'snapshot-isolation']}
+  prompt="A meeting room booking system checks for overlapping bookings before inserting. Two people book overlapping slots simultaneously, under snapshot isolation. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'The second insert fails, because the first is now visible',
+      implies: 'You expect the second transaction to see the first transaction’s write.',
+      why: 'Under snapshot isolation each transaction reads the snapshot taken at its start, so neither sees the other\'s uncommitted insert. Both overlap checks pass against a state where no conflicting booking exists.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Both succeed: each read a snapshot with no conflict, and they inserted different rows so nothing collided',
+      implies: 'You recognise write skew — the invariant spans rows, so no row-level conflict exists to detect.',
+      why: 'This is textbook write skew. The invariant "no two bookings overlap" is a property of a set of rows. Each transaction verified it against a snapshot and then wrote a new row, and two new rows do not collide with each other.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'One will deadlock and be retried',
+      implies: 'You are expecting lock contention.',
+      why: 'Under snapshot isolation neither transaction takes a lock the other needs — reads do not block, and the inserts are of different rows. There is nothing to deadlock on.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer gives at least two fixes with their costs: serializable isolation, which detects the read-write dependency and aborts one but requires retry handling everywhere; or a constraint that makes overlap structurally impossible, such as an exclusion constraint on a time range, which is enforced by the database and cannot be forgotten. It also notes that a lock on a row representing the room would work and would serialise all bookings for that room."
+/>
+
+<Check
+  concepts={['mvcc', 'isolation-levels']}
+  prompt="Your database's storage has grown 40% in a week. Row counts are unchanged. Query performance across the whole database has degraded. What do you check first?"
+  options={[
+    {
+      id: 'a',
+      text: 'Whether an index is missing on a heavily-queried table',
+      implies: 'You are looking at query plans.',
+      why: 'A missing index would slow specific queries; it would not grow storage with a flat row count, and it would not degrade the whole database at once.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Whether a long-running transaction is preventing cleanup of old row versions',
+      implies: 'You connected flat row counts plus growing storage to MVCC version retention.',
+      why: 'Under MVCC, updates create new versions and dead ones can only be removed once no transaction might still see them. One transaction left open — a report, a stuck connection, an idle session in a transaction — pins the horizon for the entire database, so dead versions accumulate everywhere.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Whether backups are consuming disk',
+      implies: 'You are looking at external disk consumers.',
+      why: 'Worth ruling out, and it would explain disk usage but not the degradation of query performance across the database, which points at bloat within the tables themselves.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the preventive controls: an idle-in-transaction timeout, a statement timeout, an alert on the age of the oldest open transaction, and a rule that transactions never span an external call. It also notes that the cleanup backlog does not clear instantly once the transaction ends, so recovery takes time and may need manual intervention."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Transaction isolation as implemented', sourceId: 'postgres-docs' },
+    {
+      label: 'Weak isolation, write skew and the anomaly taxonomy',
+      sourceId: 'ddia',
+      note: 'The clearest treatment of what each level permits, with examples you can reproduce.',
+    },
+    { label: 'Concurrency control internals', sourceId: 'database-internals' },
+    {
+      label: 'Next: what happens to all of this when the data lives on several machines',
+      href: '/lessons/copies-and-what-they-cost',
+    },
+  ]}
+/>

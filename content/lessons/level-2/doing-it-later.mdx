@@ -1,0 +1,442 @@
+---
+id: doing-it-later
+title: Doing It Later
+level: 2
+module: l2-later-work
+order: 1
+summary: Moving work off the request path makes the request fast and makes the work uncertain. Everything a queue costs you comes from that exchange.
+difficulty: core
+minutes: 28
+prerequisites: [sync-vs-async, many-machines-one-service]
+concepts: [queue, sync-vs-async, backpressure, queue-depth, pubsub, coupling]
+unlocks: [at-least-once, idempotency, dead-letter-queue, load-shedding]
+failures: [silent-backlog]
+sources: [aws-builders-library, ddia, kafka-docs]
+status: reviewed
+---
+
+## The problem
+
+Signing up takes 4 seconds. The handler does seven things: create the user, hash the password,
+write an audit record, send a welcome email, generate a thumbnail, notify the analytics
+pipeline, and sync to the CRM.
+
+Only the first two need to happen before you can tell the user they are signed up. The other
+five are the reason they are waiting — and each one is a third party whose outage becomes your
+outage, whose slowness becomes your latency, and whose failure loses a signup that had already
+effectively happened.
+
+## Intuition
+
+There are two ways to ask someone to do something.
+
+**Synchronously:** you stand there until it is done. You know the outcome immediately. You are
+also blocked, and if they are slow, you are slow; if they are unavailable, you fail.
+
+**Asynchronously:** you leave a note in their inbox and carry on. You are fast and unblocked.
+You do not know when it will be done, or whether it succeeded, and you must be able to cope
+with the answer arriving later — or not at all.
+
+A queue is the inbox. It buys you three things:
+
+- **Latency**, because the caller stops waiting.
+- **Availability**, because the consumer being down no longer fails the request.
+- **Burst absorption**, because the queue holds work that arrived faster than it can be
+  processed.
+
+And it charges you in a single currency: **you no longer know that the work happened.**
+Everything else — retries, duplicates, ordering, dead letters, monitoring lag — is the bill for
+that.
+
+## Concretely
+
+<Example title="Which of the seven steps can move">
+
+Ask one question of each step: **if this fails, should the user be told their signup failed?**
+
+| Step | Must be synchronous? | Why |
+|---|---|---|
+| Create the user record | Yes | It is the operation. Without it nothing happened. |
+| Hash the password | Yes | Part of creating the user. |
+| Write an audit record | Yes, in the same transaction | Its value is that it cannot diverge from the thing it audits. |
+| Send a welcome email | No | Late is fine. Failure is recoverable by retry. |
+| Generate a thumbnail | No | The interface can show a placeholder. |
+| Notify analytics | No | Nobody's experience depends on it. |
+| Sync to the CRM | No | An external system with its own availability, which should never be able to fail a signup. |
+
+Four steps move off the request path. Latency drops from 4 seconds to perhaps 200 ms, and the
+signup no longer depends on the availability of an email provider or a CRM.
+
+What you have taken on: those four things must now happen *eventually*, you must be able to
+tell when they do not, and each of them may run more than once.
+
+</Example>
+
+## Formal explanation
+
+A <C id="queue" /> decouples producer from consumer in time. The producer writes and returns;
+the consumer reads when it is able.
+
+Three properties matter for design.
+
+**A queue absorbs bursts, not sustained overload.** If the arrival rate exceeds the service
+rate on average, the queue grows without bound. It does not fix the imbalance; it hides it for
+a while, converting an overload problem into a latency problem and then into a storage problem.
+
+**<C id="queue-depth">Depth is a leading indicator</C>.** A growing queue means arrivals exceed
+service. It tells you about the problem before users notice, which makes it one of the most
+valuable signals in a system — and one of the most commonly unmonitored.
+
+**Delivery is at-least-once in practice.** A consumer that crashes after acting but before
+acknowledging will see the message again. This is not a defect in any particular broker; it is
+what happens when you cannot make acknowledgement and side effect atomic. The consequence is
+that consumers must be idempotent, which is a design constraint rather than an optimisation.
+
+<Callout kind="warn" title="The dual-write problem, arriving early">
+If the handler writes to the database and then publishes to the queue, a crash between them
+leaves the two permanently disagreeing: a user exists with no welcome email queued, and nothing
+knows. This is the dual-write problem, and the standard answer is the transactional outbox —
+write the message into the same database in the same transaction, and publish from there.
+</Callout>
+
+<Deeper title="Queue or log? They are different tools">
+
+Two shapes are commonly both called "a queue".
+
+**A task queue** is a work list. A consumer takes a message, does the work, acknowledges, and
+the message is gone. Well suited to one producer, one logical consumer, and work that is
+disposable once done.
+
+**A durable log** is a retained, ordered, replayable sequence. Consumers track their own
+position, so several independent consumer groups can read the same messages, and any of them
+can rewind.
+
+The distinction matters because the log's extra properties — retention, replay, multiple
+independent consumers — are exactly what you need to rebuild a derived store or add a new
+consumer after the fact, and are exactly what you are paying operational cost for if you never
+use them.
+
+<Claim label="fact" source="kafka-docs">
+In a partitioned log, ordering is guaranteed within a partition and not across partitions.
+Parallelism within a consumer group is bounded by the number of partitions.
+</Claim>
+
+<Claim label="recommendation">
+Choose the log when several independent consumers need the same events, or when you may need
+to replay history. Choose the task queue when work is consumed once and forgotten. Choosing
+the log "in case we need it later" buys a substantial operational bill against a hypothetical.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The request path shrinks; a second path appears that nobody is watching unless you make them."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client' }] },
+    { title: 'Request path', nodes: [{ id: 'api', label: 'API', note: 'fast now', tone: 'accent' }] },
+    { title: 'Durable handoff', nodes: [{ id: 'db', label: 'Database + outbox' }, { id: 'queue', label: 'Queue' }] },
+    { title: 'Workers', nodes: [{ id: 'worker', label: 'Workers' }, { id: 'dlq', label: 'Dead letters' }] },
+    { title: 'Effects', nodes: [{ id: 'email', label: 'Email provider' }, { id: 'crm', label: 'CRM' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'api' },
+    { from: 'api', to: 'db', label: 'write + event' },
+    { from: 'db', to: 'queue', label: 'relay' },
+    { from: 'queue', to: 'worker' },
+    { from: 'worker', to: 'email' },
+    { from: 'worker', to: 'crm' },
+    { from: 'worker', to: 'dlq', label: 'after N failures', tone: 'danger' },
+  ]}
+  stages={[
+    {
+      label: 'Synchronous',
+      show: ['client', 'api', 'email', 'crm'],
+      because:
+        'Everything happens before the response. The user waits for the slowest third party, and any of them can fail the signup.',
+    },
+    {
+      label: 'With a queue',
+      show: ['client', 'api', 'queue', 'worker', 'email', 'crm'],
+      because:
+        'The request returns as soon as the work is durably queued. Third-party latency and availability no longer affect the user.',
+    },
+    {
+      label: 'Made reliable',
+      show: ['client', 'api', 'db', 'queue', 'worker', 'dlq', 'email', 'crm'],
+      because:
+        'The outbox removes the gap between committing the user and queueing the work. The dead-letter queue stops one permanently-failing message from consuming the workers forever.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Consumers keep up easily',
+      behaviour: 'Depth near zero. Latency of the deferred work is a second or two.',
+      firstToBreak: 'Nothing, and nobody is monitoring depth yet.',
+    },
+    {
+      scale: 'A burst arrives',
+      behaviour:
+        'Depth grows, consumers work through it, depth returns to zero. This is the queue doing its job.',
+      firstToBreak: 'Nothing, provided the burst is finite and the drain rate exceeds the average arrival rate.',
+    },
+    {
+      scale: 'Sustained arrival rate above service rate',
+      behaviour:
+        'Depth grows without bound. Deferred work is now hours old. Users notice the effects long before anyone notices the queue.',
+      firstToBreak:
+        'Freshness of everything downstream, then storage, then the broker.',
+    },
+    {
+      scale: 'Consumers scaled up',
+      behaviour:
+        'Parallelism is capped by partition count in a log, and by downstream capacity everywhere.',
+      firstToBreak:
+        'The downstream dependency. Scaling consumers frequently just moves the bottleneck one step further along.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Poison message blocks a partition',
+      symptom:
+        'One partition stops making progress while others are fine. Consumer restarts do not help.',
+      cause:
+        'A message that always fails is retried forever, and in an ordered partition nothing behind it can proceed.',
+      mitigation:
+        'Bound retries per message and route failures to a dead-letter queue after a limit. Alert on dead letters; an unmonitored dead-letter queue is a silent data-loss mechanism.',
+    },
+    {
+      what: 'Duplicate processing',
+      symptom: 'Two welcome emails. Two charges. Two rows where one was expected.',
+      cause:
+        'A consumer acted and then crashed before acknowledging, so the message was redelivered.',
+      mitigation:
+        'Make consumers idempotent, keyed on something stable in the message. This is a requirement, not a refinement — at-least-once is what you have.',
+    },
+    {
+      what: 'Silent backlog',
+      symptom:
+        'Emails arrive six hours late. Search results are stale. Everything reports healthy.',
+      cause:
+        'Consumers are running and processing, just slower than arrivals. Nothing errors, so nothing alerts.',
+      mitigation:
+        'Alert on queue depth and on the age of the oldest unprocessed message. Age is the better signal because it maps directly to user-visible staleness.',
+    },
+    {
+      what: 'Dual write between database and queue',
+      symptom:
+        'Occasional records with no corresponding downstream effect, or events referring to records that do not exist.',
+      cause:
+        'Two writes to two systems with no atomicity between them, and a crash in the gap.',
+      mitigation:
+        'Transactional outbox: write the event into the same database in the same transaction, and publish from the outbox asynchronously.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Move non-essential work off the request path into a queue"
+  options={[
+    'Keep everything synchronous',
+    'Fire-and-forget in a background thread within the same process',
+    'Durable queue with workers',
+  ]}
+  why="Work whose failure should not fail the user's request does not belong on the request path. Anything else means a third party's availability becomes yours, and their latency becomes your latency."
+  gain="Request latency drops to the essential work only. The request no longer depends on the availability of anything deferred. Bursts are absorbed rather than rejected, and the deferred work can be retried without the user present."
+  sacrifice="You lose the immediate answer. The work becomes eventually consistent, may run more than once, and needs its own monitoring — which is a second system that can be unhealthy while the first looks fine."
+  failureModes={[
+    'Silent backlog: everything healthy, everything late',
+    'Duplicate side effects from redelivery',
+    'Poison messages blocking progress',
+    'Dual write leaving the database and the queue disagreeing',
+  ]}
+  operationalBurden="Moderate and frequently underestimated. A broker to run, consumers to deploy and scale, dead letters to triage, and depth and age to alert on. The consumers are a second production service with the same needs as the first."
+  cost="Broker infrastructure, worker capacity, and retained messages. Modest in money; the real cost is the operational attention the second path requires."
+  whenNot="A background thread in the same process is fine when losing the work on a crash is genuinely acceptable — a metrics ping, a cache warm. It is not fine for anything a user would notice missing, because a deploy will lose it. And do not defer work whose result the caller needs: an asynchronous operation the client immediately polls for is a synchronous operation with extra steps and worse latency."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-builders-library">
+Queue depth and the age of the oldest message are standard operational signals, and message
+age maps more directly to user-visible impact than depth does. A queue with 10,000 messages
+that drains in 30 seconds is healthy; one with 200 messages whose oldest is four hours old is
+not.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Consumers commit offsets to record progress. The choice of when to commit — before or after
+processing — determines whether a crash produces duplicate processing or lost messages. There
+is no configuration that avoids choosing.
+</Claim>
+
+<Claim label="recommendation" source="ddia">
+Design consumers to be idempotent from the start. Retrofitting idempotency after a duplicate
+incident is significantly harder than building it in, because by then the side effects are
+spread across code that assumed it would run once.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know what asynchrony costs, not just what it buys. Adding a queue is easy to propose; naming the duplicate-delivery consequence and the monitoring requirement is what distinguishes the answer."
+  depth="Know that delivery is at-least-once and that consumers must therefore be idempotent. Know that a queue absorbs bursts and not sustained overload. Broker-specific detail is rarely the point unless you introduced the broker."
+  followUps={[
+    'The consumer crashes after sending the email but before acknowledging. What happens?',
+    'The queue has 4 million messages. What do you do first?',
+    'How do you know the deferred work actually happened?',
+    'How do you guarantee the event is published if the database write succeeds?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will use a queue to handle traffic spikes.',
+      why: 'A queue absorbs a burst. It cannot absorb an arrival rate that exceeds your service rate on average — it just hides the imbalance while depth grows, and every message that eventually completes may already be irrelevant.',
+      instead:
+        'Say whether the excess is a burst or sustained. Queue for bursts; shed load for sustained overload. Both, if the answer is "sometimes each".',
+    },
+    {
+      mistake: 'The queue guarantees delivery, so the work will happen.',
+      why: 'It guarantees the message is retained until acknowledged. It does not guarantee the consumer can process it, that the downstream service is available, or that a permanently failing message will ever succeed.',
+      instead:
+        'Say what happens after N failures, where those messages go, and who looks at them. An unmonitored dead-letter queue is a place where work goes to be forgotten.',
+    },
+    {
+      mistake: 'We publish the event after committing the transaction.',
+      why: 'A crash between the commit and the publish loses the event permanently, with no record that it was ever owed. It is rare, and it is silent, which is the worst combination.',
+      instead:
+        'Use a transactional outbox so the event and the state change commit together, and publish from the outbox.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['queue', 'backpressure', 'queue-depth']}
+  prompt="Your queue receives 5,000 messages per second. Consumers process 4,000 per second. You add more consumers, but the downstream API rate-limits you at 4,000 per second. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'The queue smooths it out and everything is processed eventually',
+      implies: 'You are treating the queue as capacity rather than as a buffer.',
+      why: 'Arrivals exceed service permanently, so depth grows at 1,000 messages per second — 86 million a day. "Eventually" is never, and the work at the front of the queue becomes older and less relevant every second.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Depth grows without bound; the imbalance must be fixed upstream, not by adding consumers',
+      implies: 'You recognise that the bottleneck moved downstream and that consumers are no longer the constraint.',
+      why: 'The rate limit is now the service rate, and no number of consumers changes it. The options are to reduce arrivals (shed, batch, sample), to negotiate a higher limit, or to accept that some work will not be done and choose which.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The broker will apply backpressure to the producers automatically',
+      implies: 'You expect the broker to propagate the constraint.',
+      why: 'Some brokers can, and if configured that way the pressure surfaces at the producer, which is genuinely better than a silent backlog. But it converts the problem into producer-side failures, which then need their own answer — so the imbalance still has to be resolved.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer distinguishes the kinds of work in the queue and proposes shedding the least valuable: sample analytics events, batch CRM updates, keep the emails. It also notes that the right alert here is oldest-message age rather than depth, because age is what maps to the user-visible symptom."
+/>
+
+<Check
+  concepts={['queue', 'idempotency', 'at-least-once']}
+  prompt="A worker sends a welcome email, then crashes before acknowledging the message. What happens, and what should you have done?"
+  options={[
+    {
+      id: 'a',
+      text: 'The message is lost, because it was being processed when the worker died',
+      implies: 'You expect in-flight messages to be discarded.',
+      why: 'The opposite: brokers redeliver unacknowledged messages precisely so that a crashed consumer does not lose work. That choice makes duplicates possible and losses unlikely, which is almost always the right trade.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The message is redelivered and a second email is sent; the consumer needed to be idempotent',
+      implies: 'You understand that at-least-once delivery makes duplicate side effects the default.',
+      why: 'The broker cannot distinguish "crashed before doing the work" from "crashed after doing the work", so it redelivers. Preventing the duplicate is the consumer\'s job: record that this message id has been handled, in the same transaction as the effect where possible, or use the provider\'s own idempotency key.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Acknowledge before processing so this cannot happen',
+      implies: 'You are choosing the other side of the trade.',
+      why: 'That converts duplicates into losses: a crash after acknowledgement and before the work means the email is never sent and nothing knows. For a welcome email, a duplicate is a mild annoyance and a loss is a missing customer touchpoint — so this is usually the wrong side to choose.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the general principle: you choose between at-least-once and at-most-once by choosing when to acknowledge, and there is no third option available from the broker. Exactly-once *effect* is achievable by combining at-least-once delivery with an idempotent consumer, and that is what people mean when they claim exactly-once."
+/>
+
+<CompleteCheck
+  concepts={['queue', 'backpressure', 'queue-depth', 'sync-vs-async']}
+  prompt="Image uploads are moved off the request path so the user does not wait for thumbnail generation. One piece is missing, and without it a slow day for the workers looks identical to a broken one. What goes in the gap?"
+  pipeline={[
+    { label: 'Upload API', note: 'returns immediately' },
+    { label: 'Job queue', note: 'durable' },
+    { label: 'Queue depth alarm', note: 'in time, not messages', gap: true },
+    { label: 'Workers', note: 'generate thumbnails' },
+    { label: 'Image store', note: 'result' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'An alarm on queue depth expressed as a wait time, so the backlog is visible before users notice missing thumbnails.',
+      implies: 'You are treating the queue as the place the failure now lives rather than as the place it was removed.',
+      why: 'Making work asynchronous did not remove the failure, it converted a synchronous error into a growing backlog. Nobody is waiting on the response any more, so nothing surfaces the delay: the API keeps returning success while thumbnails fall hours behind. Expressing depth as time — "the queue is 40 minutes deep" — is what makes it actionable, because a message count means nothing without knowing the drain rate.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'A retry mechanism with exponential backoff, so failed jobs are attempted again.',
+      implies: 'You are protecting against individual job failure.',
+      why: 'Necessary, and it addresses a different problem. Retries handle a job that fails; they do nothing about a fleet of workers that is simply too slow, which is the failure that this design has newly made invisible. Retries can also make it worse by adding load to a backlog that is already growing.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A second queue for high-priority uploads, so important work is not stuck behind bulk jobs.',
+      implies: 'You are separating classes of work.',
+      why: 'Useful once you know there are classes worth separating, and it presumes you can already see the backlog — which is the thing that is missing. Prioritising within an invisible queue means the low-priority lane silently starves and nobody finds out.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer states the rule the gap illustrates: every synchronous failure you remove becomes an asynchronous delay, and a delay is only a failure if something is watching for it. It also pairs the alarm with backpressure — when depth exceeds a threshold, the upload API should slow down or refuse, because a queue with no upper bound converts a temporary worker outage into unbounded memory or storage growth and a backlog that outlives the incident."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Queue depth, message age and operational signals', sourceId: 'aws-builders-library' },
+    { label: 'Delivery semantics, offsets and consumer groups', sourceId: 'kafka-docs' },
+    { label: 'Messaging systems and their guarantees', sourceId: 'ddia' },
+    {
+      label: 'Next: what happens when the load is not evenly spread',
+      href: '/lessons/when-load-is-not-even',
+    },
+  ]}
+/>

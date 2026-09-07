@@ -1,0 +1,152 @@
+---
+id: strangler-fig
+title: Strangler Fig
+problem: A system needs replacing, it is live, and a rewrite would chase a target that keeps moving.
+category: deployment
+concepts: [strangler-migration, cdc, feature-flag, canary, rollback, dual-write, maintainability, service-boundary]
+relatedPatterns: [expand-contract, transactional-outbox]
+alsoKnownAs: [strangler application, incremental replacement]
+seenIn: [Legacy system replacement, monolith decomposition, platform migrations]
+sources: [martin-fowler, building-microservices, ddia]
+status: reviewed
+---
+
+## Problem
+
+The old system works, has users, and is wrong in some specific way: the wrong data model, the
+wrong technology, or simply unmaintainable.
+
+The tempting answer is a rewrite. It fails predictably, and the mechanism is not about engineering
+skill:
+
+- **The old system keeps changing** while you build the new one, so the target recedes.
+- **Its mess encodes knowledge** — years of edge cases nobody wrote down.
+- **Nothing ships until the end**, so there is no feedback and no evidence.
+- **The switch-over is one enormous event**, attempted under maximum schedule pressure with the
+  least-tested code path in the project.
+
+## Pattern
+
+Put a facade in front of the old system that can route each request to either implementation.
+Then move one capability at a time.
+
+1. Insert the facade. Route everything to the old system. Verify this changes nothing.
+2. Implement one capability in the new system.
+3. Route that capability to the new system, for a small percentage, then more.
+4. Repeat until the old system receives no traffic.
+5. Delete it.
+
+The name comes from a fig that grows around a host tree and eventually replaces it, while the
+tree is standing throughout.
+
+Every step is small, reversible by a routing change, and ships value. A project cancelled halfway
+leaves a working system with several capabilities improved — which a cancelled rewrite does not.
+
+## Architecture
+
+<Arch
+  caption="One facade, two implementations, a boundary that moves."
+  columns={[
+    { title: 'Clients', nodes: [{ id: 'client', label: 'Clients', note: 'unchanged' }] },
+    { title: 'Facade', nodes: [{ id: 'facade', label: 'Routing facade', note: 'per capability', tone: 'accent' }] },
+    { title: 'Implementations', nodes: [{ id: 'old', label: 'Legacy system' }, { id: 'new', label: 'New system' }] },
+    { title: 'Data', nodes: [{ id: 'data', label: 'Shared or synced data' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'facade' },
+    { from: 'facade', to: 'old', label: 'not yet migrated' },
+    { from: 'facade', to: 'new', label: 'migrated', tone: 'accent' },
+    { from: 'old', to: 'data' },
+    { from: 'new', to: 'data' },
+  ]}
+/>
+
+## Advantages
+
+- **Value ships continuously** rather than at the end.
+- **Risk is bounded per step.** A problem affects one capability at one traffic percentage.
+- **Rollback is a routing change**, not a deploy or a restore.
+- **The old system is the specification.** Running both and comparing outputs extracts the
+  undocumented behaviour that a rewrite would lose.
+- **Cancellation is survivable**, which matters because long projects are frequently cancelled.
+
+## Costs
+
+- **Both systems run simultaneously**, costing infrastructure and cognitive load.
+- **The facade is a new component** with its own failure modes, and it sits on the critical path.
+- **Data must be shared or synchronised**, which is usually the hardest part and is not solved by
+  the routing facade.
+- **Calendar time is longer**, even though value arrives sooner.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'The facade becomes permanent',
+      symptom: 'Years later the routing layer is still there, with rules nobody understands, and both systems still run.',
+      cause: 'The migration stalled once the interesting capabilities moved, and the remaining ones had no champion.',
+      mitigation: 'Plan the end state and the removal from the start, with an owner. Track remaining capabilities as a visible countdown.',
+    },
+    {
+      what: 'Data divergence between the systems',
+      symptom: 'The two implementations disagree about the same entity.',
+      cause: 'Dual writes with no verification, or a synchronisation gap nobody monitors.',
+      mitigation: 'One system remains the source of truth throughout. Compare continuously and alert on divergence.',
+    },
+    {
+      what: 'Verification phase skipped',
+      symptom: 'After switching a capability, subtle differences appear — rounding, nulls, timezones.',
+      cause: 'The new implementation was tested against a specification rather than against the old system’s actual behaviour.',
+      mitigation: 'Shadow mode: run both on real traffic, compare, return the old result, and continue until discrepancies are zero.',
+    },
+    {
+      what: 'Migrating the easy capabilities first and stopping',
+      symptom: 'The 80% that was straightforward has moved and the difficult 20% remains forever.',
+      cause: 'Capability order chosen by ease rather than by a plan that reaches the end.',
+      mitigation: 'Sequence deliberately, and tackle at least one genuinely hard capability early so the plan is tested against reality.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- The system is live and cannot stop.
+- It is large enough that a rewrite would take longer than the old system takes to change
+  meaningfully.
+- Its behaviour is not fully documented, so the running system is the best specification available.
+- There is a request boundary where a facade can sit.
+
+## When NOT to use it
+
+- **When the system is small enough to replace faster than it changes.** A single service with one
+  team and a week of work does not need a facade, and the ceremony would cost more than the risk
+  it removes.
+- **When there is no request boundary.** A library, or logic embedded throughout an application,
+  has nowhere for a facade to sit. There, expand-and-contract at the code level is the analogous
+  technique.
+- **When the two systems cannot share or synchronise data.** The routing facade solves request
+  routing; if the data problem is unsolvable, the migration is blocked regardless.
+- **When the old system genuinely must be switched off by a date** — a licence expiry, a data
+  centre closure. Then the incremental approach may not finish in time, and the honest plan is
+  different: a window, with the risk stated.
+
+## Example systems
+
+<Claim label="convention" source="martin-fowler">
+The strangler fig is documented as an approach to replacing a legacy system incrementally by
+routing capabilities to a new implementation over time, rather than attempting a simultaneous
+replacement.
+</Claim>
+
+<Claim label="convention" source="building-microservices">
+Extracting functionality from a monolith is described as an incremental process involving a
+facade, dual-running and verification, with explicit guidance that the removal of the old path
+must be planned rather than assumed.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Change data capture allows a new store to be built from an existing system's change log without
+modifying the source, which is particularly valuable when the legacy system cannot safely be
+changed.
+</Claim>

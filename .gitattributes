@@ -1,0 +1,5 @@
+# Normalise line endings in the repository, so a clone on any platform sees the same bytes.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

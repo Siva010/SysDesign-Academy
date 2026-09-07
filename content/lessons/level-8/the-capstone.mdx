@@ -1,0 +1,406 @@
+---
+id: the-capstone
+title: The Capstone
+level: 8
+module: l8-capstone
+order: 1
+summary: A system you have not been shown, with requirements that conflict. Derive it yourself, then compare against a worked solution — assumption by assumption.
+difficulty: staff
+minutes: 90
+prerequisites: [people-shape-architecture, the-primitives-underneath]
+concepts: [requirement-clarification, back-of-envelope, partition-key, fanout-on-write, hot-key, idempotency-key, linearizability, session-guarantees, multi-region, load-shedding, cell-architecture, cost-optimisation, blast-radius, data-residency]
+unlocks: [strict-serializability, active-active]
+sources: [ddia, sre-book, spanner, aws-well-architected]
+status: reviewed
+---
+
+## The problem
+
+Everything up to here has been taught. This is the test that matters: **a system nobody has shown
+you, with requirements that do not all fit.**
+
+Read the prompt. Then stop, and work it yourself before revealing anything. Reading a solution
+produces the feeling of understanding without the substance; the value here is entirely in the
+derivation.
+
+Allow 60 to 90 minutes. Write it down — a document, a diagram, whatever you would produce for a
+colleague. Writing forces the decisions that thinking lets you skip.
+
+<Callout kind="warn" title="The exercise is the derivation">
+The expert treatment below is one defensible answer, not the answer. If yours differs and you can
+defend the difference from your assumptions, you have done the exercise correctly. Comparing
+assumptions matters far more than comparing diagrams.
+</Callout>
+
+## The prompt
+
+> Design a **collaborative document editing platform** for organisations.
+>
+> - Multiple people edit the same document simultaneously and see each other's changes.
+> - Documents contain text and embedded images, and may be very large.
+> - Organisations have strict access control: documents are shared with individuals, groups, or
+>   an entire organisation, and permission changes must take effect immediately.
+> - Full history is retained; any past version can be restored.
+> - Customers are global. Some are contractually required to keep their data within a specific
+>   jurisdiction.
+> - Full-text search across everything a user may access.
+> - Target: 40 million users, 5 million documents edited daily, peak 200,000 concurrent editing
+>   sessions.
+
+Six primitives, at least two conflicting requirements, and one constraint that quietly
+invalidates the obvious architecture.
+
+## Intuition
+
+Before designing anything, ask what makes it hard. Not what it does — what breaks.
+
+Three questions to answer first, because each rules out an entire family of designs:
+
+1. **What is the unit of concurrency?** Documents are edited by a handful of people, not by
+   millions. That means contention is per document and low — which is very different from a
+   ticket sale.
+2. **What must be immediate, and what may lag?** Permission changes must be immediate. Search
+   indexes may lag by seconds. Those are different consistency requirements in the same system,
+   and conflating them is the most common way to over-build this.
+3. **What does data residency do to the design?** It is the constraint that invalidates the
+   obvious answer, and noticing it early saves an hour.
+
+## Work it yourself
+
+<OpenCheck
+  concepts={['requirement-clarification', 'back-of-envelope']}
+  prompt="Before designing: which questions would you ask, and what would you estimate? Write the questions whose answers would change your design, and produce the numbers that decide the architecture."
+  rubric={[
+    { point: 'Conflict-resolution model', weight: 3, hint: 'Concurrent edits to the same text need a defined merge. Operational transformation and CRDTs are the two families; which one, and why?' },
+    { point: 'Immediate versus lagging consistency', weight: 3, hint: 'Permission changes are immediate; search and history may lag. These are different requirements and must be separated explicitly.' },
+    { point: 'Data residency implications', weight: 3, hint: 'Jurisdiction-bound data cannot live in a single global store, which rules out a single-region design and shapes routing and search.' },
+    { point: 'Concurrency estimate', weight: 2, hint: '200,000 concurrent sessions, each a long-lived connection. That is a stateful connection tier with its own scaling story.' },
+    { point: 'Edit rate estimate', weight: 2, hint: 'Keystroke-level operations per active editor per second, multiplied by concurrent editors. This decides whether edits go to a database at all.' },
+    { point: 'Storage estimate', weight: 2, hint: 'Full history retained forever, plus images. Growth is unbounded, so retention and tiering are design inputs.' },
+    { point: 'Search freshness requirement', weight: 1, hint: 'Seconds of lag is almost certainly acceptable, which makes search a derived store rather than a synchronous concern.' },
+    { point: 'Large object handling', weight: 1, hint: 'Images must never pass through the application. Presigned upload, CDN delivery, metadata in the database.' },
+  ]}
+  stronger="A strong submission separates the two consistency requirements explicitly and identifies data residency as the constraint that shapes everything else. The strongest ones also notice that per-document contention is low, which means this is not a contention problem despite looking like one."
+/>
+
+<OpenCheck
+  concepts={['partition-key', 'multi-region', 'data-residency']}
+  prompt="Design it. What are the components, what is the partition key, where does data live, and what happens when a region is unavailable?"
+  rubric={[
+    { point: 'Document as the unit of partitioning', weight: 3, hint: 'Everything about a document — content, history, collaborators — lives together. Cross-document operations are rare.' },
+    { point: 'Stateful edit tier separate from the API', weight: 3, hint: 'Long-lived connections and in-memory document state need different scaling and deployment from stateless request handling.' },
+    { point: 'One authoritative editing session per document', weight: 3, hint: 'Concurrent edits need a single ordering point per document. That is a leadership problem, with a lease and a handover on failure.' },
+    { point: 'Home region per organisation', weight: 3, hint: 'Residency means the organisation, not the user, determines where data lives. Routing follows the organisation.' },
+    { point: 'Permissions checked at request time, not cached in a token', weight: 2, hint: 'Immediate revocation rules out embedding permissions in a long-lived token.' },
+    { point: 'Search as a derived, per-region store', weight: 2, hint: 'Derived from the document store, eventually consistent, and partitioned by residency boundary like everything else.' },
+    { point: 'History as an append-only log', weight: 2, hint: 'Operations are already a log. Version restore is replay to a point, and snapshots bound replay cost.' },
+    { point: 'Failure behaviour stated', weight: 2, hint: 'What happens when the edit tier for a document fails mid-session, and what the user sees.' },
+  ]}
+  stronger="A strong design separates the stateless API from the stateful edit tier and says why. The strongest ones state what happens to an in-progress editing session when its node fails, because that is the failure everyone forgets and it is the one users notice."
+/>
+
+## The expert treatment
+
+<Deeper title="Reveal the worked solution — only after you have written yours">
+
+### Primitives present
+
+**Collaborative merge** (unusual; not in the standard eleven), **fanout** (presence and change
+notification), **large-object** (images), **search-index**, **scheduling** (snapshot and
+compaction jobs), and an access-control problem that behaves like an authorization primitive.
+
+### The load-bearing decisions
+
+**One authoritative session per document.** Concurrent edits require a single ordering point.
+Rather than coordinating on every keystroke, one node owns a document's active session, holds its
+state in memory, orders incoming operations, and broadcasts the result. Contention is per
+document and low, so this scales by document count rather than by user count.
+
+That node holds a **lease**. If it fails, another acquires the lease and rebuilds state from the
+persisted operation log. Clients reconnect and replay unacknowledged operations, which they must
+retain locally for exactly this reason.
+
+**Operations, not documents, are the unit of storage.** Every edit is an operation appended to a
+per-document log. This gives history for free, makes restore a replay to a point, and makes the
+merge problem tractable. Periodic snapshots bound how far replay must go.
+
+**Data residency determines the partitioning, and it is the constraint that decides the
+architecture.** Each organisation has a home region; all its documents, history, search index and
+images live there. This is not a performance optimisation — it is a legal requirement — and it
+rules out the single global store that would otherwise be the obvious design.
+
+Consequences that follow:
+
+- Routing is by organisation, resolved at the edge, before anything else happens.
+- Search is per-region. A cross-organisation global search is not possible for jurisdiction-bound
+  customers, which is a product limitation and must be stated rather than engineered around.
+- A user belonging to two organisations in different jurisdictions has two separate data homes,
+  and the interface must make that coherent.
+
+**Permissions are checked at request time.** Immediate revocation rules out embedding permissions
+in a long-lived token. The permission service is on the critical path, so it needs a local cache
+with a very short TTL — seconds — and an explicit invalidation on change. The trade is stated
+plainly: a few seconds of revocation delay, not minutes, and never "until the token expires".
+
+**Search is derived and eventually consistent.** Documents are indexed from the operation log
+asynchronously. Results are filtered by permission **at query time**, not at index time, because
+indexing permissions would require reindexing on every permission change.
+
+**Images bypass everything.** Presigned upload directly to object storage in the organisation's
+region, CDN delivery, metadata in the document store. Bytes never touch the application.
+
+### The conflicts, and how they resolve
+
+**"Immediate permission changes" versus "search must be fast".** Resolved by filtering at query
+time rather than at index time. Search is fast, permissions are current, and the cost is that a
+query fetching 100 candidates may return 40 after filtering — so you over-fetch.
+
+**"Global product" versus "data residency".** Resolved by accepting a product limitation:
+cross-jurisdiction search does not exist. Attempting to engineer around this produces either a
+legal problem or a system that cannot be reasoned about.
+
+**"Full history forever" versus "cost".** Resolved by tiering: recent operations hot, older
+operations compacted into snapshots and moved to cheap storage. Restore from cold storage is
+slower, and that is an acceptable, stated degradation.
+
+### What breaks
+
+- **Edit tier node fails mid-session.** Clients reconnect; a new node acquires the lease and
+  rebuilds from the log; clients replay unacknowledged operations. The user sees a brief
+  reconnecting state. This is the failure everyone forgets to design for.
+- **Permission service unavailable.** Fail closed for permission *changes* and serve from the
+  short-TTL cache for reads, so existing sessions continue and new grants stall. Failing open on
+  reads would be a security incident; failing closed on reads would take the product down.
+- **Search index falls behind.** Recent documents are not findable. Degrades rather than breaks,
+  and needs alerting on index lag.
+- **A document with 500 concurrent editors.** A hot document. The session node becomes the
+  bottleneck. Mitigation: this is a product limit, and enforcing a maximum number of concurrent
+  editors is more honest than degrading silently.
+- **An organisation's region is unavailable.** Their documents are unavailable. Residency
+  constrains failover to within the jurisdiction, so redundancy must exist inside the region
+  rather than across regions.
+
+### What we did not build
+
+- **Global strong consistency.** Only the per-document operation ordering needs it, and that is
+  achieved by a single session owner rather than by a consensus system spanning regions.
+- **Cross-region replication of document content.** Residency forbids it for jurisdiction-bound
+  customers, and building two paths — replicated for some, not for others — would double the
+  complexity for a minority of customers.
+- **Permissions in tokens.** Immediate revocation is a hard requirement.
+- **A distributed lock service for editing.** The session lease serves the purpose with less
+  machinery, and the operation log makes recovery straightforward.
+
+</Deeper>
+
+## Compare
+
+The comparison worth making is not diagram against diagram. It is:
+
+| Dimension | Question to ask yourself |
+|---|---|
+| Assumptions | Did you state them? Were they defensible? Would a different assumption have led somewhere better? |
+| Primitives | Did you identify all six, or design around the ones you noticed? |
+| The conflict | Did you find the residency constraint, and did you resolve it or ignore it? |
+| Failure | Did you say what happens when the edit tier fails mid-session? |
+| Scope | Did you state what you were *not* building, and why? |
+| Cost | Did you say roughly what dominates the bill? |
+
+A design that differs from the one above but answers all six is a better outcome than one that
+matches it and answers three.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Reading the solution first',
+      symptom: 'It all seems obvious, and none of it is available under pressure a week later.',
+      cause: 'Recognition feels like understanding. It is not the same thing and it does not transfer.',
+      mitigation: 'Write your design before revealing anything. A bad written design is worth far more than a good understood one.',
+    },
+    {
+      what: 'Designing for the stated words rather than the conflict',
+      symptom: 'A design that satisfies every requirement in isolation and cannot exist.',
+      cause: 'The conflicting requirements were not identified, so nothing was traded.',
+      mitigation: 'List the requirements, then find the pairs that cannot both hold. There is always at least one.',
+    },
+    {
+      what: 'Solving the interesting problem and skipping the boring one',
+      symptom: 'An elegant collaborative merge design with no answer for permissions or residency.',
+      cause: 'The technically interesting primitive absorbed the time.',
+      mitigation: 'Allocate time by requirement importance, not by personal interest. Residency is the constraint that decides this architecture, and it is not the fun part.',
+    },
+    {
+      what: 'No statement of scope',
+      symptom: 'A design that appears to cover everything and covers nothing in depth.',
+      cause: 'Nothing was declared out of scope, so everything was treated equally.',
+      mitigation: 'Say what you are not designing and why. It is a signal of judgment, not of avoidance.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Give each organisation a home region and forbid cross-region document replication"
+  options={[
+    'Global replication with per-document residency tags',
+    'Home region per organisation, no cross-region replication',
+    'Two architectures: replicated for unconstrained customers, pinned for constrained ones',
+  ]}
+  why="Residency is a legal constraint rather than a preference. A design where data can move and is prevented from moving by policy is one configuration error away from a compliance incident; a design where it cannot move is safe by construction."
+  gain="Compliance is structural rather than procedural. Reasoning is simple: an organisation's data is in one place. No cross-region consistency problems, no conflict resolution across jurisdictions."
+  sacrifice="No cross-jurisdiction search or sharing. A regional outage takes that organisation offline entirely, because failover outside the jurisdiction is not permitted."
+  failureModes={[
+    'Regional outage with no legal failover target',
+    'A user in two organisations in different regions experiencing an incoherent product',
+    'Growth in a region outstripping capacity, with no ability to spill over',
+  ]}
+  operationalBurden="Higher: N regional deployments, each needing its own capacity planning, monitoring and on-call. Made tractable only by strong deployment automation."
+  cost="Capacity cannot be pooled across regions, so utilisation is lower. Each region needs its own headroom and its own redundancy."
+  whenNot="If no customer has a residency requirement, this is pure cost and a single global architecture with regional read replicas is better in every respect. The trap is building the constrained architecture for everyone because a minority of customers need it — the alternative worth considering is two deployment topologies for two customer classes, which doubles operational surface but keeps the majority simple."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-well-architected">
+Data residency and sovereignty requirements are treated as architectural constraints that
+determine regional topology rather than as configuration applied afterwards, because enforcement
+by construction is more reliable than enforcement by policy.
+</Claim>
+
+<Claim label="fact" source="spanner">
+Providing strong consistency across geographically distributed replicas requires bounded clock
+uncertainty and a commit wait, imposing latency on every commit. Systems that avoid needing it
+across regions avoid that cost entirely.
+</Claim>
+
+<Claim label="convention" source="ddia">
+Deriving searchable and analytical views from an authoritative operation log, asynchronously, is
+a standard approach to giving several access patterns their own optimised representation without
+compromising the source of truth.
+</Claim>
+
+<Claim label="recommendation" source="sre-book">
+State explicitly what the system does when each component is unavailable. A design without a
+failure section is a description of the happy path rather than an architecture.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Everything. This is the shape of a staff-level interview: an unfamiliar system, conflicting requirements, and a constraint that invalidates the obvious design."
+  depth="You are not expected to produce this in 45 minutes. You are expected to identify the primitives, find the conflict, make a defensible trade, and say what you are not building."
+  followUps={[
+    'Which requirement did you decide not to fully satisfy, and why?',
+    'What happens to an in-progress editing session when its node fails?',
+    'A customer demands global search across jurisdictions. What do you tell them?',
+    'What dominates the cost of this system?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Starting with the collaborative merge algorithm.',
+      why: 'It is the most interesting part and not the part that decides the architecture. Residency and permissions shape the whole system; the merge algorithm is contained within one component.',
+      instead:
+        'Identify what constrains the whole design first. Solve the interesting problem inside the structure that the constraints permit.',
+    },
+    {
+      mistake: 'Treating residency as a configuration flag.',
+      why: 'A system where data can move and is prevented from moving by policy is one misconfiguration away from a legal problem. Structural enforcement is the point.',
+      instead:
+        'Make it a partitioning decision. An organisation has a home region, and there is no code path that moves its data elsewhere.',
+    },
+    {
+      mistake: 'Caching permissions to make checks fast.',
+      why: 'The requirement says immediate. A long cache converts an immediate requirement into a delayed one silently, and permission staleness is a security property rather than a performance one.',
+      instead:
+        'A very short TTL with explicit invalidation on change, and state the resulting window plainly: seconds, not minutes.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['data-residency', 'multi-region', 'blast-radius']}
+  prompt="A customer with a strict residency requirement asks for their documents to be replicated to a second region for disaster recovery. What is the correct response?"
+  options={[
+    {
+      id: 'a',
+      text: 'Replicate to a second region and encrypt the data so it does not count as residing there',
+      implies: 'You are treating encryption as satisfying a location requirement.',
+      why: 'Residency requirements are generally about where data is stored and processed, not about whether it is readable. Encryption is a security control, and whether it satisfies a particular jurisdiction is a legal question rather than an engineering one — and not one to assume in the affirmative.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Provide redundancy within the jurisdiction — multiple zones or a second in-jurisdiction region — and state that cross-jurisdiction failover is not available',
+      implies: 'You are satisfying the durability requirement within the constraint rather than around it.',
+      why: 'Disaster recovery and residency are both satisfiable if redundancy stays inside the boundary. Most jurisdictions have more than one available location. Where they do not, the honest answer is that the availability ceiling is lower for that customer, and they should know that.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Explain that residency and disaster recovery are incompatible',
+      implies: 'You are treating the constraint as absolute.',
+      why: 'Too pessimistic. Redundancy within a jurisdiction usually satisfies both, and declining to offer it means losing the customer for a reason that was not real.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer distinguishes durability from availability: backups within the jurisdiction protect against data loss, while surviving a total regional failure requires a second location in the same jurisdiction — and if none exists, the availability target for that customer is genuinely lower and belongs in their contract rather than in a hopeful design."
+/>
+
+<TransferCheck
+  concepts={['hot-key', 'exactly-once', 'idempotency', 'partition-key', 'load-shedding']}
+  system="A national electricity grid operator runs a system for demand response. Around 400,000 domestic batteries and heat pumps are enrolled. When the grid is short of capacity, the operator sends a signal and enrolled devices reduce consumption within seconds. Devices confirm they acted, and households are paid per event based on the reduction they delivered. Signals go out perhaps forty times a year, almost always within the same two evening hours, and a device that acts twice on one signal is paid twice."
+  prompt="You have never designed this. Which problems that you have already seen is it made of?"
+  options={[
+    {
+      id: 'a',
+      text: 'Extreme concentration on a rare event, fan-out to a large device population, and effect-once with money attached — payment keyed by signal and device, not by message received.',
+      implies: 'You are matching on load shape and settlement semantics rather than on the domain.',
+      why: 'Forty events a year in a two-hour window means the system is idle almost always and must work perfectly during a few minutes a year, so capacity follows the peak and the peak cannot be discovered in production. The dispatch is a fan-out to 400,000 endpoints on unreliable consumer connections, which means at-least-once delivery and duplicate confirmations. And the payment is settled per signal per device, so the natural key makes a repeated confirmation a no-op rather than a second payment.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'A time-series ingest problem, since every device reports consumption continuously.',
+      implies: 'You are matching on the telemetry rather than on the event.',
+      why: 'Telemetry from 400,000 devices is real and is the easy half — a well-understood ingest and rollup problem with modest volume. What makes this system hard is the forty moments a year when a signal must reach every device within seconds and be settled exactly once, and none of that is a time-series problem.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'A real-time messaging problem: hold a connection to every device so signals can be pushed instantly.',
+      implies: 'You are identifying the delivery requirement.',
+      why: 'The latency requirement is real and push is the likely answer, so this is a genuine part of the design — along with the reconnect behaviour of 400,000 devices after any network event. It stops short of the two properties that decide whether the system is correct: the concentration of load, and settlement that must not double-pay.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names what it would clarify, because two answers change the shape entirely. First, what happens when a device cannot be reached — if the operator is contractually committed to a megawatt reduction, undelivered signals are a shortfall someone must cover, which turns delivery into a settlement problem rather than a best-effort one. Second, whether the device or the operator computes the reduction, because a device-reported number that determines a payment is an input from an untrusted party and needs reconciliation against metering. It also observes that a system exercised forty times a year has no organic testing, so the rehearsal schedule is a design requirement rather than an operational preference."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Derived data and operation logs', sourceId: 'ddia' },
+    { label: 'The cost of global strong consistency', sourceId: 'spanner' },
+    { label: 'Residency and regional topology as architectural constraints', sourceId: 'aws-well-architected' },
+    {
+      label: 'Practise the derivation under pressure',
+      href: '/interview',
+      note: 'A scripted interviewer that escalates, on smaller problems than this one.',
+    },
+  ]}
+/>

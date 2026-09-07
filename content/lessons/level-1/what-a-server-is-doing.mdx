@@ -1,0 +1,419 @@
+---
+id: what-a-server-is-doing
+title: What a Server Is Actually Doing
+level: 1
+module: l1-anatomy
+order: 1
+summary: A server is a queue with some CPUs attached. Once you see it that way, most performance behaviour stops being mysterious.
+difficulty: intro
+minutes: 24
+prerequisites: [tcp, connection-pooling]
+concepts: [littles-law, bottleneck, connection-pooling, throughput, maintainability]
+unlocks: [horizontal-scaling, backpressure, connection-exhaustion]
+failures: [pool-exhaustion]
+sources: [ostep, brendan-gregg, sre-book]
+status: reviewed
+---
+
+## The problem
+
+Your service handles 1,000 requests per second comfortably. You push it to 1,200 and latency
+goes from 40 ms to 900 ms. Not 20% worse. Twenty times worse.
+
+CPU is at 70%. Memory is fine. The database is not complaining. Nothing is at 100% of
+anything, and yet the service has clearly fallen off a cliff.
+
+This is the most important non-obvious behaviour in systems, and it is not about your code. It
+is about queueing.
+
+## Intuition
+
+Picture a coffee shop with one barista.
+
+Customers arrive at some rate. Each drink takes some time to make. As long as customers arrive
+slower than the barista can serve them, there is no queue and everyone waits only for their
+own drink.
+
+Now customers arrive slightly faster than the barista can serve. The queue does not grow
+slightly. It grows without limit, and the wait for the last person in line grows with it. The
+barista is not working any slower; they are simply not the fastest thing in the room any more.
+
+And here is the part that surprises people: the trouble starts well *before* the barista is
+saturated. Arrivals are not evenly spaced. Bursts happen. Each burst leaves a queue that has
+to drain before the next one arrives, and the closer you are to capacity, the longer draining
+takes. Somewhere around 70-80% utilisation, waiting time starts rising steeply, and past that
+it goes vertical.
+
+**A server is a queue with some CPUs attached.** Everything else in this lesson follows.
+
+## Concretely
+
+<Example title="Where a request actually waits">
+
+A single request touches several queues, and only one of them is the CPU:
+
+1. **The accept queue.** The connection has arrived but no worker has picked it up yet. If
+   this is full, new connections are refused or silently dropped.
+2. **The worker pool.** Threads, processes, or event-loop tasks. If all workers are busy, the
+   request waits here.
+3. **The connection pool** to the database. If all connections are checked out, the request
+   waits here.
+4. **The database's own queues**, which are the same three problems again, one layer down.
+5. **The CPU run queue**, if there are more runnable threads than cores.
+
+When a service &ldquo;gets slow&rdquo;, it is almost always waiting in one of these, and
+almost never executing slower instructions. The diagnostic question is not &ldquo;what is my
+code doing?&rdquo; but &ldquo;which queue is it sitting in?&rdquo;
+
+</Example>
+
+## Formal explanation
+
+<C id="littles-law">Little's law</C> is the most useful piece of arithmetic in this entire
+curriculum, and it is one line:
+
+<Formula
+  expression="L = λ × W"
+  where={[
+    { symbol: 'L', meaning: 'average number of requests in the system at once (concurrency)' },
+    { symbol: 'λ', meaning: 'arrival rate, requests per second' },
+    { symbol: 'W', meaning: 'average time a request spends in the system, in seconds' },
+  ]}
+/>
+
+It holds for any stable system, regardless of the arrival distribution or the service
+discipline. Three uses, in increasing order of importance:
+
+- **Sizing.** 500 requests per second at 200 ms each needs 100 concurrent workers. If you have
+  20, you have a bottleneck you can predict on paper.
+- **Diagnosis.** If concurrency is high but throughput is low, service time has risen. Find
+  out where.
+- **Prediction.** When a dependency slows, concurrency requirements rise proportionally, even
+  though nothing about the request rate changed. This is why a dependency's latency problem
+  becomes your availability problem.
+
+The second piece is the relationship between **utilisation and waiting time**. As a resource
+approaches full utilisation, queueing delay does not rise linearly — it rises sharply, because
+there is progressively less idle time available to absorb variability. This is why systems run
+comfortably at 60% and fall apart at 85%, and why <C id="capacity-headroom">headroom</C> is
+not waste.
+
+<Deeper title="Why the knee is not at 100%">
+
+If arrivals were perfectly evenly spaced and every request took exactly the same time, you
+could run at 99% utilisation with a queue of essentially zero. Nothing real behaves like that.
+
+Real arrivals are bursty and real service times vary. Every burst creates a temporary queue,
+and that queue drains using whatever spare capacity exists. At 50% utilisation there is a lot
+of spare capacity, so queues drain quickly. At 90% there is very little, so each burst takes
+much longer to clear, and the next burst arrives before the previous one has drained.
+
+The practical rule most teams converge on is to target something in the region of 60-70%
+utilisation for latency-sensitive services, with the exact figure depending on how bursty the
+traffic is and how much variance there is in service time.
+
+<Claim label="convention" source="sre-book">
+Deliberately maintaining capacity headroom, rather than running resources near saturation, is
+standard practice for latency-sensitive services. The reason is the non-linear relationship
+between utilisation and queueing delay, not conservatism about failure.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Every box here is a queue. The CPU is only one of them."
+  columns={[
+    { title: 'Arrival', nodes: [{ id: 'accept', label: 'Accept queue', note: 'connections waiting' }] },
+    { title: 'Concurrency', nodes: [{ id: 'workers', label: 'Worker pool', note: 'bounded', tone: 'accent' }] },
+    { title: 'Compute', nodes: [{ id: 'cpu', label: 'CPU run queue' }] },
+    { title: 'Downstream', nodes: [{ id: 'pool', label: 'DB conn pool', note: 'bounded' }, { id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'accept', to: 'workers', label: 'accepted' },
+    { from: 'workers', to: 'cpu', label: 'runnable' },
+    { from: 'workers', to: 'pool', label: 'query' },
+    { from: 'pool', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'The mental model',
+      show: ['workers', 'cpu'],
+      because:
+        'Most people picture a server as workers running code on CPUs. That model explains none of the interesting behaviour.',
+    },
+    {
+      label: 'The real one',
+      show: ['accept', 'workers', 'cpu', 'pool', 'db'],
+      because:
+        'Four bounded queues in series. A request can wait in any of them, and which one it waits in determines what the fix is. Adding CPUs helps with exactly one.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '40% utilisation',
+      behaviour: 'Queues are essentially empty. Latency equals service time. Life is good.',
+      firstToBreak: 'Nothing. Also the point at which nobody is monitoring utilisation.',
+    },
+    {
+      scale: '70% utilisation',
+      behaviour:
+        'Bursts produce visible queueing. p50 is unchanged, p99 starts climbing. This is the early warning.',
+      firstToBreak: 'The tail, quietly. Averages still look fine.',
+    },
+    {
+      scale: '85% utilisation',
+      behaviour:
+        'Queueing delay is now a large fraction of total latency. Small increases in load produce large increases in latency.',
+      firstToBreak: 'Latency objectives, well before any resource shows as saturated.',
+    },
+    {
+      scale: 'Over 100% of some resource',
+      behaviour:
+        'The queue grows without bound. Latency rises until something times out, and then it is a memory problem too.',
+      firstToBreak:
+        'Whatever holds the queue: memory, connections, file descriptors. Then everything downstream of it.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'The bottleneck is not where anyone is looking',
+      symptom:
+        'Latency is bad, CPU and memory are comfortable, and the database reports normal query times.',
+      cause:
+        'The wait is in a bounded pool — workers or connections — which is invisible in system metrics and usually not instrumented.',
+      mitigation:
+        'Instrument every bounded resource with utilisation and wait time. Pool metrics are the single most commonly missing signal in production services.',
+    },
+    {
+      what: 'Unbounded queue instead of backpressure',
+      symptom:
+        'Under load, memory grows steadily and latency rises until requests exceed every timeout. The service does not reject anything; it just stops being useful.',
+      cause:
+        'Accepting work with no limit converts an overload problem into a latency problem, then into a memory problem.',
+      mitigation:
+        'Bound every queue. Reject when the bound is reached, and reject quickly — a fast rejection is far more useful to a caller than a slow success.',
+    },
+    {
+      what: 'Blocking work on an event loop',
+      symptom:
+        'Throughput collapses on a runtime that is supposed to handle high concurrency. CPU is at 100% on one core while others idle.',
+      cause:
+        'A synchronous or CPU-heavy operation on a single-threaded event loop blocks every other in-flight request.',
+      mitigation:
+        'Move blocking and CPU-bound work to a separate pool. Understand which concurrency model your runtime actually uses before sizing anything.',
+    },
+    {
+      what: 'Thread pool sized by guesswork',
+      symptom:
+        'More threads make things slower rather than faster; context switching becomes visible in profiles.',
+      cause:
+        'For CPU-bound work, more threads than cores adds switching overhead without adding capacity. For I/O-bound work, too few threads leaves the CPU idle while everything waits.',
+      mitigation:
+        "Size from Little's law using measured service time, and distinguish CPU-bound from I/O-bound work rather than using one pool for both.",
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Bound the worker pool and reject work above the limit, rather than accepting everything"
+  options={[
+    'Unbounded: accept every request and let queues grow',
+    'Bounded with a queue: accept up to a limit, queue a little, reject beyond',
+    'Bounded with no queue: reject immediately once workers are busy',
+  ]}
+  why="Concurrency is the resource that actually runs out. Bounding it makes the limit explicit and turns overload into a fast, visible rejection instead of a slow, invisible degradation that eventually consumes memory."
+  gain="Latency stays predictable for the requests you accept. Failures are fast and visible, which lets callers retry elsewhere or degrade. You also protect downstream dependencies from receiving more concurrency than they can absorb."
+  sacrifice="You reject work you might have completed. During a brief burst, a bound that is slightly too tight turns a small latency spike into visible errors."
+  failureModes={[
+    'Bound too low: you shed load that the system could have served',
+    'Queue too deep: requests complete after the caller has already given up, which is wasted work',
+    'Rejection without a retry-after or a clear status: callers hammer you harder',
+  ]}
+  operationalBurden="Low to implement, moderate to tune. It needs a measured service time to size correctly, and it needs revisiting whenever the dependency profile changes."
+  cost="No infrastructure cost. The real cost is the conversation about which requests are worth rejecting, which is a product decision as much as a technical one."
+  whenNot="For internal batch work where latency does not matter and completion does, a deep queue is exactly right — the whole point is to absorb bursts and work through them. Bounding aggressively there discards work for no benefit."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="brendan-gregg">
+The USE method — for every resource, check utilisation, saturation and errors — is a standard
+approach to performance investigation precisely because saturation is often visible before
+utilisation reaches its limit. Queue length is a saturation signal.
+</Claim>
+
+<Claim label="recommendation">
+Instrument four numbers for every bounded resource: current usage, limit, wait time, and
+rejections. Most production services have the first two and neither of the last two, which
+means the failure described in this lesson is invisible until a user complains.
+</Claim>
+
+<Claim label="fact" source="ostep">
+Concurrency models differ fundamentally in how they use CPUs and memory: thread per request,
+event loops, and hybrid models make different trade-offs between memory per connection and
+susceptibility to blocking operations. The choice determines what "too many concurrent
+requests" means for your service.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can find a bottleneck from symptoms, and whether you understand that resources saturate before they hit 100%. This is the foundation of every later conversation about backpressure, load shedding and cascading failure."
+  depth="Know Little's law and be able to apply it out loud. Know that latency rises non-linearly with utilisation. You do not need queueing theory beyond that."
+  followUps={[
+    'Latency is bad, CPU is at 30%. Where do you look?',
+    'How many worker threads should this service have?',
+    'Why does the p99 get worse before the p50 does?',
+    'A dependency slows from 20 ms to 200 ms. What happens to your service, and why?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'CPU is only at 60%, so we have plenty of headroom.',
+      why: 'Utilisation of one resource says nothing about the others, and 60% is already inside the region where queueing delay becomes material for bursty traffic.',
+      instead:
+        'Check every bounded resource, especially pools. Then look at saturation signals — queue depth and wait time — rather than utilisation alone.',
+    },
+    {
+      mistake: 'We increased the thread pool and it got slower.',
+      why: 'For CPU-bound work, more threads than cores adds context switching without adding capacity. For I/O-bound work, more threads push more concurrency at a dependency that may already be the bottleneck.',
+      instead:
+        'Identify the actual bottleneck first. If it is downstream, the correct move is usually fewer concurrent requests, not more.',
+    },
+    {
+      mistake: 'We will handle load spikes by queueing them.',
+      why: 'A queue absorbs a burst; it cannot absorb a sustained arrival rate above your service rate. In that case it converts an overload into a latency problem and then a memory problem, and every request that eventually completes has already been abandoned by its caller.',
+      instead:
+        'Queue for bursts, shed for sustained overload. Be explicit about which one you are designing for.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<EstimateCheck
+  concepts={['littles-law']}
+  prompt="Your service receives 800 requests per second. Each request spends an average of 250 ms in the system. How many requests are in flight at any moment?"
+  unit="concurrent requests"
+  answer={200}
+  tolerance={0.2}
+  derivation={[
+    "Little's law: L = λ × W.",
+    'λ = 800 requests per second, W = 0.25 seconds.',
+    'L = 800 × 0.25 = 200 concurrent requests.',
+    'So you need at least 200 workers, and at least 200 connections if each request holds one for its whole duration.',
+    'If service time doubles to 500 ms, the requirement doubles to 400, with no change in traffic.',
+  ]}
+  stronger="A stronger answer notes the second-order consequence: because concurrency scales with service time, a dependency getting slower silently increases your resource requirements. That is the mechanism by which someone else's latency problem becomes your outage."
+/>
+
+<Check
+  concepts={['bottleneck', 'capacity-headroom']}
+  prompt="Traffic rises 20% and p99 latency rises 15-fold. CPU is at 75%, memory is at 40%, the database reports unchanged query latency. What is the most likely explanation?"
+  options={[
+    {
+      id: 'a',
+      text: 'The database is lying and is actually the bottleneck',
+      implies: 'You distrust the downstream metric.',
+      why: 'Possible but not the first hypothesis. If the database reports unchanged per-query latency, queries are not slower; the time is being spent before a query is issued.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'A bounded resource is saturating and requests are queueing for it',
+      implies: 'You recognise the non-linear signature of queueing rather than of slower work.',
+      why: 'A 15-fold latency increase from a 20% traffic increase is the shape of a queue, not of slower execution. Something bounded — worker threads, connections, or a lock — is now the limiting resource, and requests are waiting for it rather than doing work.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The extra 20% of requests are more expensive than average',
+      implies: 'You are looking for a change in the workload mix.',
+      why: 'Worth checking, and occasionally the answer. But it would not usually produce a 15-fold change at the tail; that non-linearity is characteristic of queueing near saturation.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names what to measure next: pool utilisation and acquisition wait time, queue depth at each stage, and whether the increase is concentrated in one endpoint. It also notes that 75% CPU is already inside the region where variability produces queueing, so CPU may well be the bottleneck despite not being at 100%."
+/>
+
+<BottleneckCheck
+  concepts={['littles-law', 'bottleneck', 'throughput']}
+  prompt="One machine serving an API. Throughput has plateaued at 1,100 requests per second and will not rise however much traffic you send. Which line explains the ceiling?"
+  resources={[
+    { component: 'CPU', measured: '61% across 8 cores', capacity: '8 cores', note: 'Steady, not climbing' },
+    { component: 'Memory', measured: '3.2 GB resident', capacity: '16 GB', note: 'Flat' },
+    { component: 'Worker threads', measured: '64 busy, 0 idle', capacity: '64', note: 'Average request holds one for 58 ms' },
+    { component: 'Disk', measured: '180 IOPS', capacity: '20,000 IOPS', note: 'Almost idle' },
+    { component: 'Outbound calls', measured: 'p50 42 ms, p99 51 ms', capacity: '—', note: 'Downstream is healthy' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'The worker pool. 64 workers holding a request for 58 ms each is about 1,100 per second, which is exactly the plateau.',
+      implies: 'You are converting concurrency and service time into a throughput ceiling rather than reading utilisation percentages.',
+      why: 'Little’s law does the whole job here: concurrency divided by service time is 64 / 0.058, which is 1,103 per second. The number matches the plateau, so the ceiling is explained rather than guessed. CPU sits at 61% because most of that 58 ms is waiting on a downstream call, not computing.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'CPU, since 61% is the highest utilisation on the list.',
+      implies: 'You are picking the largest percentage.',
+      why: 'It is the largest number and it has 39% of headroom, which means it cannot be what stops throughput rising. Highest utilisation and binding constraint are different things, and only one of them explains a plateau.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'The downstream dependency, because 42 ms of the 58 ms is spent waiting on it.',
+      implies: 'You are following the time rather than the concurrency.',
+      why: 'Correct about where the time goes, and the dependency is healthy and could serve far more. It sets the service time, and the ceiling is service time combined with the worker count. Raising downstream capacity changes nothing while 64 workers is the limit.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer says what changes if you raise the worker count, and does not assume it helps. More workers means more concurrent downstream calls, so the ceiling moves to whatever the dependency or the connection pool can sustain — and if most of the 58 ms is waiting rather than computing, the machine can support far more workers than cores. It also notes the shape of the correct fix: reduce service time, or raise concurrency, and the arithmetic tells you which one is available."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    {
+      label: 'Concurrency models: threads, events, and what each costs',
+      sourceId: 'ostep',
+    },
+    {
+      label: 'The USE method for finding a bottleneck systematically',
+      sourceId: 'brendan-gregg',
+      note: 'Utilisation, saturation, errors — applied to every resource in turn. Saturation is the one people skip.',
+    },
+    {
+      label: "Little's law as a design tool",
+      href: '/concepts/littles-law',
+    },
+    {
+      label: 'Next: backpressure, which is what you do when the queue is the problem',
+      href: '/concepts/backpressure',
+    },
+  ]}
+/>

@@ -1,0 +1,132 @@
+---
+id: pool-exhaustion
+title: Everything Is Slow and the CPU Is Idle
+symptom: Latency is terrible across every endpoint, error rates climb, and every resource graph looks healthy.
+category: latency
+concepts: [connection-exhaustion, connection-pooling, littles-law, timeout, queue-depth, bulkhead, cascading-failure, backpressure]
+sources: [brendan-gregg, aws-timeouts, ostep, sre-book]
+status: reviewed
+---
+
+## What you see
+
+**11:15** — p99 latency on the orders API goes from 120 ms to 9 seconds. Every endpoint, not just
+the ones you would expect.
+
+The dashboards:
+
+- CPU: **22%.**
+- Memory: **40%.**
+- Database CPU: **31%**, query latency unchanged at 4 ms.
+- Network: nothing unusual.
+- Disk: nothing unusual.
+
+Nothing is saturated. Everything is slow. The team spends 40 minutes looking for a resource that
+is exhausted and cannot find one, because the exhausted resource is not on any of these graphs.
+
+## The mechanism
+
+The service holds a pool of 25 database connections per instance. A request checks one out, runs
+its queries, and returns it.
+
+Little's law gives the concurrency requirement:
+
+<Formula
+  expression="L = λ × W"
+  where={[
+    { symbol: 'λ', meaning: 'arrival rate: 400 requests per second' },
+    { symbol: 'W', meaning: 'time each request holds a connection' },
+    { symbol: 'L', meaning: 'connections needed concurrently' },
+  ]}
+/>
+
+**Normally:** each request holds a connection for 20 ms. L = 400 × 0.02 = **8 connections.** The
+pool of 25 is comfortable.
+
+**Then one query gets slower** — a plan change after a statistics update, taking 400 ms instead
+of 20 ms. Nothing else changed. Traffic is identical.
+
+**Now:** L = 400 × 0.4 = **160 connections needed.** The pool has 25.
+
+The other 135 requests wait for a connection. That wait is not database time, not CPU time, and
+not visible in any dashboard the team was looking at. It is queueing inside the application
+process for a bounded resource that nobody instrumented.
+
+<Claim label="inference">
+This is why the signature is high latency with low utilisation everywhere. The system is not
+doing more work; it is waiting for permission to start. The bottleneck is a bounded pool, and
+pools are the most commonly uninstrumented resource in production services.
+</Claim>
+
+It also explains why *every* endpoint is slow, including ones that never run the slow query: they
+need a connection too, and the pool is full of requests waiting on the slow one.
+
+## Why the obvious fixes make it worse
+
+**Increasing the pool size.** Tempting, and it pushes more concurrent queries at a database that
+is already slower than it was. If the database is the constraint, this deepens the problem — and
+it multiplies across instances, so a fleet of 50 instances raising pools from 25 to 100 takes the
+database from 1,250 to 5,000 connections.
+
+**Adding application instances.** Each brings its own pool, so total concurrency against the
+database rises. Same failure, larger.
+
+**Restarting instances.** Clears the queue momentarily. It refills in seconds, because the cause
+is still there.
+
+## What actually works
+
+**Find the resource that is actually bounded.** The diagnostic question is not "what is
+saturated?" but "what is everything waiting for?" Candidates, in the order they usually turn out
+to be responsible:
+
+1. Connection pool slots.
+2. Worker threads or event-loop capacity.
+3. A downstream service's response time.
+4. A lock in application code.
+5. File descriptors.
+
+**Then fix the cause, not the symptom.** Here the cause was a query plan change. Restoring the
+plan — by refreshing statistics — returned service time to 20 ms, and the concurrency requirement
+returned to 8.
+
+## How to prevent it
+
+**Instrument every bounded resource with four numbers:** current usage, limit, **wait time**, and
+rejections. Most services have the first two. The third is what makes this failure visible, and
+it is almost always missing.
+
+**Set an acquisition timeout.** Without one, the queue for the pool is unbounded, so the bound
+you configured did not actually bound anything — it moved the queue rather than limiting it.
+
+**Set a query timeout.** A query that runs for 400 ms instead of 20 ms should be cancelled if the
+caller's budget does not allow it. A slow query that nobody is waiting for is pure waste.
+
+**Bulkhead by dependency.** Separate pools mean one slow dependency exhausts its own compartment
+rather than starving unrelated endpoints.
+
+**Alert on per-statement latency**, not only on aggregate database latency. A single query going
+from 20 ms to 400 ms is invisible in an average across thousands of fast queries.
+
+## How to detect it early
+
+- **Pool wait time** rising while pool utilisation approaches 100%. This is the direct signal and
+  it precedes user-visible latency.
+- **Concurrency versus throughput.** If in-flight requests rise while completions do not, service
+  time has increased. That is Little's law read backwards, and it is a reliable early warning.
+- **The absence of saturation.** When latency is bad and no system resource is busy, stop looking
+  at system resources. The bottleneck is a bounded queue in your own process.
+
+## Related
+
+<Claim label="convention" source="brendan-gregg">
+The USE method examines utilisation, saturation and errors for every resource. Saturation — the
+degree to which work is queued — is the signal most often absent from dashboards, and it is the
+one that reveals this failure.
+</Claim>
+
+<Claim label="recommendation" source="aws-timeouts">
+Timeouts derived from the caller's latency budget bound how long a request may hold resources.
+Without them, a dependency's latency increase translates directly into a concurrency increase on
+the caller.
+</Claim>

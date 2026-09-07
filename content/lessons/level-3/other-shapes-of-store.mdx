@@ -1,0 +1,413 @@
+---
+id: other-shapes-of-store
+title: When a Relational Database Is the Wrong Tool
+level: 3
+module: l3-specialised
+order: 1
+summary: Search, analytics, time series and large objects each have an access pattern a row store serves badly. Knowing which four, and why, is the decision.
+difficulty: core
+minutes: 26
+prerequisites: [how-a-database-stores-things, oltp]
+concepts: [olap, columnar-storage, inverted-index, tokenisation, relevance-ranking, time-series-storage, object-storage, large-object, downsampling, cardinality]
+unlocks: [inverted-index, cdc, denormalisation]
+sources: [elasticsearch-docs, clickhouse-docs, ddia, mapreduce]
+status: reviewed
+---
+
+## The problem
+
+Everything is in PostgreSQL and it has been fine. Then four requests arrive in the same
+quarter:
+
+- &ldquo;Users should be able to search descriptions, with typo tolerance and results ranked by
+  relevance.&rdquo;
+- &ldquo;The analytics team needs revenue by region by month for the last three years.&rdquo;
+- &ldquo;We want per-second latency metrics for every endpoint, kept for a year.&rdquo;
+- &ldquo;Users can upload videos.&rdquo;
+
+You can implement all four in a relational database. Three of them will be slow in ways that
+tuning cannot fix, and the fourth will be expensive in a way that surprises the finance team.
+
+Each is a different access pattern, and access patterns are what storage engines are shaped
+around.
+
+## Intuition
+
+A general-purpose relational database is optimised for a specific shape of work: **fetch or
+modify a small number of rows, identified precisely, with strong guarantees.** It is
+extraordinarily good at this, which is why it should be the default.
+
+The four requests above are each a different shape:
+
+- **Search** wants &ldquo;which documents contain roughly these words, ranked by how well they
+  match&rdquo;. A row store can find exact values, not rank fuzzy ones.
+- **Analytics** wants &ldquo;scan a billion rows, read three columns, aggregate&rdquo;. A row
+  store must read whole rows to get three columns.
+- **Time series** wants &ldquo;append constantly, query recent ranges, summarise old data,
+  discard eventually&rdquo;. Everything about it is append-and-expire.
+- **Large objects** want bytes moved directly between client and storage, never through your
+  application or your database.
+
+Each specialised store is a general-purpose engine that gave something up — usually
+transactions, sometimes freshness, always flexibility — to be much better at one shape.
+
+## Concretely
+
+<Example title="Why a column store is not just a faster row store">
+
+Query: `SELECT region, SUM(amount) FROM orders WHERE year = 2024 GROUP BY region` over 500
+million rows with 40 columns each.
+
+**Row storage.** Rows are stored together, so reading `region` and `amount` requires reading
+every row's full 400-ish bytes. That is roughly 200 GB read from disk to use maybe 12 GB of it.
+
+**Column storage.** Each column is stored separately, so the query reads only the `region`,
+`amount` and `year` columns — perhaps 6 GB. Those columns also compress far better, because
+adjacent values in a column are similar: a region column has few distinct values and compresses
+enormously.
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage reads only the columns a query references and compresses each column
+independently, which is what gives analytical databases their advantage on scan-heavy
+aggregate queries.
+</Claim>
+
+This is not tuning. It is a different physical layout, and it is why running analytics on your
+transactional primary is the classic way to take down production with a report.
+
+</Example>
+
+## Formal explanation
+
+**Search.** An <C id="inverted-index" /> maps each term to the documents containing it, so
+&ldquo;find documents containing these words&rdquo; is a set intersection rather than a scan.
+<C id="tokenisation">Analysis</C> — lowercasing, stemming, removing stop words — must be applied
+identically at index time and query time, or matches silently fail.
+<C id="relevance-ranking">Ranking</C> is the actual product: matching is easy, ordering the
+matches so the right one is first is the hard part. Search indexes are derived data, updated
+asynchronously, and therefore eventually consistent with the source of truth.
+
+**Analytics.** <C id="olap" /> workloads are few enormous queries touching many rows and few
+columns. <C id="columnar-storage">Columnar storage</C> plus compression is the answer, and it
+comes with a cost: point updates are expensive, so these systems are append-oriented and often
+have weaker transactional guarantees.
+
+**Time series.** <C id="time-series-storage" /> is append-heavy, time-ordered, and queried
+mostly over recent ranges. The distinctive failure is <C id="cardinality" />: every distinct
+combination of labels is a separate series, so putting a user ID in a metric label creates
+millions of series and the storage cost is unbounded. <C id="downsampling" /> and retention are
+mandatory rather than optional.
+
+**Large objects.** <C id="object-storage" /> holds whole immutable blobs addressed by key,
+cheaply and durably. The design rule is that <C id="large-object">bytes never pass through your
+application</C>: clients upload directly using a presigned URL and download via a CDN. Your
+database stores metadata and a key, never the bytes.
+
+<Callout kind="warn" title="Every specialised store is a second copy of your data">
+Which means a synchronisation problem, a consistency window, a reindexing procedure for when it
+drifts, and a second system to operate. Adding one is a real cost, and it should be justified by
+an access pattern the primary genuinely cannot serve — not by the pleasure of using the right
+tool.
+</Callout>
+
+<Deeper title="Keeping the copy in sync">
+
+Three ways to populate a derived store, in increasing order of robustness:
+
+**Dual write.** The application writes to both. Simple and wrong: a crash between the two
+leaves them permanently disagreeing, and nothing knows.
+
+**Application events.** The write path emits an event that a consumer applies to the derived
+store. Better, and it still has the dual-write problem between the database commit and the
+event publish — which the <C id="outbox">transactional outbox</C> solves by writing the event
+into the same database in the same transaction.
+
+**<C id="cdc">Change data capture</C>.** Read the database's own replication log and derive
+updates from it. The write path needs no knowledge of the derived store at all, and the log is
+already an ordered record of committed truth. More machinery, and clearly the most robust.
+
+Whichever you choose, you need a **reindex procedure**, because the derived store will drift.
+Bugs, outages and schema changes all cause it. A system whose search index cannot be rebuilt
+from source is one bad deploy away from being permanently wrong.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="One source of truth, several derived views, each shaped for one access pattern."
+  columns={[
+    { title: 'Writes', nodes: [{ id: 'app', label: 'Application' }] },
+    { title: 'Truth', nodes: [{ id: 'db', label: 'Primary database', note: 'source of truth', tone: 'accent' }] },
+    { title: 'Propagation', nodes: [{ id: 'cdc', label: 'Change stream', note: 'CDC or outbox' }] },
+    { title: 'Derived', nodes: [{ id: 'search', label: 'Search index' }, { id: 'olap', label: 'Analytics store' }, { id: 'ts', label: 'Metrics store' }] },
+    { title: 'Bytes', nodes: [{ id: 'blob', label: 'Object storage', note: 'never via the app' }] },
+  ]}
+  edges={[
+    { from: 'app', to: 'db', label: 'writes' },
+    { from: 'db', to: 'cdc' },
+    { from: 'cdc', to: 'search' },
+    { from: 'cdc', to: 'olap' },
+    { from: 'app', to: 'ts', label: 'metrics' },
+    { from: 'app', to: 'blob', label: 'presigned URL' },
+  ]}
+  stages={[
+    {
+      label: 'One store',
+      show: ['app', 'db'],
+      because:
+        'The right default. One system, strong guarantees, one place to look. Most products never need more.',
+    },
+    {
+      label: 'Add a derived view',
+      show: ['app', 'db', 'cdc', 'search'],
+      because:
+        'Search needs a different structure entirely, so it becomes a derived copy fed from the source of truth. It is eventually consistent by construction.',
+    },
+    {
+      label: 'The full picture',
+      show: ['app', 'db', 'cdc', 'search', 'olap', 'ts', 'blob'],
+      because:
+        'Each store serves an access pattern the primary serves badly. The change stream keeps derived views current; large objects bypass the application entirely.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Small data',
+      behaviour:
+        'The relational database does all four jobs adequately. Full-text search on a small table is fine; a report scanning 100,000 rows is fine.',
+      firstToBreak: 'Nothing. Adding specialised stores here is premature.',
+    },
+    {
+      scale: 'Millions of rows',
+      behaviour:
+        'Analytical queries begin competing with transactional ones. Search quality, not speed, becomes the complaint.',
+      firstToBreak:
+        'Transactional latency during reports, and search relevance for real user queries.',
+    },
+    {
+      scale: 'Hundreds of millions',
+      behaviour:
+        'Scanning for aggregates is no longer viable on a row store. Search over that many documents needs a purpose-built index.',
+      firstToBreak: 'Analytics first, usually by taking the primary down with it.',
+    },
+    {
+      scale: 'High-volume telemetry',
+      behaviour:
+        'Metric cardinality drives cost, not volume. Retention becomes the dominant line item.',
+      firstToBreak:
+        'The observability budget, typically because someone added a high-cardinality label.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Analytics on the transactional primary',
+      symptom:
+        'User-facing latency degrades badly at predictable times, usually the start of the business day.',
+      cause:
+        'A large scan evicts the working set from the page cache and consumes I/O the transactional workload needs.',
+      mitigation:
+        'Run analytics against a replica at minimum, and against a purpose-built store when the scans grow. Never against the primary.',
+    },
+    {
+      what: 'Derived store drifts from the source',
+      symptom:
+        'Search results reference items that no longer exist, or new items never appear.',
+      cause:
+        'A failed sync, a dropped event, a schema change, or a bug in the consumer. Drift is guaranteed over a long enough period.',
+      mitigation:
+        'Build a reindex procedure before you need one, and run periodic reconciliation comparing counts and checksums between source and derived.',
+    },
+    {
+      what: 'Metric cardinality explosion',
+      symptom:
+        'Observability costs multiply, and the metrics system slows or starts dropping data.',
+      cause:
+        'A label with unbounded values — user ID, request ID, URL with parameters — creates one series per distinct value.',
+      mitigation:
+        'Enforce cardinality limits at ingest. High-cardinality context belongs in traces or logs, not in metric labels.',
+    },
+    {
+      what: 'Large files routed through the application',
+      symptom:
+        'Application memory spikes on upload, timeouts on large files, and bandwidth costs several times what was expected.',
+      cause:
+        'Bytes flowing client → application → storage, then storage → application → client, paying for the transfer twice and holding it in memory.',
+      mitigation:
+        'Presigned URLs for direct upload, CDN for download. The application handles metadata and authorisation only.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Add a dedicated search index rather than using the database's full-text features"
+  options={[
+    'Database full-text search: one system, transactional, always current',
+    'Dedicated search engine fed by change data capture',
+    'A managed search service',
+  ]}
+  why="Search is a ranking problem, not a matching problem. Purpose-built engines provide analysers, fuzzy matching, faceting and relevance tuning that a general-purpose database does not, and they scale the index independently of the transactional workload."
+  gain="Substantially better relevance, typo tolerance, autocomplete and faceted navigation. Search load no longer competes with transactional load. The index scales independently."
+  sacrifice="A second copy of the data, eventually consistent, with a synchronisation pipeline that can fail. Search results can reference deleted items, or omit new ones, for the length of the lag."
+  failureModes={[
+    'Sync pipeline failing silently, leaving the index quietly stale',
+    'Deleted content still appearing in results, which can be a privacy problem rather than a quality one',
+    'Reindexing under load competing with serving traffic',
+  ]}
+  operationalBurden="Significant. A cluster to run, shard and upgrade; a sync pipeline to monitor; a reindex procedure to maintain and rehearse. This is a second production system, not a library."
+  cost="Memory-hungry: search indexes want to be in RAM. Typically a meaningful line item, plus the engineering time for the pipeline."
+  whenNot="When the corpus is small and the queries are simple prefix or exact matches, database full-text search is adequate and keeps everything transactional and current. Adding a search cluster for a few thousand documents buys latency, a consistency window and an operational burden in exchange for relevance features nobody asked for."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="elasticsearch-docs">
+Search indexes are near-real-time rather than immediately consistent: documents become
+searchable after a refresh interval, which is a configurable trade between indexing throughput
+and search freshness.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage with per-column compression is what makes analytical scans efficient;
+the same design makes point updates expensive, which is why these systems are append-oriented.
+</Claim>
+
+<Claim label="fact" source="mapreduce">
+Large-scale batch processing over distributed data was one of the earliest specialised
+workloads to be separated from transactional systems, precisely because the access pattern —
+scan everything, aggregate — is incompatible with serving low-latency point queries.
+</Claim>
+
+<Claim label="recommendation">
+Keep one source of truth and treat everything else as derived. When a derived store disagrees
+with the primary, the primary wins and the derived store is rebuilt. A system with two
+authorities has no authority.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can match a store to an access pattern, and whether you acknowledge the synchronisation cost. Reaching for a specialised store without mentioning the consistency window is the tell."
+  depth="Know what each of the four is good at and what it gives up. Know that derived stores are eventually consistent and need a reindex path. Internals are not required unless you introduce them."
+  followUps={[
+    'How does the search index stay current, and what happens when it does not?',
+    'Why not run the analytics query on a read replica?',
+    'A user uploads a 2 GB video. Trace the bytes.',
+    'What makes a metrics system expensive?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will use the right tool for each job.',
+      why: 'Stated as a principle it sounds unarguable, and in practice it produces five databases, five sync pipelines and five on-call burdens for a team of eight. Every additional store has a fixed operational cost that is independent of how much data it holds.',
+      instead:
+        'Name the access pattern the primary cannot serve, and the threshold at which that becomes true. Then add one store, with a sync mechanism and a reindex procedure.',
+    },
+    {
+      mistake: 'The search index is the source of truth for search results.',
+      why: 'It is derived data. When it disagrees with the primary it is wrong, and if it cannot be rebuilt from the primary, a bad deploy can corrupt it permanently.',
+      instead:
+        'Keep one authority. Build and test the reindex path before you depend on the index.',
+    },
+    {
+      mistake: 'We store uploaded files in the database as blobs; it keeps everything transactional.',
+      why: 'It inflates backup size and duration, pushes the working set out of memory, and means every download consumes database and application capacity for bytes that should have been served by a CDN.',
+      instead:
+        'Store the bytes in object storage and the metadata in the database. Accept that the two can diverge, and reconcile: orphaned objects and rows pointing at missing objects are both normal and both need a cleanup job.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['olap', 'columnar-storage']}
+  prompt="An analytics query aggregating three columns over 500 million rows takes 40 minutes on your transactional database. Which change gives the largest improvement?"
+  options={[
+    {
+      id: 'a',
+      text: 'Add an index covering the three columns',
+      implies: 'You are treating this as a selectivity problem.',
+      why: 'A covering index does help — it avoids reading the full rows — and it is the right first move on a row store. But it is still row-structured, still poorly compressed for this access pattern, and it adds write cost to every insert on a table receiving 500 million rows.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'Move the query to a column-oriented store fed from the primary',
+      implies: 'You matched the physical layout to the access pattern.',
+      why: 'Reading three columns out of forty means reading roughly a tenth of the bytes, and columnar compression typically reduces that much further. It also removes the scan from the transactional system entirely, which protects user-facing latency.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Run it on a read replica',
+      implies: 'You are isolating the workload without changing its cost.',
+      why: 'An important and cheap first step — it protects the primary — and it does not make the query faster. The replica has the same row-oriented layout and does the same 200 GB of reading.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer sequences the moves by cost: replica first because it is nearly free and protects production, covering index second, dedicated analytical store when scan volume justifies a second system. It also names what the analytical store costs — a sync pipeline, a consistency window, and a second system to operate — so the decision is a trade rather than an upgrade."
+/>
+
+<Check
+  concepts={['cardinality', 'time-series-storage']}
+  prompt="Your metrics bill triples after a release. Traffic is unchanged. What is the most likely cause?"
+  options={[
+    {
+      id: 'a',
+      text: 'Someone increased the metric collection frequency',
+      implies: 'You are looking at sample rate.',
+      why: 'It would raise cost proportionally — doubling frequency doubles points — but tripling from a release usually points at something that multiplies rather than doubles.',
+      credit: 'partial',
+    },
+    {
+      id: 'b',
+      text: 'A new label with unbounded values was added, multiplying the number of distinct series',
+      implies: 'You recognise that cost in a metrics system scales with series count, not with request volume.',
+      why: 'Every distinct combination of label values is a separate stored series. Adding a user ID, request ID, or full URL as a label turns one series into millions, and each carries its own storage and indexing overhead regardless of how often it is written.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Retention was extended',
+      implies: 'You are looking at how long data is kept.',
+      why: 'Plausible and worth checking, and it would produce a gradual increase as the extra retention accumulates rather than an immediate tripling correlated with a release.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the correct home for high-cardinality data: identifiers belong in traces and logs, where they are stored once per event, not in metric labels where they multiply the series space. It also proposes a control — a cardinality limit enforced at ingest, with alerting on new label keys — because this is a mistake that recurs and is easier to prevent than to unwind."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Inverted indexes, analysers and near-real-time search', sourceId: 'elasticsearch-docs' },
+    { label: 'Columnar storage and analytical query execution', sourceId: 'clickhouse-docs' },
+    { label: 'Derived data and keeping systems in sync', sourceId: 'ddia' },
+    {
+      label: 'Next: coordination between machines that cannot agree on the time',
+      href: '/levels/4',
+    },
+  ]}
+/>

@@ -1,0 +1,396 @@
+---
+id: people-shape-architecture
+title: People Shape Architecture
+level: 8
+module: l8-organisation
+order: 1
+summary: Systems come to mirror the communication structure of the teams that build them. That is not a warning, it is a design input you can use deliberately.
+difficulty: staff
+minutes: 22
+prerequisites: [migrating-a-live-system]
+concepts: [service-boundary, coupling, microservices, modular-monolith, operational-burden, maintainability, tenant-isolation, blast-radius, cost]
+unlocks: [control-plane-vs-data-plane]
+sources: [building-microservices, fundamentals-arch, martin-fowler]
+status: reviewed
+---
+
+## The problem
+
+Two companies build the same product. One ships in three months, the other in eighteen. They
+have similar engineers and similar budgets.
+
+The difference is that in the first, one team owns the whole feature. In the second, the feature
+crosses four teams: one owns the API, one the database, one the front end, one the platform. Every
+change requires four backlogs to align.
+
+The architecture and the organisation are the same picture. If four teams must coordinate to ship
+one feature, the system will have four coupled components, and no amount of technical elegance
+fixes a coordination problem.
+
+## Intuition
+
+The observation is old and holds up well:
+
+<Claim label="convention" source="fundamentals-arch">
+Systems tend to reflect the communication structures of the organisations that build them, an
+observation commonly known as Conway's law. In practice it appears as service boundaries that
+follow team boundaries and interfaces that follow reporting lines.
+</Claim>
+
+Read one way it is a warning. Read the other way it is a tool: **if structure follows
+communication, choose the structure you want and organise for it.** This is sometimes called the
+inverse Conway manoeuvre, and it is why reorganisations and architecture changes are frequently
+the same project.
+
+The practical consequence for design:
+
+**A service boundary is a coordination boundary.** Two components in one deployable can change
+together in one commit. Two components in separate deployables owned by separate teams need a
+contract, a deprecation window, and two planning cycles.
+
+That is the real cost of splitting a service, and it is much larger than the network latency
+everyone discusses.
+
+## Concretely
+
+<Example title="The same change, two organisations">
+
+**Feature:** add a field to the checkout flow and show it in the order confirmation email.
+
+**One team owns checkout end to end:** one branch, one deploy, one afternoon. The database
+change, the API change, the front end and the email template ship together, tested together.
+
+**Four teams own the pieces:**
+
+1. Database team adds the column — next sprint, because they are working on something else.
+2. API team exposes it — the sprint after, because they were waiting for the column.
+3. Front-end team displays it — the sprint after that.
+4. Notifications team updates the email — they have a different roadmap and it is not on it.
+
+Same code, roughly. **Two days of work spread over three months**, with four planning
+conversations and a coordination cost that dwarfs the implementation.
+
+Neither organisation is badly run. The second has simply chosen boundaries that cut across the
+direction changes actually travel.
+
+</Example>
+
+## Formal explanation
+
+The useful question when drawing a boundary is not "is this a separate concern?" but
+**"do these change together?"**
+
+Two components that always change together should not be separated by a team boundary, because
+every change now needs coordination. Two components that change independently can be separated
+cheaply, and separating them buys deployment independence.
+
+This reframes the microservices decision:
+
+- **The technical argument** — independent scaling, isolation, technology choice — is usually
+  weak. A monolith scales by running more copies, and most services have similar scaling profiles.
+- **The organisational argument** — teams shipping without coordinating — is the real one, and it
+  only applies once you have enough teams to be blocking each other.
+
+<Callout kind="info" title="A useful rule of thumb">
+If two teams routinely need to coordinate a release, the boundary between them is in the wrong
+place — either move the boundary, or move the people. If one team owns both sides of a boundary,
+the split is buying you very little and costing you a network call.
+</Callout>
+
+The related idea is **cognitive load**: a team can only hold so much in its head. A boundary that
+gives each team a comprehensible domain is a good boundary regardless of the technical
+architecture. A team responsible for eleven services, each with its own data store, is not
+independent; it is overloaded.
+
+<Deeper title="Why platform teams become bottlenecks, and what to do about it">
+
+The common structure: a platform team owns infrastructure, and product teams request changes from
+them.
+
+This works while requests are rare, and becomes a bottleneck as soon as they are not. Every
+product team is blocked on one team's capacity, and that team is measured on stability, which
+makes them appropriately conservative about change.
+
+The failure is treating the platform team as a **service desk** rather than as a product team
+whose product is a self-service platform.
+
+The distinction in practice:
+
+- **Service desk:** product teams file tickets; the platform team makes changes. Throughput is
+  bounded by platform team headcount.
+- **Platform as product:** the platform team builds capabilities that product teams use directly,
+  without asking. Throughput is bounded by how good the capabilities are, which is a problem you
+  can invest in.
+
+The second scales; the first does not. The signal that you are in the first is that platform
+requests have a queue and product teams estimate around it.
+
+The same reasoning applies to any centralised function: database changes, security review, release
+approval. Each is either a self-service capability with guardrails, or a queue.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="The boundary in the diagram is a coordination boundary in the organisation."
+  columns={[
+    { title: 'Change', nodes: [{ id: 'feature', label: 'One feature', tone: 'accent' }] },
+    { title: 'Aligned', nodes: [{ id: 't1', label: 'Team A', note: 'owns the slice' }] },
+    { title: 'Misaligned', nodes: [{ id: 'db', label: 'Database team' }, { id: 'api', label: 'API team' }, { id: 'fe', label: 'Front-end team' }, { id: 'notif', label: 'Notifications team' }] },
+  ]}
+  edges={[
+    { from: 'feature', to: 't1', label: 'one deploy', tone: 'accent' },
+    { from: 'feature', to: 'db', label: 'sprint 1' },
+    { from: 'db', to: 'api', label: 'sprint 2' },
+    { from: 'api', to: 'fe', label: 'sprint 3' },
+    { from: 'fe', to: 'notif', label: 'someday', tone: 'danger' },
+  ]}
+  stages={[
+    {
+      label: 'Boundaries follow change',
+      show: ['feature', 't1'],
+      because:
+        'One team owns everything a typical change touches, so a change is one branch and one deploy. This is what "aligned boundaries" means in practice.',
+    },
+    {
+      label: 'Boundaries cut across change',
+      show: ['feature', 'db', 'api', 'fe', 'notif'],
+      because:
+        'The same change now crosses four teams and four backlogs. The implementation is unchanged; the calendar time is not, and no technical decision fixes it.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '1 team',
+      behaviour:
+        'Coordination is a conversation. A monolith is correct, and any split is pure overhead.',
+      firstToBreak: 'Nothing. Splitting here is a common and expensive mistake.',
+    },
+    {
+      scale: '3–5 teams',
+      behaviour:
+        'Release coordination becomes noticeable. Module boundaries inside one deployable usually still suffice.',
+      firstToBreak: 'Release cadence, as teams start waiting for each other.',
+    },
+    {
+      scale: '10+ teams',
+      behaviour:
+        'Deployment independence is genuinely valuable. Services start to earn their cost.',
+      firstToBreak:
+        'The shared deployment pipeline and the shared database, in that order.',
+    },
+    {
+      scale: '50+ teams',
+      behaviour:
+        'Platform capabilities must be self-service. Any centralised function becomes a queue.',
+      firstToBreak:
+        'Every centralised team: platform, security, database. Each becomes a bottleneck unless it becomes a product.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Boundaries drawn on technical layers',
+      symptom:
+        'Every feature crosses every team. Delivery is slow and no individual team is idle.',
+      cause:
+        'Teams organised by layer — database, API, front end — while changes travel vertically through all of them.',
+      mitigation:
+        'Organise teams around slices of the product that change together, so a typical change is owned end to end by one team.',
+    },
+    {
+      what: 'Services split before there are teams to own them',
+      symptom:
+        'Six engineers maintain eleven services. Nobody knows all of them and every incident needs several people.',
+      cause:
+        'The technical argument for splitting was applied without the organisational one.',
+      mitigation:
+        'One team should own several services, not the reverse. If a team cannot hold its services in its head, the split went too far.',
+    },
+    {
+      what: 'Platform team as a service desk',
+      symptom:
+        'Product teams estimate around a platform queue, and infrastructure changes take weeks.',
+      cause:
+        'The platform team makes changes on request rather than building self-service capabilities.',
+      mitigation:
+        'Treat the platform as a product with users. Measure it by how rarely product teams need to ask.',
+    },
+    {
+      what: 'A shared database across team boundaries',
+      symptom:
+        'Services are nominally independent and no schema change can be made without cross-team coordination.',
+      cause:
+        'The services were separated and the data was not, so the real coupling remains.',
+      mitigation:
+        'Data ownership must follow service ownership. A shared database is a shared deployment, whatever the service diagram says.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Draw service boundaries around teams and their change patterns, rather than around technical layers"
+  options={[
+    'Layered teams: database, backend, front end, platform',
+    'Vertical teams owning a product slice end to end',
+    'One team, one deployable, until coordination genuinely hurts',
+  ]}
+  why="Changes travel vertically through a system — a feature touches storage, logic and interface. Boundaries that cut across that direction turn every change into a coordination problem, which no technical decision can fix."
+  gain="Most changes are owned by one team and ship in one deploy. Ownership is clear during incidents. Teams can be measured on outcomes rather than on output, because they own a whole outcome."
+  sacrifice="Duplication across teams: each needs some front-end, data and operational capability. Specialists are spread thin rather than concentrated, and standards drift between teams."
+  failureModes={[
+    'Each team solves the same infrastructure problem slightly differently',
+    'Specialist knowledge — security, performance, data modelling — thins out',
+    'Boundaries drawn once and never revisited as the product changes',
+  ]}
+  operationalBurden="Each team must be able to operate what it owns, which means on-call, deployment and observability capability per team. That is a real investment and it is what makes ownership meaningful."
+  cost="Some duplicated capability, offset by removing coordination overhead — which is usually the larger number and is almost never measured."
+  whenNot="With a small number of engineers, vertical teams fragment scarce specialists for no gain, because coordination is a conversation rather than a process. And where deep expertise is genuinely scarce — cryptography, a specialised storage engine — a central team with strong self-service interfaces is better than expecting every team to acquire it."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="building-microservices">
+Service boundaries aligned to team ownership is presented as a primary consideration, with the
+organisational benefit — independent deployment without cross-team coordination — identified as
+the main justification for the technical cost.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+The relationship between organisational structure and system structure is well documented, along
+with the deliberate use of team design to shape architecture rather than treating the
+correspondence as an accident.
+</Claim>
+
+<Claim label="recommendation" source="fundamentals-arch">
+Architecture decisions have organisational consequences and vice versa, so the two should be
+designed together rather than sequentially. A boundary that no team owns will decay.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you understand that architecture is partly an organisational decision. Staff-level interviews frequently ask about team structure, and candidates who answer purely technically miss what is being probed."
+  depth="Be able to justify service boundaries in terms of who owns them and what changes together, not only in terms of scaling. Recognising when a technical problem is actually a coordination problem is the signal."
+  followUps={[
+    'How many teams will work on this, and where do the boundaries go?',
+    'Two teams need to change the same thing to ship a feature. What does that tell you?',
+    'When is a monolith the right answer for a 40-person engineering organisation?',
+    'Who owns this database?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We split into microservices to scale.',
+      why: 'Scaling means running more copies of something, which a monolith does perfectly well. What services buy is deployment independence, and that is only valuable when teams are blocking each other.',
+      instead:
+        'Justify the split organisationally: which teams are blocked on which, and what does independence let them do? If the answer is nobody, the split is cost without benefit.',
+    },
+    {
+      mistake: 'Each team owns a layer, so responsibilities are clear.',
+      why: 'Responsibilities are clear and every change crosses all of them. Clarity of ownership per component is worth much less than ownership of a whole change.',
+      instead:
+        'Give teams vertical slices. Ownership should be of outcomes, which means owning everything a typical change touches.',
+    },
+    {
+      mistake: 'The platform team will handle infrastructure requests.',
+      why: 'Every product team is now bounded by one team\'s capacity, and that team is measured on stability, which makes them appropriately reluctant to change things quickly.',
+      instead:
+        'Build self-service capabilities with guardrails. Measure the platform by how rarely anyone needs to file a ticket.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['service-boundary', 'coupling', 'microservices']}
+  prompt="Shipping one feature requires coordinated changes from three teams, every time. What does that tell you?"
+  options={[
+    {
+      id: 'a',
+      text: 'The teams need better communication and planning processes',
+      implies: 'You are treating the coordination cost as a process problem.',
+      why: 'Better process makes coordination smoother and does not remove it. If three teams must coordinate on every feature, the boundaries are cutting across the direction changes travel, and process improvements are treating a symptom.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'The boundaries are in the wrong place: either move the boundary, or move the people',
+      implies: 'You recognise the coordination cost as a structural signal about the boundary.',
+      why: 'A boundary that every change crosses is not providing independence — it is providing overhead. The two available fixes are to redraw the boundary so one team owns the whole slice, or to reorganise so the same team owns all three parts.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The system should be merged back into a monolith',
+      implies: 'You are proposing a technical remedy for a structural problem.',
+      why: 'It might follow, and it is not the conclusion by itself. If the three teams are genuinely independent in other respects, moving one boundary may be enough. Merging everything trades one problem for another.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer applies the test directly: things that change together should live together. It also proposes measuring it — count how many teams a typical change touches, over a quarter — so the boundary decision is made with evidence rather than with anecdote."
+/>
+
+<Check
+  concepts={['modular-monolith', 'operational-burden']}
+  prompt="A 40-person engineering organisation is deciding between a modular monolith and microservices. What is the deciding question?"
+  options={[
+    {
+      id: 'a',
+      text: 'What traffic volume do they expect?',
+      implies: 'You are treating this as a scaling decision.',
+      why: 'Scaling is the weakest argument in this decision. A monolith scales by running more copies, and 40 engineers can build something that handles very large traffic in a single deployable.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Are teams currently blocked on each other to release, and can each team operate what it would own?',
+      implies: 'You are asking about coordination cost and about whether ownership would be real.',
+      why: 'The first half is what services buy — deployment independence — so if nobody is blocked, there is nothing to purchase. The second half is what they cost: a team that cannot operate its services has not gained independence, it has gained an on-call burden.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Do they have the platform tooling to run many services?',
+      implies: 'You are asking about operational readiness.',
+      why: 'A necessary condition and not the deciding one. Excellent tooling makes services affordable; it does not make them worthwhile if no team is blocked.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer proposes the intermediate path: enforce module boundaries inside one deployable, so the seams exist and are testable, and extract a service only when a specific component has a genuine reason — different scaling, isolation, or a team that needs to ship independently. That preserves the option at a fraction of the cost of taking it early."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Service boundaries and team ownership', sourceId: 'building-microservices' },
+    { label: 'Organisational structure as an architecture input', sourceId: 'fundamentals-arch' },
+    { label: 'Conway’s law and the inverse manoeuvre', sourceId: 'martin-fowler' },
+    {
+      label: 'Next: the capstone, on a system nobody has shown you',
+      href: '/lessons/the-capstone',
+    },
+  ]}
+/>

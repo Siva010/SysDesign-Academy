@@ -1,0 +1,452 @@
+---
+id: when-the-shape-is-not-a-row
+title: When the Shape Is Not a Row
+level: 3
+module: l3-specialised
+order: 3
+summary: A B-tree answers two questions well and nothing else. Three common kinds of data cannot be phrased as either of them, and each needs a different structure.
+difficulty: advanced
+minutes: 27
+prerequisites: [how-a-database-stores-things, other-shapes-of-store]
+concepts: [block-storage, geospatial-index, chunking]
+unlocks: [large-object, object-storage, cdn, hot-partition, immutability]
+patterns: [read-through-edge]
+sources: [database-internals, ddia, postgres-docs, redis-docs, aws-well-architected, dropbox-tech]
+status: reviewed
+---
+
+## The problem
+
+A property listings site stores everything in one relational database, which is the correct
+default and works for two years.
+
+Then three complaints arrive in the same month, from three different people, and nobody connects
+them.
+
+The nightly backup now takes six hours and overlaps the morning traffic. The
+&ldquo;properties near me&rdquo; search times out for anyone in a city. And a surveyor on a
+mobile connection, annotating a 40 MB floor plan on site, waits four minutes to upload a change of
+two kilobytes.
+
+Three unrelated symptoms. One cause: the storage and the index were built to answer questions
+about rows identified by keys, and none of this data is a row identified by a key.
+
+## Intuition
+
+A B-tree is a sorted list with a fast way to find a position in it. That means it answers exactly
+two questions well:
+
+- **What is the row with this key?**
+- **What are the rows between these two keys?**
+
+Almost everything a relational database does quickly is one of those two wearing different
+clothes. A join is repeated lookups. An index scan is a range. A sort that uses an index is a walk.
+
+Three kinds of data cannot be expressed as either question, and no amount of indexing changes
+that:
+
+- **Data with two independent dimensions.** Sorting by one discards the other. There is no
+  ordering of a map that puts everything nearby next to each other, because a line has one
+  direction and a map has two.
+- **Data too large to be a value.** The index is irrelevant here. Whatever you do, the bytes have
+  to move, and they have to move through everything that touches the row — backups, replication,
+  the page cache.
+- **Data where the question is &ldquo;what changed?&rdquo;** A key identifies a version. It does
+  not tell you the difference between two versions, and computing that difference by comparing two
+  whole objects is exactly the work you were trying to avoid.
+
+The rest of this lesson is one structure for each.
+
+## Concretely
+
+<Example title="The three complaints, with their numbers">
+
+**The slow backup.** Floor plans are stored in a column on the listings table, averaging 40 MB.
+Ten thousand listings is 400 GB of blobs sitting in a table whose actual queryable data is about
+2 GB. Every backup copies all 400 GB. Every replica ships all 400 GB. Worst of all, the page cache
+is filled with bytes no query has ever looked at, so the 2 GB that *is* queried keeps being
+evicted.
+
+**The slow proximity search.** A 5 km box around a point in a city spans roughly 0.045 degrees of
+latitude and 0.06 of longitude. There is an index on each. The latitude index narrows the search
+to a band 5 km tall — stretching from the Atlantic to the Urals, about 2 million listings. The
+longitude index narrows to a strip 5 km wide from pole to pole, about 1.5 million. The planner
+picks one, reads millions of rows, and discards all but the two hundred that are in both.
+
+**The slow upload.** The surveyor's annotation changed 2 KB of a 40 MB file. The client has no way
+to say so, because the interface takes a file, so it sends 40 MB. On a mobile connection at
+1.5 Mb/s that is about four minutes for a change that would fit in a text message.
+
+</Example>
+
+## Formal explanation
+
+### Where the bytes live
+
+<C id="block-storage" /> is a virtual disk attached to one machine. It presents blocks, a
+filesystem sits on top, and you can modify any byte in place. Latency is low, semantics are
+familiar, and it inherits two properties from being a disk: it is **tied to one machine's failure
+domain**, and its capacity is **decided in advance**.
+
+Object storage is the opposite trade: whole immutable blobs addressed by key over HTTP,
+effectively unlimited, replicated across failure domains, with higher first-byte latency and **no
+partial update**. Changing one byte means writing the whole object again.
+
+The decision has one question in it: **does anything need to modify part of this in place?** A
+database's own files, yes — that is what block storage is for. A user's uploaded floor plan, no. It
+is written once, read many times, and replaced wholesale when it changes.
+
+For the second case the payoff is not primarily cost. It is that capacity planning disappears, the
+failure domain disappears, and the bytes stop travelling through your application at all: the
+client uploads directly and downloads directly, and the database holds a key.
+
+### Two dimensions into one key
+
+A <C id="geospatial-index" /> exists because the problem in the example is not fixable by adding
+indexes. Two separate B-trees each narrow one dimension, and the planner must intersect two very
+wide ranges.
+
+Two families of answer:
+
+**A spatial tree.** An R-tree, or PostgreSQL's GiST framework, indexes bounding boxes directly and
+handles containment and overlap queries properly. This is the right answer for data whose write
+rate is ordinary, which is nearly all spatial data — property listings, shop locations, delivery
+zones.
+
+**A cell or curve scheme.** Interleave the two coordinates into a single ordered value — a
+geohash, a quadtree path, an S2 cell id — so that points near each other in space are usually near
+each other in the ordering. Proximity becomes a range scan on one ordinary index, and membership
+becomes a set keyed by cell, which is why this is what a system with a very high write rate
+reaches for.
+
+<Callout kind="info" title="Why the word is usually">
+No mapping from two dimensions to one preserves proximity perfectly. Any curve that covers a plane
+must, somewhere, jump — two points on opposite sides of a cell boundary are adjacent in space and
+distant in the ordering.
+
+That is not a defect of a particular scheme; it is a property of flattening a plane onto a line.
+It is also why a proximity search reads **several cells** rather than one range: the neighbours of
+a cell have to be visited explicitly, because the ordering will not deliver them.
+</Callout>
+
+### What changed, rather than what it is
+
+<C id="chunking" /> splits a large object into pieces addressed by the hash of their contents, so a
+client and a server can agree on what to transfer by exchanging hashes instead of bytes.
+
+The mechanism that makes it work is the choice of boundaries. Cut at fixed 4 MB offsets and insert
+one byte at the front: every boundary shifts, every chunk hash changes, nothing matches, and the
+whole object is re-sent. Cut where a rolling hash of the content matches a pattern, and the
+boundaries are properties of the bytes rather than of the offsets — so an insertion changes only
+the chunks around it and everything after re-aligns on its own.
+
+Three consequences follow, and the third is a gift:
+
+- **Transfer becomes proportional to the change**, not to the object. The 40 MB upload becomes
+  one 4 MB chunk plus a list of hashes.
+- **Identical chunks are stored once.** Deduplication is free, because identical content produces
+  an identical address.
+- **Integrity comes with it.** A content address is a checksum you were already storing. A chunk
+  that does not hash to its own name is corrupt, and you find out on read rather than on restore.
+
+The cost lands on the client: computing hashes means reading the file, so a 40 MB object is read
+in full every time it changes. Cache the chunk list against path, size and modification time, or a
+laptop's fan becomes part of your architecture.
+
+## Architecture
+
+<Arch
+  caption="Three shapes, three structures. The database holds keys and nothing large."
+  columns={[
+    { title: 'Client', nodes: [{ id: 'client', label: 'Client' }] },
+    { title: 'Service', nodes: [{ id: 'api', label: 'Listings API' }] },
+    { title: 'Metadata', nodes: [{ id: 'db', label: 'Database', note: 'rows and keys only', tone: 'accent' }, { id: 'geo', label: 'Spatial index', note: 'cells or R-tree' }] },
+    { title: 'Bytes', nodes: [{ id: 'obj', label: 'Object storage', note: 'content addressed' }] },
+    { title: 'Delivery', nodes: [{ id: 'cdn', label: 'CDN' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'api' },
+    { from: 'api', to: 'db' },
+    { from: 'api', to: 'geo', label: 'nearby' },
+    { from: 'client', to: 'obj', label: 'direct, by chunk' },
+    { from: 'db', to: 'obj', label: 'holds keys' },
+    { from: 'obj', to: 'cdn' },
+  ]}
+  stages={[
+    {
+      label: 'One database',
+      show: ['client', 'api', 'db'],
+      because:
+        'Rows, blobs and coordinates all in one place. This is correct for a long time, and it is where the three complaints in the problem section come from — each one is a question the row-and-key model cannot answer cheaply.',
+    },
+    {
+      label: 'Move the bytes out',
+      show: ['client', 'api', 'db', 'obj', 'cdn'],
+      because:
+        'Blobs go to object storage and the row holds a key. Backups shrink by two orders of magnitude, the page cache holds only queried data, and the client transfers directly so the bytes never pass through the application.',
+    },
+    {
+      label: 'Index the second dimension',
+      show: ['client', 'api', 'db', 'geo', 'obj', 'cdn'],
+      because:
+        'A spatial structure answers proximity as a bounded read instead of an intersection of two continent-wide ranges. It is a separate index because the question is a separate shape, not because the data lives somewhere else.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Small, few large objects',
+      behaviour:
+        'Blobs in a column are genuinely fine. One store, one backup, one transaction, and nothing to reconcile.',
+      firstToBreak:
+        'Backup duration, usually. It is the first place the bytes become visible as a cost.',
+    },
+    {
+      scale: 'Tens of thousands of objects',
+      behaviour:
+        'The database is mostly bytes nobody queries. Replication and page cache both suffer for data no query reads.',
+      firstToBreak:
+        'The page cache. Query latency degrades for reasons that have nothing to do with the queries.',
+    },
+    {
+      scale: 'Spatial data over a city',
+      behaviour:
+        'Coordinate columns still work at small volumes because a full scan of ten thousand rows is fast.',
+      firstToBreak:
+        'The proximity query, abruptly, once the table is large enough that the scan stops being free.',
+    },
+    {
+      scale: 'Large objects changing frequently',
+      behaviour:
+        'Whole-object transfer dominates bandwidth and time, and the ratio of bytes moved to bytes changed becomes absurd.',
+      firstToBreak:
+        'The upload path, and the patience of anyone on a mobile connection — which is to say, the field users your product exists for.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Blobs crowding out the working set',
+      symptom: 'Query latency degrades steadily as uploads accumulate, with no change in query patterns or volume.',
+      cause: 'Large values share the page cache with the rows that are actually queried, and evict them.',
+      mitigation: 'Move the bytes to object storage and keep a key in the row. If they must stay, force them out of line and confirm the storage layout with the database, rather than assuming it.',
+    },
+    {
+      what: 'Two coordinate indexes and a slow planner',
+      symptom: 'A proximity query reads millions of rows to return a few hundred, and adding an index does not help.',
+      cause: 'Each index narrows one dimension, so the planner intersects two very wide ranges.',
+      mitigation: 'A spatial index, or a single ordered key derived from both coordinates. Check the query plan afterwards rather than assuming the new index is used.',
+    },
+    {
+      what: 'Deduplication stops working after an edit',
+      symptom: 'A one-byte insertion at the start of a file causes the whole file to be re-uploaded and re-stored.',
+      cause: 'Fixed-size chunk boundaries shifted with the insertion, so every subsequent chunk hash changed.',
+      mitigation: 'Content-defined boundaries from a rolling hash, so boundaries follow the bytes and an insertion is local.',
+    },
+    {
+      what: 'Orphaned objects accumulate',
+      symptom: 'Object storage grows faster than the number of listings, with no obvious explanation.',
+      cause: 'Uploads complete and the metadata write fails or is abandoned, leaving objects nothing references.',
+      mitigation: 'A collector that removes unreferenced objects after a grace period much longer than any plausible slow upload. Bias it toward leaking rather than deleting.',
+    },
+    {
+      what: 'Cell size wrong for the density',
+      symptom: 'Searches are slow in cities and return nothing in rural areas, with the same code and the same radius.',
+      cause: 'A fixed grid size cannot serve densities that vary by three orders of magnitude.',
+      mitigation: 'A hierarchical scheme so cell size varies with density, and an expanding search with both a candidate cap and a maximum radius.',
+    },
+    {
+      what: 'Client hashing on every save',
+      symptom: 'The desktop client pins a CPU core and drains battery whenever a large file is touched.',
+      cause: 'Chunk hashes are recomputed from scratch on every change, which means reading the whole file.',
+      mitigation: 'Cache the chunk list keyed on path, size and modification time, so an unchanged file is never re-read.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Store large objects outside the database, with the row holding only a key"
+  options={[
+    'A binary column in the row: one store, one transaction, one backup',
+    'A separate table for blobs in the same database',
+    'Object storage, with the row holding a key',
+    'A filesystem on block storage, with the row holding a path',
+  ]}
+  why="Bytes in a row are carried by everything that touches the row — backups, replication, the page cache — even though no query ever reads them. Moving them out is the single largest structural improvement available to most systems that store user uploads."
+  gain="Backups and replicas shrink to the size of the queryable data. The page cache holds only data queries read. Capacity planning for uploads disappears. Clients transfer directly, so bytes never occupy an application worker, and delivery can go through a CDN."
+  sacrifice="Two stores that can disagree. The write is no longer atomic, so a crash between the upload and the metadata write leaves an orphan. Deleting a listing no longer deletes its bytes unless something does that explicitly."
+  failureModes={[
+    'Orphaned objects from abandoned uploads, accumulating silently',
+    'Metadata written before the bytes exist, producing a listing whose file will not download',
+    'Deletes that remove the row and leave the object, which is a compliance problem as well as a cost one',
+  ]}
+  operationalBurden="Moderate. A garbage collector with a grace period, a lifecycle policy, and a deletion path that covers both stores. None of it is hard; all of it must actually be written."
+  cost="Object storage is far cheaper per byte than database storage, and the saving on backup and replica volume is usually larger than the saving on the bytes themselves."
+  whenNot="When the objects are small — a few kilobytes of JSON, a thumbnail — the second store costs more in complexity than the bytes cost in the row. When the write must be atomic with the row and you cannot tolerate an orphan window even briefly, keeping them together is defensible, though ordering the writes bytes-first usually removes the need. And when the object must be modified in place rather than replaced, object storage cannot do it and block storage is the answer."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL stores oversized field values out of line in a separate area, transparently, because a
+row must fit within a page. The values are still part of the table for backup and replication
+purposes.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+GiST is an index framework for data types that lack a natural linear ordering, including geometric
+types, supporting containment and overlap operators that B-tree operators cannot express.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+Multi-dimensional data is commonly indexed by mapping several dimensions onto a single ordered
+value using a space-filling curve, so that a proximity query becomes a range scan. The mapping
+cannot preserve proximity exactly, so neighbouring regions must be queried explicitly.
+</Claim>
+
+<Claim label="fact" source="redis-docs">
+Redis implements geospatial queries on sorted sets by encoding a coordinate pair into a single
+score, and provides radius queries over that encoding.
+</Claim>
+
+<Claim label="recommendation" source="aws-well-architected">
+Matching storage type to access pattern is a documented practice: block storage for data requiring
+in-place modification and low-latency access from one instance, object storage for whole immutable
+objects requiring durability and scale.
+</Claim>
+
+<Claim label="convention" source="dropbox-tech">
+Published engineering writing on file synchronisation describes splitting files into
+content-addressed blocks so that transfers are proportional to the change rather than to the file,
+and identical blocks are stored once.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Content-addressed immutable storage simplifies caching and replication, because an object
+identified by the hash of its contents cannot become stale and writing it twice is
+indistinguishable from writing it once.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you notice that a data shape does not match a row-and-key store before proposing an index for it. Candidates who say 'add an index on lat and lon' are giving the answer that does not work, and it is a common one."
+  depth="Know why two single-column indexes cannot serve a bounding box. Know that large values in a row are carried by backups and replication. Be able to say why fixed-size chunking defeats deduplication."
+  followUps={[
+    'You have indexes on latitude and longitude. Why is the nearby query still slow?',
+    'Where do the uploaded files go, and what happens if the upload succeeds and the metadata write fails?',
+    'A user changes two kilobytes of a forty megabyte file. What crosses the network?',
+    'When would you keep the blob in the database anyway?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Indexing latitude and longitude separately.',
+      why: 'Each index narrows one dimension only, so the planner must intersect two ranges that are each enormous. The query reads millions of rows to return a few hundred, and it looks like it should work, which is why it survives review.',
+      instead:
+        'Use a spatial index, or derive one ordered key from both coordinates. Then read the query plan to confirm it is being used, because adding the index is not the same as the planner choosing it.',
+    },
+    {
+      mistake: 'Keeping user uploads in a database column because it keeps the write atomic.',
+      why: 'Atomicity is real and it is bought by making every backup, every replica and the page cache carry bytes no query reads. The cost is paid continuously; the benefit applies to a window of a few seconds around the upload.',
+      instead:
+        'Write the bytes first, then the metadata. An orphaned object is inert and collectable; metadata pointing at bytes that do not exist is data loss as far as the user is concerned.',
+    },
+    {
+      mistake: 'Chunking at fixed offsets.',
+      why: 'It is the obvious implementation and it fails on the most common edit there is. Anything inserted rather than overwritten shifts every subsequent boundary, so no chunk matches and the entire object is re-sent.',
+      instead:
+        'Choose boundaries with a rolling hash over the content, so they move with the bytes. This is the whole reason content-defined chunking exists, and it is not an optimisation over the fixed version — it is the difference between working and not.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['geospatial-index', 'index']}
+  prompt="A table of 8 million shops has B-tree indexes on latitude and on longitude. A query for shops within 2 km of a point takes 4 seconds. What is happening?"
+  options={[
+    {
+      id: 'a',
+      text: 'Each index narrows one dimension, so the planner reads a band across the whole world and filters the rest in memory.',
+      implies: 'You understand that ordering on one axis discards the other.',
+      why: 'A 2 km band of latitude contains every shop at that latitude on Earth. The index does its job perfectly and returns hundreds of thousands of rows, nearly all of which fail the longitude test. The work is proportional to the band, not to the answer, which is why the query is slow in a way that adding hardware barely improves.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The table needs a composite index on both columns together.',
+      implies: 'You are reaching for a multi-column index.',
+      why: 'A composite index sorts by the first column and then by the second within equal values of the first — which is useless here, because latitude is effectively unique. It helps for equality on the leading column followed by a range; a bounding box is a range on both, and that is precisely the case it cannot serve.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'Eight million rows is too many for one table and it needs partitioning.',
+      implies: 'You are treating it as a volume problem.',
+      why: 'Eight million rows is small, and a correctly indexed lookup would return in milliseconds. Partitioning would spread the same bad access pattern across more machines, so every partition would do the same wasteful scan.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer offers both structures and says when each applies. A spatial index — GiST, R-tree — handles bounding boxes directly and is the right answer for shop data, whose write rate is ordinary. A cell or curve scheme turns proximity into a range scan on one ordinary index and is what you reach for when the write rate is very high, because updating a set membership is cheaper than restructuring a tree. It also notes that the cheap first move is to check the query plan, since an index that exists and an index the planner chooses are different things."
+/>
+
+<Check
+  concepts={['chunking', 'immutability']}
+  prompt="A sync client splits files into 4 MB chunks at fixed offsets and uploads only chunks whose hash the server does not have. A user adds a paragraph to the top of a 200 MB document. What is transferred?"
+  options={[
+    {
+      id: 'a',
+      text: 'Essentially all 200 MB, because every boundary shifted and no chunk hash matches.',
+      implies: 'You are tracing what an insertion does to fixed offsets.',
+      why: 'Inserting shifts every subsequent byte, so the bytes at offset 4 MB are now different bytes, and so on to the end of the file. Every chunk after the insertion point has a new hash, the server has none of them, and the deduplication scheme achieves nothing on the single most common kind of edit.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'One chunk, since only the first 4 MB of the file changed.',
+      implies: 'You are reasoning about which region of the file the user edited.',
+      why: 'True of the user\’s intent and not of the bytes. An insertion is not a local edit at the byte level: it displaces everything after it, so a scheme that identifies chunks by offset sees the whole remainder as new.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'It depends on the file format — some formats would localise the change.',
+      implies: 'You are considering how the application writes the file.',
+      why: 'A genuinely important observation: a format that appends rather than rewrites, or a database that updates in place, changes only a small region and would chunk beautifully. But the question specifies an insertion at the top, and for that case the format cannot save a fixed-offset scheme.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the fix and why it works: choose boundaries with a rolling hash of the content, so a boundary is wherever the bytes say it is. After the insertion the early boundaries move, and then the hash re-synchronises and every later boundary lands exactly where it did before — so only the chunks around the edit change. It also notes the two properties this buys for free, since content addresses are both a deduplication key and a checksum, so corruption is detected on read rather than discovered at restore."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Multi-dimensional indexes and space-filling curves', sourceId: 'database-internals' },
+    { label: 'GiST, and indexing types with no linear order', sourceId: 'postgres-docs' },
+    { label: 'Content-addressed chunking and transfer proportional to change', sourceId: 'dropbox-tech' },
+    { label: 'Matching storage type to access pattern', sourceId: 'aws-well-architected' },
+    { label: 'Next: reasoning without certainty', href: '/levels/4' },
+  ]}
+/>

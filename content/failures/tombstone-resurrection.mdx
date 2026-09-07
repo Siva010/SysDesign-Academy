@@ -1,0 +1,165 @@
+---
+id: tombstone-resurrection
+title: Deleted Data Comes Back
+symptom: Records deleted weeks ago reappear. There is no write in any log that could have created them.
+category: data
+concepts: [anti-entropy, read-repair, hinted-handoff, leaderless, replication-generic, eventual-consistency, conflict-resolution, compaction, correctness, durability, audit-log, immutability]
+sources: [cassandra-docs, cassandra-paper, dynamo, ddia]
+status: reviewed
+---
+
+## What you see
+
+**Tuesday** — A support ticket. A customer deleted a saved address five weeks ago. It is back in
+their account.
+
+Support looks for the write that recreated it. There is none. The application audit log has the
+deletion, five weeks ago, and nothing since. The customer is certain they did not re-add it, and
+the evidence agrees with them.
+
+**Wednesday** — Four more tickets. All restored records. All deletions from a three-day window in
+the previous month. All in one keyspace.
+
+**Wednesday afternoon** — Somebody checks the cluster's history. Three weeks ago a node was
+removed for a hardware fault and rejoined fourteen days later, after the part arrived. The
+tombstone grace period on that keyspace is ten days.
+
+Nobody made a mistake at the keyboard. Every component behaved exactly as documented. The data is
+back because of an interaction between two settings and one maintenance decision, and there is no
+query that can tell you which other rows are affected.
+
+## The mechanism
+
+In a replicated store, **a deletion is a write.** It has to be: replicas converge by exchanging
+values, and "this row is gone" has to be a value they can exchange. So a delete writes a marker —
+a tombstone — which replicates like any other write and shadows the row.
+
+Markers cannot be kept forever. They occupy space, and every read of that key must scan past them,
+so read latency degrades as they accumulate. Compaction therefore removes them after a grace
+period. From that moment the row is not deleted-and-marked; it is simply **absent**.
+
+The grace period is a bet: *every replica will have seen this marker within N days.* The bet is
+usually safe and it is a bet.
+
+A replica offline for longer than the grace period never receives the marker. When it returns it
+holds the original row, and the other replicas hold nothing at all. Now consider what
+reconciliation can possibly do with that:
+
+- This replica has a value with a timestamp.
+- The others have no value and no marker — not "deleted", just nothing.
+- Reconciliation propagates values, because a value is evidence and an absence is not.
+
+The row is written back to every replica. It is now live again, everywhere, with a fresh
+replication timestamp, and no record anywhere explains it.
+
+<Claim label="inference">
+The root of this is a single sentence: <strong>absence is not a value.</strong> Eventual
+consistency converges on things replicas can observe and compare, which is why deletion has to be
+represented as data. Removing that data for space reasons creates a window in which the system
+genuinely cannot distinguish "deleted while I was away" from "not yet replicated to me" — and it
+resolves that ambiguity in favour of the data, because that is the only safe default for every
+other case.
+</Claim>
+
+There is a slower version of the same failure with no node outage at all: a repair process that
+runs but never completes within the grace period. Every cycle it fails to finish is a set of
+markers expiring on some replicas and not others. It produces the same resurrections at a trickle
+instead of in a batch, which makes it far harder to attribute.
+
+## Why the obvious fixes make it worse
+
+**Raising the grace period to a year.** Tombstones now accumulate for a year. Reads must scan past
+every marker on the key, so read latency degrades steadily; compaction has more to do; and in the
+worst case a partition accumulates so many markers that queries against it time out. The store's
+own documentation warns about this, and the warning is not theoretical.
+
+**Deleting the resurrected rows again.** Fine for the ones customers reported. There is no query
+for *rows that should not exist* — the evidence of their deletion was removed, which is the whole
+mechanism. You are fixing the reports, not the incident.
+
+**Running a repair to fix the inconsistency.** Repair is the mechanism that spread it. Running it
+after the rejoin propagates the stale rows to every replica faster and more completely, which
+converts a partially-resurrected dataset into a fully-resurrected one.
+
+**Restoring from a backup.** The backup taken after the rejoin contains the resurrected rows. The
+one taken before it is missing three weeks of legitimate writes. Neither is the state you want,
+and merging them by hand is the actual work.
+
+## What actually works
+
+**Bound the blast radius first.** Which node, offline for how long, and which token ranges did it
+own? That gives you the set of keys that could possibly be affected, which is usually a small
+fraction of the keyspace and turns an unbounded problem into a finite one.
+
+**Reconcile against an authority, if you have one.** An event log, an application-level audit
+table, or the upstream system that issued the deletions. This is the only path that produces a
+correct answer rather than a plausible one, and whether it exists was decided long before the
+incident.
+
+**If you have no authority**, you are reduced to heuristics — rows in the affected ranges, created
+before the outage, never modified since, matching a deletion in the application log. That works to
+the extent your application log is complete, which is the lesson rather than the remedy.
+
+## How to prevent it
+
+**A rule with teeth: a node offline longer than the grace period is rebuilt, never rejoined.**
+Rebuilding streams data from healthy replicas, so it cannot reintroduce anything. This must be
+enforced in tooling — the rejoin command should refuse — because it is exactly the decision
+someone makes at the end of a long week, when the part has finally arrived and the node
+"obviously" just needs to come back.
+
+**Monitor time since last completed repair, per node, against the grace period.** A repair that
+has not completed a full cycle within the grace period is the slow version of this failure,
+already in progress, reporting nothing.
+
+**Size the grace period from measured repair completion time**, not from the default. It is the
+one setting that trades read latency against data correctness, and both sides of that trade have
+numbers you can measure.
+
+**Where resurrection is unacceptable, do not model deletion as absence.** A `deleted_at` column, a
+status field, or a deletion event in a log is a *value* — it converges like any other value, it
+survives any outage, and this entire class of failure disappears. The cost is that the row is
+never reclaimed automatically, which for anything a regulator or a customer might ask about is
+usually a cost you wanted to pay anyway.
+
+## How to detect it early
+
+- **Node downtime alarm at half the grace period.** By the time a node has been down for the full
+  period the decision has already been made badly.
+- **Repair completion time per node**, alerted against the grace period. This is the signal that
+  catches the slow variant, which is the one that runs for months.
+- **Row counts on tables where deletion is routine.** An unexplained rise is the earliest visible
+  symptom, and it appears before any customer notices.
+- **Periodic reconciliation against an authoritative record**, for the tables where a resurrected
+  row is a compliance problem rather than an inconvenience.
+
+## Related
+
+<Claim label="fact" source="cassandra-docs">
+Deletions are recorded as tombstones with a configured grace period, and a replica that has been
+offline for longer than that period must be rebuilt rather than rejoined, because it can otherwise
+reintroduce data whose deletion marker has already been removed elsewhere.
+</Claim>
+
+<Claim label="fact" source="cassandra-docs">
+Accumulated tombstones degrade read performance, because a read must scan past them, and a
+partition holding a large number of them can cause queries to fail. Extending the grace period
+therefore trades read performance for a wider safety margin.
+</Claim>
+
+<Claim label="fact" source="dynamo">
+Replicas are reconciled by read repair during reads and by a background anti-entropy process using
+Merkle trees for data that is not read. Both mechanisms compare the values replicas hold, which is
+why a deletion must itself be represented as a value.
+</Claim>
+
+<Claim label="fact" source="ddia">
+In a leaderless replicated system, an anti-entropy process is required for data that is rarely
+read, because read repair only converges the records that are actually accessed.
+</Claim>
+
+<Claim label="convention" source="cassandra-paper">
+A partitioned, replicated store with tunable consistency makes the consistency and availability
+trade per operation, which means the durability of a deletion is subject to the same
+configuration and the same failure modes as the durability of a write.
+</Claim>

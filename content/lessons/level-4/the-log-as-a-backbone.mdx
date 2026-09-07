@@ -1,0 +1,472 @@
+---
+id: the-log-as-a-backbone
+title: The Log as a Backbone
+level: 4
+module: l4-moving-work
+order: 2
+summary: A queue forgets a message once it is handled. A retained log does not, and almost every property people want from messaging comes from that one difference.
+difficulty: advanced
+minutes: 28
+prerequisites: [delivery-and-duplicates, doing-it-later]
+concepts: [log-based-messaging, consumer-group, offset, replay, dead-letter-queue, poison-message, event-driven, delay-queue]
+unlocks: [stream-processing, cdc, event-sourcing, partition-ordering, head-of-line-blocking]
+patterns: [transactional-outbox]
+failures: [stalled-partition, silent-backlog]
+sources: [kafka-paper, kafka-docs, ddia, aws-builders-library, linkedin-eng]
+status: reviewed
+---
+
+## The problem
+
+A consumer has a bug. For six hours it has been writing the wrong value into a downstream table
+for about one message in twenty. Someone notices, the fix is a one-line change, and it ships in
+twenty minutes.
+
+Then the real question: how do you repair the six hours?
+
+The messages were delivered and acknowledged, so the broker discarded them. The downstream table
+has wrong values with no record of what produced them. The only remaining copies of those events
+are in whatever the producers happen to have kept, in a format nobody designed to be re-read.
+
+The fix took twenty minutes. The recovery takes a week of writing one-off scripts, and it is never
+quite complete.
+
+## Intuition
+
+There are two ways to move work between machines, and they differ in what happens to a message
+after it has been handled.
+
+**A queue is a to-do list.** A worker takes an item, does it, and crosses it off. The list gets
+shorter. This is efficient and intuitive, and it has one consequence: **a crossed-off item is
+gone.** Only one worker could have taken it, and nobody can do it again.
+
+**A log is a diary.** Events are appended in order and nothing is removed. Each reader keeps a
+bookmark saying how far they have read. Several readers can read the same diary at different
+speeds for different reasons, and any of them can move their bookmark backwards.
+
+That single change — the reader tracks position, rather than the broker tracking per-message state
+— produces almost everything people value in modern messaging:
+
+- **Many independent consumers**, because reading does not consume.
+- **Replay**, because the past is still there and the bookmark can move back.
+- **A simpler broker**, because appending to a file and serving ranges of it is much less work
+  than tracking the state of every message for every consumer.
+
+The cost arrives with it, and it is not small: a diary in strict order can be blocked by one entry
+you cannot get past, and a diary has a finite number of pages.
+
+## Concretely
+
+<Example title="The same six-hour bug, with a retained log">
+
+The consumer wrote wrong values for six hours. Now:
+
+1. Fix the bug and deploy the consumer.
+2. Move the consumer's offset back six hours.
+3. It reprocesses everything since then and overwrites the wrong values with right ones.
+
+Recovery is a configuration change, and it takes as long as reprocessing takes.
+
+**Two conditions make it work, and neither is automatic.**
+
+The processing must be **idempotent** — writing a keyed row, not incrementing a counter. If the
+consumer had been adding to a running total, reprocessing would double-count everything, and the
+replay would cause a second, worse incident.
+
+The consumer must not have **external side effects that repeat**. If it also sends a confirmation
+email, replaying six hours of messages sends six hours of duplicate emails to real people. Replay
+is only available to consumers designed for it, which usually means splitting the consumer: one
+that updates state, safely replayable; one that sends emails, never replayed.
+
+</Example>
+
+## Formal explanation
+
+<C id="log-based-messaging" /> stores messages in an ordered, append-only sequence, retained for a
+configured period, partitioned for parallelism. The broker does not track which messages a
+consumer has handled. Consumers do, by recording an <C id="offset">offset</C> — a position in the partition
+(<Cite id="kafka-paper" />).
+
+Four consequences follow, and they are the whole subject:
+
+**Ordering exists inside a partition and nowhere else.** Two messages in different partitions have
+no defined order, whatever their timestamps say. So the partition key determines what is ordered
+with respect to what: key by account id and one account's events stay in order, while different
+accounts are independent. Wanting global order means one partition, which means one consumer, which
+means no parallelism. That is not a limitation to work around — it is the trade, stated exactly.
+
+**The partition count is the parallelism ceiling.** Within a <C id="consumer-group" />, each
+partition is assigned to at most one consumer, so a group can never usefully have more members than
+there are partitions. Sixteen partitions means at most sixteen concurrent workers, whatever the
+backlog. Partition count is therefore a capacity decision made when the topic is created, and
+raising it later changes which key lands where — so anything that depended on a key's history being
+in one partition is disturbed.
+
+**Committing the offset is a correctness decision.** Commit before processing and a crash loses the
+message: at-most-once. Process before committing and a crash reprocesses it: at-least-once. There
+is no local third option, because the offset store and the effect are two different systems. The
+familiar conclusion applies again — make the effect idempotent and stop trying to make delivery
+exact.
+
+**<C id="replay" /> is the property that changes how you operate.** A consumer bug becomes an
+offset reset rather than a data archaeology project. Adding a new consumer that needs history
+becomes reading from the beginning rather than a backfill pipeline. This is the single largest
+practical difference between a log and a queue, and it is worth designing consumers to preserve it.
+
+Then the costs.
+
+**A <C id="poison-message" /> stops the partition.** In a queue, a message that always fails goes
+back to the queue and other work proceeds. In a log, the consumer cannot advance past it without
+skipping it, so one unprocessable message halts everything behind it in that partition. This is
+head-of-line blocking, and it is a direct consequence of ordering. The answer is an explicit
+policy: after N attempts, write the message and its error to a <C id="dead-letter-queue" />,
+advance the offset, and alert. A dead-letter destination nobody reads is a data-loss mechanism with
+paperwork, so it needs an owner and an alarm.
+
+**Retention bounds everything.** The log is not a database. Retention decides how far back you can
+replay, how long a consumer may be down before it loses data, and how long a new consumer's history
+goes. It is a disaster-recovery parameter disguised as a storage setting, and the honest way to
+express it is: *we can survive a consumer outage of N hours.*
+
+**Scheduling is not a log operation.** &ldquo;Do this in an hour&rdquo; needs random access by due
+time; a log gives sequential access by position. Publishing a message an hour early and having the
+consumer sleep blocks the partition for an hour. <C id="delay-queue">Delayed execution</C> needs a store
+with a time index — which is why the job scheduler in the case study library is built on a
+database rather than on a topic, and why the tiered-delay-topic arrangement is a workaround with a
+fixed set of delays rather than a general answer.
+
+Finally, the architectural consequence. <C id="event-driven" /> communication means producers stop
+knowing who consumes them. You gain the ability to add a consumer without touching the producer,
+which is genuinely valuable. You lose the ability to read one call site and know what happens next,
+and a change to an event's meaning now breaks consumers you cannot enumerate. The coupling did not
+disappear; it moved from the code into the event schema, where it is less visible and therefore
+easier to break.
+
+## Architecture
+
+<Arch
+  caption="One log, several independent readers, each with its own position and its own lag."
+  columns={[
+    { title: 'Producers', nodes: [{ id: 'prod', label: 'Order service' }] },
+    { title: 'Log', nodes: [{ id: 'p0', label: 'Partition 0', note: 'retained, ordered', tone: 'accent' }, { id: 'p1', label: 'Partition 1' }] },
+    { title: 'Groups', nodes: [{ id: 'g1', label: 'Billing group' }, { id: 'g2', label: 'Analytics group' }, { id: 'g3', label: 'Search indexer' }] },
+    { title: 'Exceptions', nodes: [{ id: 'dlq', label: 'Dead letters', note: 'owned and alarmed' }] },
+    { title: 'Effects', nodes: [{ id: 'sink', label: 'Downstream stores' }] },
+  ]}
+  edges={[
+    { from: 'prod', to: 'p0', label: 'key = order id' },
+    { from: 'prod', to: 'p1' },
+    { from: 'p0', to: 'g1' },
+    { from: 'p0', to: 'g2' },
+    { from: 'p1', to: 'g3' },
+    { from: 'g1', to: 'sink' },
+    { from: 'g1', to: 'dlq', label: 'after N attempts' },
+    { from: 'g2', to: 'sink' },
+  ]}
+  stages={[
+    {
+      label: 'One consumer',
+      show: ['prod', 'p0', 'g1', 'sink'],
+      because:
+        'A producer appends, a consumer reads and records its offset. At this point it behaves like a queue, and the difference has not yet earned anything.',
+    },
+    {
+      label: 'More readers, no coordination',
+      show: ['prod', 'p0', 'p1', 'g1', 'g2', 'g3', 'sink'],
+      because:
+        'Each group keeps its own offset, so analytics can be hours behind while billing is current, and a new consumer can start from the beginning of retention. The producer changed in no way and does not know they exist.',
+    },
+    {
+      label: 'Handle the message that cannot be handled',
+      show: ['prod', 'p0', 'p1', 'g1', 'g2', 'g3', 'dlq', 'sink'],
+      because:
+        'One unprocessable message halts everything behind it in its partition. An explicit dead-letter policy after a bounded number of attempts is what converts a stalled partition into one alert and one skipped record.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One producer, one consumer',
+      behaviour: 'Indistinguishable from a queue. Retention and offsets are unused machinery.',
+      firstToBreak: 'Nothing. If this is all you will ever need, a queue is simpler and correct.',
+    },
+    {
+      scale: 'Several consumers of the same events',
+      behaviour:
+        'Each group reads independently at its own pace. New consumers can be added without touching producers, which is where the log starts paying for itself.',
+      firstToBreak:
+        'Schema discipline. Producers now have consumers they do not know about, and a field change breaks someone silently.',
+    },
+    {
+      scale: 'High throughput, many partitions',
+      behaviour:
+        'Parallelism scales with partitions. Consumer lag becomes the primary operational metric, per partition rather than in aggregate.',
+      firstToBreak:
+        'One slow or stalled partition, invisible in an average. Total lag looks fine while one key range is hours behind.',
+    },
+    {
+      scale: 'Log as the system backbone',
+      behaviour:
+        'Most inter-service communication is events. Retention and replay underpin recovery procedures for many services at once.',
+      firstToBreak:
+        'Comprehension. No one person can say what happens after an event is published, and tracing a business flow means reading many consumers rather than one call chain.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Poison message stalls a partition',
+      symptom: 'One key range stops updating entirely while everything else is current. Aggregate lag looks acceptable.',
+      cause: 'A message fails deterministically, and the consumer cannot advance past it without skipping it.',
+      mitigation: 'Bounded retries, then dead-letter the message with its error and advance. Alert per partition, because an average hides a single stalled one.',
+    },
+    {
+      what: 'Consumer lag noticed too late',
+      symptom: 'A downstream store is hours stale and nothing alerted, or worse, data is already past retention and gone.',
+      cause: 'Lag was measured in messages rather than in time, and nobody knew what a number of messages meant.',
+      mitigation: 'Alert on lag in seconds, and alert well before lag approaches retention. Retention minus lag is the time you have left to fix it.',
+    },
+    {
+      what: 'Replay causes a second incident',
+      symptom: 'Reprocessing to fix wrong data sends duplicate emails, double-charges, or double-counts.',
+      cause: 'The consumer had non-idempotent effects, so replaying repeated them.',
+      mitigation: 'Separate consumers that update state, which must be idempotent and replayable, from consumers with external effects, which must not be replayed.',
+    },
+    {
+      what: 'Rebalance storm',
+      symptom: 'A consumer group repeatedly stops and reassigns partitions, and throughput collapses without any member crashing.',
+      cause: 'Processing takes longer than the group timeout, so a healthy member is judged dead, triggering a reassignment that makes everyone slower.',
+      mitigation: 'Bound per-message work, tune the timeout against the real distribution rather than the average, and heartbeat independently of processing.',
+    },
+    {
+      what: 'Global ordering assumed',
+      symptom: 'An event is processed before the event that logically precedes it, and only under load.',
+      cause: 'Related events were published with different keys, so they landed in different partitions where no ordering exists.',
+      mitigation: 'Make the partition key the entity whose order matters. If two events must be ordered, they must share a key — there is no other mechanism.',
+    },
+    {
+      what: 'Retention expires under a stopped consumer',
+      symptom: 'A consumer restored after a long outage silently starts from the oldest available offset and skips a period.',
+      cause: 'The outage exceeded retention, so the missed messages no longer exist.',
+      mitigation: 'Treat retention as the maximum survivable consumer outage, state it as a number, and alarm when lag reaches a fraction of it.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use a retained, partitioned log instead of a classic queue"
+  options={[
+    'Classic queue: broker tracks per-message state, message removed on acknowledgement',
+    'Retained log: consumers track offsets, messages retained for a period',
+    'Direct synchronous calls between services',
+    'A database table polled as a work queue',
+  ]}
+  why="Replay and multiple independent consumers are properties that cannot be added to a queue afterwards, because the information they need was deleted at acknowledgement time. If you will ever want either, the decision has to be made at the start."
+  gain="Reprocessing after a bug becomes an offset reset. New consumers can read history without a backfill pipeline. Producers are decoupled from consumers. Broker throughput is high because appending and serving ranges is cheap work."
+  sacrifice="Head-of-line blocking within a partition. Parallelism capped by partition count, chosen up front. Retention storage for data that is usually never re-read. Ordering guarantees that are narrower than most people assume."
+  failureModes={[
+    'A poison message halting a partition',
+    'Lag growing past retention, converting a delay into permanent loss',
+    'Replay repeating external side effects',
+    'Rebalance storms when processing time exceeds the group timeout',
+  ]}
+  operationalBurden="Substantial. Per-partition lag monitoring, dead-letter ownership, partition capacity planning, schema compatibility across consumers you may not know about, and a cluster whose storage is sized by retention rather than by throughput."
+  cost="Storage for the full retention window plus replication, paid continuously for data that is mostly read once. Usually justified by the single incident where replay turns a week of recovery into an afternoon."
+  whenNot="When there is one consumer, work is discarded once done, and nobody will ever reprocess — a queue is simpler and has no head-of-line blocking. When items must be worked in a priority order or with per-item delays, because a log is ordered by arrival and a queue with priorities or a scheduler is the right structure. And when the caller needs an answer, in which case a synchronous call is not a limitation you are working around, it is the correct shape."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="kafka-paper">
+A partitioned log stores messages in order within each partition and retains them for a configured
+period. Consumers maintain their own position rather than the broker tracking per-message
+acknowledgement, which is what allows multiple independent consumers and re-reading.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Within a consumer group, each partition is consumed by at most one member, so the number of
+partitions bounds the effective parallelism of that group.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Ordering is guaranteed within a partition, not across partitions. Messages that must be ordered
+relative to each other must therefore be assigned the same key.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Whether an offset is committed before or after processing determines at-most-once or at-least-once
+delivery. Both are ordinary outcomes of the ordering, and neither can be avoided by configuration
+alone.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Bounding retries and moving repeatedly failing messages to a separate destination is established
+practice, on the grounds that unbounded retry of a deterministically failing item consumes capacity
+without ever succeeding.
+</Claim>
+
+<Claim label="convention" source="linkedin-eng">
+Published engineering writing on log-centric data infrastructure argues for treating an ordered,
+retained log as a primary integration point between systems, so that derived stores can be rebuilt
+by reprocessing rather than repaired in place.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know what a log gives you that a queue does not, and what it costs. Saying 'use Kafka' without naming partition keys, ordering scope or retention is the shallow version of this answer."
+  depth="Be able to state the partition key and what it makes ordered. Know that partition count caps consumer parallelism. Have an answer for a message that always fails, and for what replay does to side effects."
+  followUps={[
+    'What is your partition key, and what does it make ordered?',
+    'A message fails every time. What happens to everything behind it?',
+    'You need to reprocess the last four hours. What breaks?',
+    'How long can a consumer be down before you lose data?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Assuming messages are globally ordered.',
+      why: 'Ordering holds within a partition only. Events with different keys are unordered relative to each other regardless of the timestamps they carry, and the failure appears only under load when the interleaving changes.',
+      instead:
+        'Say what must be ordered with respect to what, and make that the key. If nothing must be ordered, say that too — it means you can key for even distribution instead.',
+    },
+    {
+      mistake: 'Treating the log as durable storage.',
+      why: 'Retention deletes. A log with seven days of retention is not a record of your business; it is a seven-day buffer, and anything that must outlive that has to be written somewhere designed to keep it.',
+      instead:
+        'State retention as the maximum survivable consumer outage. If events must be kept permanently, copy them to a store whose job is keeping things.',
+    },
+    {
+      mistake: 'Adding a queue between services to make the system resilient.',
+      why: 'It converts a synchronous failure into a growing backlog, which is better only if someone is watching the backlog and the caller can proceed without an answer. If the caller needs the result, an asynchronous hop adds a failure mode and answers nothing.',
+      instead:
+        'Use asynchrony when the caller genuinely does not need the outcome now. Then commit to monitoring lag, because the backlog is where the failure now lives.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['poison-message', 'dead-letter-queue']}
+  prompt="One message in a partition fails every time it is processed. What happens, and what should the consumer do?"
+  options={[
+    {
+      id: 'a',
+      text: 'Everything behind it in that partition stops. Retry a bounded number of times, then dead-letter it, advance the offset, and alert.',
+      implies: 'You understand that ordering and progress are in tension.',
+      why: 'The consumer cannot commit an offset past a message it has not handled without deciding to skip it, so the partition stalls. The bounded-retry-then-dead-letter policy converts an indefinite stall into one skipped record and one alert. The alert matters as much as the skip: a dead-letter destination nobody watches is silent data loss.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The message is redelivered later and other messages continue to be processed',
+      implies: 'You are describing a classic queue.',
+      why: 'That is exactly the behaviour of a queue that tracks per-message state, and it is a genuine advantage of queues. A log has one position per partition, so there is no way to move past one message while leaving it outstanding.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Skip it immediately and continue',
+      implies: 'You are prioritising progress over the message.',
+      why: 'It keeps the partition moving and discards data on the first transient error — a downstream timeout, a brief unavailability. Most failures are transient, which is why the retry bound exists: retry enough to survive a blip, then stop.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer distinguishes retryable from non-retryable failures rather than counting attempts alone. A malformed payload will never succeed and should be dead-lettered immediately; a downstream timeout should be retried with backoff. It also notes that the dead-letter destination needs an owner, an alert and a documented way to re-inject a message once the underlying bug is fixed — otherwise the mechanism is a place where data goes to be forgotten."
+/>
+
+<Check
+  concepts={['replay', 'offset']}
+  prompt="A consumer wrote wrong values for six hours. You want to reset its offset and reprocess. What must be true first?"
+  options={[
+    {
+      id: 'a',
+      text: 'Its writes must be idempotent, it must have no external side effects that would repeat, and the data must still be within retention',
+      implies: 'You are checking the preconditions rather than assuming replay is always available.',
+      why: 'All three are required and any one of them can be missing. Incrementing counters would double-count; sending emails would send them again to real people; and if the retention window is shorter than six hours the messages are simply gone. Replay is a property you design consumers to have, not one the log grants automatically.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The consumer group must be stopped so it does not process concurrently with the replay',
+      implies: 'You are thinking about the mechanics of the reset.',
+      why: 'Practically necessary — you cannot move the offset of a group actively consuming — but it is a step in the procedure rather than a precondition for safety. Doing it without checking idempotence still causes the second incident.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'The downstream store must support transactions',
+      implies: 'You are looking for atomicity across the reprocessing.',
+      why: 'Transactions are not what makes replay safe. A transactional but non-idempotent write — an increment inside a transaction — double-counts just as reliably. The property that matters is that applying the same message twice leaves the same result, which usually comes from writing keyed rows rather than from a transaction.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer draws the design rule out of the incident: split consumers by replayability. One consumer updates derived state, is idempotent by natural key, and may be replayed freely; another performs external effects and is never replayed, only re-driven deliberately with an explicit list. Deciding that at design time is what makes the offset reset a twenty-minute operation instead of a debate held during an incident."
+/>
+
+<CompleteCheck
+  concepts={['poison-message', 'dead-letter-queue', 'head-of-line-blocking', 'offset']}
+  prompt="A consumer reads orders from a partitioned log and writes them to a search index. One component is missing, and without it a single malformed order stops every order behind it in that partition. What goes in the gap?"
+  pipeline={[
+    { label: 'Order log', note: 'partitioned by order id' },
+    { label: 'Consumer', note: 'bounded retries' },
+    { label: 'Dead letters', note: 'payload and error', gap: true },
+    { label: 'Commit offset', note: 'advance past it' },
+    { label: 'Search index', note: 'the derived view' },
+  ]}
+  options={[
+    {
+      id: 'a',
+      text: 'A dead-letter destination holding the payload, the offset and the error, written before the offset advances.',
+      implies: 'You are converting an indefinite stall into one skipped record and one alert.',
+      why: 'A consumer has one position per partition, so it cannot move past a message it has not handled without deciding to skip it. Capturing the message first is what makes the skip safe: the data still exists, the offset can advance, and everything behind it proceeds. Skipping without capturing is deleting data with extra steps.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'A retry with a longer backoff, so transient downstream failures have more time to resolve.',
+      implies: 'You are giving the message more chances.',
+      why: 'Right for a timeout and wrong for a malformed payload, which will never parse however long you wait. Extending the backoff makes the stall last longer, and the whole partition waits through every additional attempt.',
+      credit: 'partial',
+    },
+    {
+      id: 'c',
+      text: 'A second consumer group on the same topic, so processing continues even if one group is stuck.',
+      implies: 'You are adding redundancy at the consumer level.',
+      why: 'Both groups read the same partition and hit the same message, so both stall in the same place. Duplicating a consumer duplicates the failure; the problem is the message, not the availability of something to read it.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer classifies the failure rather than counting attempts: a parse error is non-retryable and should be dead-lettered on the first attempt, while a downstream timeout deserves several with backoff. It also insists the dead-letter destination has an owner, an alert and a tested re-injection path — without those three it is a place data goes to be forgotten, which is a worse outcome than the stall it replaced, because the stall at least announced itself."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'The partitioned log: offsets, retention and consumer position', sourceId: 'kafka-paper' },
+    { label: 'Consumer groups, partition assignment and ordering guarantees', sourceId: 'kafka-docs' },
+    { label: 'Delivery semantics and why exactly-once is a property of effects', sourceId: 'ddia' },
+    { label: 'Bounded retries and dead-letter handling', sourceId: 'aws-builders-library' },
+    { label: 'Next: computing over a stream that never ends', href: '/lessons/computing-on-a-stream' },
+  ]}
+/>

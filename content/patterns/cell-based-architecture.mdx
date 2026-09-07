@@ -1,0 +1,160 @@
+---
+id: cell-based-architecture
+title: Cell-Based Architecture
+problem: Any single failure — a bad deploy, a poisoned cache, an abusive tenant — affects every user, because there is one of everything.
+category: resilience
+concepts: [cell-architecture, blast-radius, fault-domain, bulkhead, tenant-isolation, noisy-neighbour, canary, multi-az, control-plane-vs-data-plane]
+relatedPatterns: [bulkhead, circuit-breaker]
+alsoKnownAs: [cells, shuffle sharding, pods, shards of infrastructure]
+seenIn: [Large multi-tenant platforms, cloud service architectures]
+sources: [aws-well-architected, sre-book, aws-builders-library]
+status: reviewed
+---
+
+## Problem
+
+You have one production environment. Everything in it is shared: one database cluster, one cache
+tier, one deployment, one configuration store.
+
+That means every failure is global by default:
+
+- A bad deploy reaches every user simultaneously.
+- A poisoned cache entry is served to everyone.
+- One abusive tenant degrades service for all tenants.
+- A corrupt configuration change takes down the product.
+
+Geographic redundancy does not help with any of these, because they all propagate through
+systems that span regions: the deploy pipeline, the configuration store, the shared data tier.
+
+The problem is not where the infrastructure sits. It is that **there is one of everything.**
+
+## Pattern
+
+Divide the fleet into independent **cells**. Each cell is a complete, self-sufficient stack —
+its own compute, its own data store, its own cache — serving a defined subset of users.
+
+- Users are assigned to a cell and stay there.
+- Cells do not talk to each other on the request path.
+- Deploys go to one cell at a time, with a bake period between.
+- A failure — of any kind — affects one cell.
+
+The result is that blast radius becomes a number you choose. With ten cells, a catastrophic cell
+failure affects 10% of users rather than 100%.
+
+**Shuffle sharding** is the refinement worth knowing. Instead of assigning each tenant to one
+cell, assign each to a random *subset* of cells. With enough cells, no two tenants share exactly
+the same subset, so one abusive tenant degrades only the fraction of others who overlap with
+them — and complete overlap becomes vanishingly unlikely.
+
+## Architecture
+
+<Arch
+  caption="Independent stacks, each serving a slice of users."
+  columns={[
+    { title: 'Users', nodes: [{ id: 'users', label: 'All users' }] },
+    { title: 'Routing', nodes: [{ id: 'router', label: 'Cell router', note: 'thin, stable', tone: 'accent' }] },
+    { title: 'Cells', nodes: [{ id: 'c1', label: 'Cell 1', note: 'full stack' }, { id: 'c2', label: 'Cell 2', note: 'full stack' }, { id: 'c3', label: 'Cell 3', note: 'deploying' }] },
+    { title: 'Control', nodes: [{ id: 'cp', label: 'Control plane', note: 'must not be in the path' }] },
+  ]}
+  edges={[
+    { from: 'users', to: 'router' },
+    { from: 'router', to: 'c1' },
+    { from: 'router', to: 'c2' },
+    { from: 'router', to: 'c3' },
+    { from: 'cp', to: 'c3', label: 'deploys here first' },
+  ]}
+/>
+
+## Advantages
+
+- **Blast radius becomes a design parameter.** Ten cells means a cell-wide failure affects 10% of
+  users. You choose the number.
+- **Deploys are naturally progressive.** One cell, bake, next cell. A bad release is caught while
+  it affects a small population.
+- **Noisy neighbours are contained.** One tenant's load stays inside their cell.
+- **Cells are a known-good unit.** Capacity planning, load testing and scaling all happen against
+  one cell, and growth means more cells rather than a larger and less predictable system.
+- **Testing in production becomes reasonable**, because there is a small population to test on.
+
+## Costs
+
+- **Cross-cell operations become hard.** Anything requiring data from several cells — global
+  search, cross-tenant analytics, aggregate reporting — needs a separate path.
+- **More infrastructure units to operate.** Ten cells is ten databases to upgrade, monitor and
+  back up. Without strong automation this is untenable.
+- **Cell placement becomes a decision.** Moving a tenant between cells is a data migration.
+- **Utilisation falls.** Each cell needs its own headroom, so capacity cannot be pooled across
+  cells the way it can in a shared fleet.
+- **The router is a new shared component**, and if it fails, all cells become unreachable.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Control plane in the request path',
+      symptom: 'A control-plane outage takes down every cell, defeating the point of the design.',
+      cause: 'Cells consult the control plane to serve requests, rather than only to be configured.',
+      mitigation: 'The data plane must keep serving with the control plane unavailable. Cache configuration locally and treat control-plane failure as inability to change, not inability to serve.',
+    },
+    {
+      what: 'Uneven cell load',
+      symptom: 'One cell is saturated while others are idle, because tenants differ enormously in size.',
+      cause: 'Tenants assigned to cells without accounting for their size.',
+      mitigation: 'Assign by measured load rather than by count, and rebalance periodically. Very large tenants may need a dedicated cell.',
+    },
+    {
+      what: 'A tenant outgrows a cell',
+      symptom: 'One customer’s load exceeds what a single cell can serve, and they cannot be split.',
+      cause: 'The cell is the unit of isolation and the tenant is the unit of assignment.',
+      mitigation: 'Plan for a dedicated cell for the largest tenants, or partition very large tenants across cells at the cost of cross-cell queries for them.',
+    },
+    {
+      what: 'Cell count grows faster than automation',
+      symptom: 'Upgrades take weeks; cells drift from each other in version and configuration.',
+      cause: 'Manual or semi-manual operations that were tolerable at three cells and are not at thirty.',
+      mitigation: 'Automate cell provisioning, deployment and verification before increasing cell count. Drift between cells is the failure mode that erodes the guarantee.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- Multi-tenant, with tenants that can be assigned to a fixed home.
+- Blast radius is a real concern: an outage affecting all users is materially worse than one
+  affecting 10%.
+- Cross-tenant operations are rare, or can be served by a separate derived store.
+- Automation is mature enough that operating N stacks costs little more than operating one.
+
+## When NOT to use it
+
+- **When users must interact across the boundary.** A social product where any user can message
+  any other has no natural cell boundary, and forcing one produces cross-cell traffic on the
+  common path — which is exactly what the pattern is supposed to prevent.
+- **When automation is not there yet.** Ten cells with manual operations is ten times the toil,
+  and the drift between them will produce failures the single environment did not have.
+- **When the system is small.** Cells add fixed cost per cell. Below a certain scale, the cost of
+  running several stacks exceeds the value of the isolation.
+- **As a substitute for progressive deployment.** If the only goal is limiting deploy blast
+  radius, canary releases achieve most of that at a fraction of the cost. Cells are worth it when
+  you also want data, cache and tenant isolation.
+
+## Example systems
+
+<Claim label="convention" source="aws-well-architected">
+Reducing blast radius through isolation — separating workloads into independent units so that a
+failure affects a bounded subset — is a documented reliability practice in architecture review
+frameworks.
+</Claim>
+
+<Claim label="convention" source="aws-builders-library">
+Shuffle sharding is described as assigning each customer to a random subset of resources so that
+overlap between any two customers is limited, which bounds how many customers a single
+misbehaving one can affect.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+Keeping the data plane operational when the control plane is unavailable is a recurring principle
+in reliability engineering, because control planes are where configuration errors land and they
+are frequently the shared dependency that defeats other isolation.
+</Claim>

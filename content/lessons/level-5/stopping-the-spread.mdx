@@ -1,0 +1,412 @@
+---
+id: stopping-the-spread
+title: Stopping the Spread
+level: 5
+module: l5-defences
+order: 1
+summary: Timeouts, breakers, bulkheads and shedding are the same move applied in different places, bounding what one failure can consume. Each costs something.
+difficulty: advanced
+minutes: 28
+prerequisites: [how-failures-spread]
+concepts: [timeout, circuit-breaker, bulkhead, load-shedding, admission-control, graceful-degradation, retry, retry-budget, exponential-backoff, hedged-request]
+unlocks: [cell-architecture, rate-limiting, feature-flag]
+patterns: [circuit-breaker, bulkhead, token-bucket]
+failures: [retry-storm, health-check-collapse]
+sources: [aws-builders-library, aws-load-shedding, release-it, sre-book, tail-at-scale]
+status: reviewed
+---
+
+## The problem
+
+You know how a slow dependency becomes an outage. Now you have to stop it, and the available
+defences all look like overhead on a normal day.
+
+A circuit breaker rejects requests that might have succeeded. Load shedding returns errors to
+users you could have served. Bulkheads reserve capacity that sits idle. Every one of them costs
+something when nothing is wrong, and pays only during the incident you have not had yet.
+
+That is the actual difficulty: **these are insurance policies, and they are easy to argue away
+in a planning meeting.**
+
+## Intuition
+
+Every defence in this lesson is the same idea in a different place: **put a bound on it.**
+
+- A **timeout** bounds how long one call may consume a worker.
+- A **retry budget** bounds how much extra load your retries may generate.
+- A **circuit breaker** bounds how long you keep calling something that is clearly broken.
+- A **bulkhead** bounds how much of a shared resource one dependency may hold.
+- **Load shedding** bounds how much work you accept.
+- **Graceful degradation** bounds how much of the product one failure can take with it.
+
+The unifying principle: an unbounded response to failure is what turns a local problem into a
+global one. Every bound you add converts an unpredictable failure into a predictable, partial
+one.
+
+The second insight is about what you are optimising. During overload the goal is **not** to
+serve every request. It is to serve as many as possible *correctly*. A system that accepts
+everything and times out on all of it has 100% acceptance and zero goodput. A system that
+rejects 40% and serves 60% correctly is more available in every sense a user cares about.
+
+## Concretely
+
+<Example title="Choosing defences by what they bound">
+
+One service, four dependencies, four different treatments:
+
+| Dependency | Nature | Defence |
+|---|---|---|
+| Auth service | Required; nothing works without it | Tight timeout, retries with jitter, no breaker — failing fast here means failing the request anyway |
+| Primary database | Required | Bounded connection pool with an acquisition timeout, so a slow database queues visibly rather than consuming everything |
+| Recommendations | Optional | Circuit breaker plus a short timeout, degrading to a default list. One failure must not touch other endpoints |
+| Analytics events | Fire and forget | Bounded queue that drops on overflow. Never block a user request for telemetry |
+
+The pattern: **the defence follows from what the dependency is for.** A required dependency
+cannot be degraded away, so bound its latency and fail fast. An optional one should be behind a
+breaker with a fallback. Telemetry should never be able to affect a user request at all.
+
+A common mistake is applying the same policy everywhere — retries and a breaker on every call —
+which produces both unnecessary complexity and, on the required path, a breaker that trips and
+turns a slow login into no login at all.
+
+</Example>
+
+## Formal explanation
+
+**<C id="timeout" />** bounds how long a call may hold resources. Derived from the latency
+budget, not from observed dependency latency. Propagated as a deadline so the chain gives up
+together.
+
+**<C id="exponential-backoff">Backoff with jitter</C>** bounds retry rate and desynchronises
+clients. Without jitter, clients that failed together retry together, producing waves.
+
+**<C id="retry-budget" />** bounds total retry load — for example, retries may be at most 10% of
+requests. This is stronger than per-request retry limits, because it holds regardless of how many
+requests are failing. Under a broad failure, per-request limits still triple the load; a budget
+does not.
+
+**<C id="circuit-breaker" />** bounds how long you keep calling something broken. After a
+failure threshold it opens and fails immediately, then periodically allows a probe. It converts
+slow failures into fast ones, which frees the resources that would otherwise be consumed waiting.
+
+**<C id="bulkhead" />** bounds how much of a shared resource one dependency can consume:
+separate connection pools, thread pools, or instances per dependency or per tenant. The name
+comes from ship compartments — one flooded compartment does not sink the vessel.
+
+**<C id="load-shedding" />** bounds accepted work. Under overload, reject quickly and cheaply so
+the work you do accept completes. Rejection must be far cheaper than service, or shedding
+consumes the capacity it was meant to protect.
+
+**<C id="admission-control" />** is shedding with priority: decide *which* requests to reject.
+Health checks and paying customers before batch and free tiers; writes before analytics.
+
+<Callout kind="info" title="Circuit breakers on required dependencies need care">
+If a dependency is required, an open breaker turns "slow" into "definitely failed". Sometimes
+correct — failing fast frees resources and lets callers degrade. Sometimes worse — a breaker
+tripping on a transient blip takes down login entirely. Breakers are most clearly right for
+optional dependencies with a fallback.
+</Callout>
+
+<Deeper title="Shedding correctly: reject early, reject cheaply, reject informatively">
+
+Load shedding only works if rejection is much cheaper than service. Three requirements:
+
+**Reject early.** As close to the entry point as possible, before authentication lookups,
+before database connections are acquired. A rejection that first does 80% of the work has saved
+almost nothing.
+
+**Reject cheaply.** No logging every rejection at full detail, no expensive error construction.
+Under overload you may be rejecting tens of thousands per second.
+
+**Reject informatively.** Return a status the client understands, with a retry-after hint.
+A rejection that causes immediate retries has made things worse.
+
+The signal to shed on matters too. CPU is a lagging indicator. **Queue wait time is a leading
+one**: if a request has already waited longer than the client's remaining deadline, serving it
+is wasted work regardless of how much capacity you have.
+
+<Claim label="convention" source="aws-load-shedding">
+Using queue depth and wait time as overload signals, and shedding at the entry point to protect
+goodput, is established practice. The objective during overload is maximising completed useful
+work rather than accepted requests.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Each defence sits at a different point and bounds a different resource."
+  columns={[
+    { title: 'Entry', nodes: [{ id: 'shed', label: 'Admission control', note: 'bounds accepted work', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Handler' }] },
+    { title: 'Isolation', nodes: [{ id: 'b1', label: 'Pool: required', note: 'bulkhead' }, { id: 'b2', label: 'Pool: optional', note: 'bulkhead' }] },
+    { title: 'Calls', nodes: [{ id: 'cb', label: 'Circuit breaker', note: 'bounds waiting' }] },
+    { title: 'Dependencies', nodes: [{ id: 'req', label: 'Auth + DB' }, { id: 'opt', label: 'Recommendations' }] },
+  ]}
+  edges={[
+    { from: 'shed', to: 'app', label: 'accepted' },
+    { from: 'app', to: 'b1' },
+    { from: 'app', to: 'b2' },
+    { from: 'b1', to: 'req', label: 'timeout' },
+    { from: 'b2', to: 'cb' },
+    { from: 'cb', to: 'opt', label: 'or fallback' },
+  ]}
+  stages={[
+    {
+      label: 'Undefended',
+      show: ['app', 'req', 'opt'],
+      because:
+        'One handler, one pool, no bounds. Any dependency can consume every worker, and any client can send as much as it likes.',
+    },
+    {
+      label: 'Isolate dependencies',
+      show: ['app', 'b1', 'b2', 'cb', 'req', 'opt'],
+      because:
+        'Separate pools mean the optional dependency cannot starve the required one. The breaker stops the optional call entirely once it is clearly broken, and the fallback keeps the endpoint working.',
+    },
+    {
+      label: 'Bound the input',
+      show: ['shed', 'app', 'b1', 'b2', 'cb', 'req', 'opt'],
+      because:
+        'Isolation protects you from dependencies; admission control protects you from callers. Without it, a traffic surge saturates every pool at once and no isolation helps.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Normal load',
+      behaviour:
+        'Every defence is inert. Breakers closed, nothing shed, pools underused. Pure overhead, and the reason they get removed.',
+      firstToBreak: 'The organisational will to keep them.',
+    },
+    {
+      scale: 'One dependency degrades',
+      behaviour:
+        'Its bulkhead saturates, its breaker opens, the endpoint degrades. Everything else is unaffected.',
+      firstToBreak: 'One feature, visibly and predictably. This is success.',
+    },
+    {
+      scale: 'Traffic surge',
+      behaviour:
+        'Admission control rejects the excess. Accepted requests complete normally. Goodput stays near capacity.',
+      firstToBreak: 'The rejected fraction, which is a deliberate choice rather than an accident.',
+    },
+    {
+      scale: 'Defences absent',
+      behaviour:
+        'Every request is accepted, queues grow, everything times out, and goodput goes to zero while throughput graphs look busy.',
+      firstToBreak: 'Everything, at once, with a confusing signature.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Circuit breaker on a required dependency',
+      symptom:
+        'A brief blip in the auth service produces a complete login outage lasting the breaker cool-down.',
+      cause:
+        'The breaker opened on a transient failure, and there is no fallback for a required call, so every request fails immediately.',
+      mitigation:
+        'Reserve breakers for calls with a fallback. On required paths, use tight timeouts and jittered retries within a budget, and tune thresholds so brief blips do not trip.',
+    },
+    {
+      what: 'Shedding too late in the request',
+      symptom:
+        'The service sheds heavily and still falls over, with CPU pinned by rejections.',
+      cause:
+        'Rejection happens after authentication, parsing and a database lookup, so a rejected request costs nearly as much as a served one.',
+      mitigation:
+        'Move admission control to the entry point, before any expensive work. Make the rejection path deliberately cheap.',
+    },
+    {
+      what: 'Bulkheads sized without measurement',
+      symptom:
+        'Pools are exhausted at normal load, or so generous that isolation is theoretical.',
+      cause:
+        'Sizes chosen by intuition rather than from measured concurrency.',
+      mitigation:
+        "Size each pool from Little's law using measured arrival rate and service time, with headroom. Monitor utilisation and wait time per pool.",
+    },
+    {
+      what: 'Defences never exercised',
+      symptom:
+        'During a real incident, the breaker does not trip, the fallback throws, or shedding rejects the wrong traffic.',
+      cause:
+        'The code paths only run during failures, and failures are rare, so the code is effectively untested.',
+      mitigation:
+        'Exercise them deliberately: fault injection, load tests that trigger shedding, and periodic drills that open breakers in production during business hours.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Shed load at the entry point during overload rather than accepting everything"
+  options={[
+    'Accept everything and let queues absorb it',
+    'Shed uniformly above a concurrency or wait-time threshold',
+    'Admission control by priority: shed low-value traffic first',
+  ]}
+  why="Accepting more work than you can complete converts an overload into universal failure. Every accepted request consumes memory and a worker whether or not anyone is still waiting for it, so acceptance without capacity destroys goodput for everyone."
+  gain="Accepted requests complete within their latency objective. Goodput stays near capacity instead of collapsing. Failures are fast and explicit, so clients can back off or degrade rather than hanging."
+  sacrifice="Some users receive errors who would have been served. During a brief spike, a slightly tight threshold produces visible failures where a queue would have absorbed it."
+  failureModes={[
+    'Rejection that is not cheap enough, so shedding consumes the capacity it protects',
+    'Clients that retry immediately on rejection, converting shedding into amplification',
+    'Priority rules that shed the wrong traffic — health checks, or the highest-value customers',
+  ]}
+  operationalBurden="Moderate. It needs a good overload signal, a cheap rejection path, and priority rules that are reviewed as the product changes. It also needs testing, because the code runs only under conditions you rarely have."
+  cost="No infrastructure cost. The real cost is the conversation about which requests are worth rejecting, which is a product decision as much as a technical one."
+  whenNot="For batch or asynchronous work where latency does not matter and completion does, a deep queue is exactly right — absorbing bursts is the point, and shedding discards work for no benefit. Also be careful where a rejected request is not retryable: shedding a payment confirmation callback is not the same as shedding a page view."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-load-shedding">
+Shedding load at the entry point using queue-based overload signals, with the objective of
+maximising goodput rather than accepted requests, is established practice for services operating
+at scale.
+</Claim>
+
+<Claim label="convention" source="release-it">
+Circuit breakers, bulkheads and timeouts are documented stability patterns whose shared purpose
+is bounding the propagation of failure between components.
+</Claim>
+
+<Claim label="fact" source="tail-at-scale">
+Hedged requests — issuing a duplicate after a short delay and taking the first response —
+reduce tail latency at the cost of additional load. They are appropriate for idempotent
+operations where tail latency is the binding constraint.
+</Claim>
+
+<Claim label="recommendation" source="sre-book">
+Prefer degrading to failing. A response with recommendations missing is better than no response.
+Design fallbacks explicitly, and test them, because untested fallback code fails at exactly the
+moment it is needed.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can choose the right defence for the right dependency, and whether you acknowledge that each costs something normally. Listing all the patterns is easy; matching them to dependencies is the signal."
+  depth="Know what each defence bounds. Know that shedding must be early and cheap. Know that a breaker on a required dependency can make things worse. Distinguishing required from optional dependencies unprompted is a strong signal."
+  followUps={[
+    'Which of your dependencies gets a circuit breaker, and which does not?',
+    'You are overloaded. Which requests do you reject first?',
+    'Why might shedding not help?',
+    'How do you know your fallback actually works?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We put a circuit breaker on every dependency.',
+      why: 'On a required dependency with no fallback, an open breaker converts slow into failed. Applied uniformly, breakers add configuration surface and can amplify a transient blip into a full outage.',
+      instead:
+        'Classify dependencies as required or optional. Breakers with fallbacks for optional; tight timeouts and budgeted retries for required.',
+    },
+    {
+      mistake: 'We will add capacity when overloaded.',
+      why: 'Capacity arrives in minutes and overload arrives in seconds. During a cascade, more capacity often means more concurrent pressure on the saturated dependency, which prolongs it.',
+      instead:
+        'Shed first to restore goodput, then add capacity. Autoscaling handles trends; shedding and headroom handle spikes.',
+    },
+    {
+      mistake: 'We tested the happy path thoroughly.',
+      why: 'The defences only execute during failure, so they are the least-tested code in the system and they run at the worst possible moment.',
+      instead:
+        'Inject faults deliberately. Trip breakers in production during business hours. Load test until shedding engages, and confirm the fallback returns something sensible.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['load-shedding', 'throughput-vs-goodput']}
+  prompt="Your service can complete 10,000 requests per second. 25,000 arrive. Clients time out after 2 seconds. What is the best behaviour?"
+  options={[
+    {
+      id: 'a',
+      text: 'Accept all 25,000 and queue them; they will be served eventually',
+      implies: 'You are treating the queue as capacity.',
+      why: 'The queue grows at 15,000 per second, so wait time passes 2 seconds almost immediately. From then on every response is delivered to a client that has already given up: throughput stays at 10,000 and goodput is zero.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Accept about 10,000 and reject the rest immediately with a retry-after hint',
+      implies: 'You are optimising for completed useful work rather than for acceptance.',
+      why: 'The accepted requests complete within the client\'s deadline, so goodput stays near 10,000 per second. Rejected clients learn immediately and can back off or degrade, rather than waiting two seconds for a timeout.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Accept all and reduce per-request work to serve more',
+      implies: 'You are trying to raise capacity by degrading quality.',
+      why: 'A legitimate additional technique — serving a cheaper response is a real form of degradation — but it does not remove the need to bound acceptance. If the cheaper response still costs more than a 2.5-fold reduction, you are back in the same position.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer adds priority and the retry consequence: shed the lowest-value traffic first — batch, free tier, analytics — before user-facing writes, and make sure the rejection carries a retry-after so clients do not immediately re-send. It also notes that rejection must happen before any expensive work, or shedding consumes the capacity it was meant to protect."
+/>
+
+<Check
+  concepts={['circuit-breaker', 'bulkhead', 'graceful-degradation']}
+  prompt="An optional recommendation service degrades. Which combination of defences keeps the rest of the product working?"
+  options={[
+    {
+      id: 'a',
+      text: 'Retries with backoff, so the call eventually succeeds',
+      implies: 'You are trying to make the failing call work.',
+      why: 'Retries make it worse: more load on a struggling dependency, and workers held longer while retrying. For an optional dependency the goal is to stop calling it, not to try harder.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'A separate pool for that dependency, a short timeout, a circuit breaker, and a fallback to a default list',
+      implies: 'You bounded the resource, the wait, the calling, and the user impact.',
+      why: 'Each element bounds a different thing. The pool means it cannot starve other endpoints. The timeout bounds how long any single call holds a worker. The breaker stops calling once it is clearly broken. The fallback means the endpoint still returns something useful, so the degradation is invisible to most users.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Remove the dependency from the request path entirely and compute recommendations asynchronously',
+      implies: 'You are changing the architecture rather than defending the current one.',
+      why: 'Often the best long-term answer, and it is a design change rather than a defence. It also does not remove the need for bounds — the asynchronous path can still back up, and there is still a decision about what to show when no recommendation is ready.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the testing requirement: the fallback path runs only during failures, so it must be exercised deliberately — fault injection, or a flag that forces the breaker open in production during business hours. Untested fallback code is a common way for a defence to become the cause of the outage."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Using load shedding to avoid overload', sourceId: 'aws-load-shedding' },
+    { label: 'Timeouts, retries and backoff with jitter', sourceId: 'aws-timeouts' },
+    { label: 'Stability patterns: breakers, bulkheads, timeouts', sourceId: 'release-it' },
+    {
+      label: 'Next: losing a zone, a region, or the data itself',
+      href: '/lessons/losing-something-large',
+    },
+  ]}
+/>

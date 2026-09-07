@@ -1,0 +1,152 @@
+---
+id: transactional-outbox
+title: Transactional Outbox
+problem: A state change and the event announcing it must both happen or neither, but they live in two systems that cannot share a transaction.
+category: messaging
+concepts: [outbox, dual-write, atomicity, at-least-once, idempotency, cdc]
+relatedPatterns: [saga, idempotency-key]
+alsoKnownAs: [outbox pattern, application outbox]
+seenIn: [Event-driven services publishing domain events, order and payment systems]
+sources: [ddia, kafka-docs, martin-fowler]
+status: reviewed
+---
+
+## Problem
+
+Your service writes an order to the database and publishes an `OrderCreated` event to a broker.
+
+These are two writes to two systems, and nothing makes them atomic. A crash between them leaves
+the two permanently disagreeing:
+
+- **Commit then publish fails:** the order exists and nothing downstream ever hears about it. No
+  email, no fulfilment, no record that anything is owed.
+- **Publish then commit fails:** consumers act on an order that does not exist.
+
+Both are silent. Neither produces an error anyone sees. This is the **dual-write problem**, and
+it is one of the most common sources of quiet data divergence in event-driven systems.
+
+## Pattern
+
+Make it one write.
+
+1. In the same database transaction as the state change, insert a row into an `outbox` table
+   containing the event payload.
+2. Commit. Either both the order and the event row exist, or neither does.
+3. A separate relay process reads unpublished rows from the outbox, publishes them to the broker,
+   and marks them published.
+
+Publication becomes a **retryable read** rather than an unrecoverable write. If the relay
+crashes, the row is still there and will be published on restart.
+
+Consumers must be idempotent, because a relay that publishes and crashes before marking the row
+will publish again. Delivery is at-least-once by construction.
+
+## Architecture
+
+<Arch
+  caption="One atomic write, then an independently retryable publication."
+  columns={[
+    { title: 'Service', nodes: [{ id: 'svc', label: 'Service' }] },
+    { title: 'Database', nodes: [{ id: 'orders', label: 'Orders table' }, { id: 'outbox', label: 'Outbox table', note: 'same transaction', tone: 'accent' }] },
+    { title: 'Relay', nodes: [{ id: 'relay', label: 'Relay', note: 'polls or tails WAL' }] },
+    { title: 'Downstream', nodes: [{ id: 'broker', label: 'Broker' }, { id: 'consumer', label: 'Consumers', note: 'idempotent' }] },
+  ]}
+  edges={[
+    { from: 'svc', to: 'orders', label: 'one transaction' },
+    { from: 'svc', to: 'outbox' },
+    { from: 'relay', to: 'outbox', label: 'read unpublished' },
+    { from: 'relay', to: 'broker', label: 'publish' },
+    { from: 'broker', to: 'consumer' },
+  ]}
+/>
+
+## Advantages
+
+- **No lost events.** If the state change committed, the event exists and will eventually be
+  published.
+- **No phantom events.** If the transaction rolled back, the event row rolled back with it.
+- **Failure is recoverable.** A relay crash delays publication; it does not lose it.
+- **The broker is not on the write path.** A broker outage does not fail user requests; it only
+  delays event delivery, and the outbox absorbs the backlog.
+
+## Costs
+
+- **A relay to build, deploy and monitor.** It is a second process with its own failure modes and
+  its own lag.
+- **Publication is asynchronous**, so downstream systems are eventually consistent with the
+  database. The window is usually small and must be monitored.
+- **Outbox table growth.** Published rows must be pruned, and pruning competes with the write
+  workload.
+- **Ordering is not free.** Publishing in insertion order requires care, especially with several
+  relay instances.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Relay falls behind',
+      symptom: 'Downstream systems are minutes or hours stale while everything reports healthy.',
+      cause: 'Publication rate below insertion rate, or the relay stopped and nothing alerted.',
+      mitigation: 'Alert on the age of the oldest unpublished row, not on row count. Age maps directly to downstream staleness.',
+    },
+    {
+      what: 'Duplicate publication',
+      symptom: 'Consumers see the same event twice.',
+      cause: 'The relay published and crashed before marking the row as published.',
+      mitigation: 'This is expected. Consumers must deduplicate on a stable event id; the pattern guarantees at-least-once, not exactly-once.',
+    },
+    {
+      what: 'Outbox table becomes a hot spot',
+      symptom: 'Write latency rises as outbox volume grows; the relay’s polling query gets slower.',
+      cause: 'Every state change writes here, and published rows accumulate.',
+      mitigation: 'Index on published status and insertion order, prune aggressively, and consider partitioning by time.',
+    },
+    {
+      what: 'Relay publishes out of order',
+      symptom: 'A consumer applies an older state after a newer one.',
+      cause: 'Several relay instances, or parallel publication of rows for the same entity.',
+      mitigation: 'Partition by entity so one relay handles a given key, or carry a version and have consumers reject older versions.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- A state change must reliably produce an event, and losing the event is unacceptable.
+- The event and the state change live in the same database, so they can share a transaction.
+- Downstream consumers can tolerate eventual delivery and are idempotent.
+
+## When NOT to use it
+
+- **When the event is genuinely disposable.** A metrics ping or a cache warm does not justify a
+  table, a relay and a pruning job. Fire and forget is the right answer, and saying so
+  deliberately is better than adding machinery by reflex.
+- **When change data capture is available and appropriate.** Reading the database's replication
+  log gives the same guarantee without an outbox table, and without the application needing to
+  know the pattern exists. The trade is more infrastructure and coupling to the log format.
+- **When the state change and the effect are both in your own database.** Then they can share one
+  transaction directly, and no event is needed.
+- **When strict global ordering across entities is required.** The outbox gives ordering within a
+  partition with care; total ordering across all events is a much harder requirement and this is
+  not the mechanism for it.
+
+## Example systems
+
+<Claim label="convention" source="ddia">
+The dual-write problem — two writes to two systems with no atomicity — is a recognised source of
+silent inconsistency in event-driven architectures, and writing the event to the same store as
+the state change is the standard remedy.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Kafka's transactional guarantees cover writes back into Kafka and consumer offset commits.
+Coordinating a database write with a Kafka publish is outside that boundary, which is precisely
+the gap the outbox closes.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+Change data capture, deriving events from the database's own log, is described as an alternative
+that removes the need for the application to write events explicitly, at the cost of additional
+infrastructure and coupling to the database's change format.
+</Claim>

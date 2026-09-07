@@ -1,0 +1,136 @@
+---
+id: cache-aside
+title: Cache-Aside
+problem: The same expensive read happens repeatedly, and the underlying data changes slowly enough that a recent answer is still good.
+category: caching
+concepts: [cache-aside, cache-generic, ttl, cache-invalidation, cache-stampede, hit-rate]
+relatedPatterns: [key-splitting, read-through-edge]
+alsoKnownAs: [lazy loading, look-aside cache]
+seenIn: [Application caching with Redis or Memcached, the most common caching pattern in web services]
+sources: [redis-docs, aws-builders-library, ddia]
+status: reviewed
+---
+
+## Problem
+
+A read is expensive — several queries, a join, a computation — and the same read happens many
+times per second. The underlying data changes far less often than it is read.
+
+Doing the work every time wastes capacity you could spend elsewhere, and adds latency to every
+request that could have been avoided.
+
+## Pattern
+
+The application manages the cache explicitly:
+
+1. Check the cache for the key.
+2. On a hit, return the value.
+3. On a miss, read from the source of truth, write the value into the cache with a TTL, and
+   return it.
+
+Writes go to the source of truth and either invalidate or update the cache entry.
+
+The defining property is that **the application is in control**. The cache does not know about
+the database, and the database does not know about the cache. That is what makes the pattern
+simple and what makes invalidation the application's problem.
+
+## Architecture
+
+<Arch
+  caption="The application coordinates; neither store knows about the other."
+  columns={[
+    { title: 'Caller', nodes: [{ id: 'app', label: 'Application', tone: 'accent' }] },
+    { title: 'Cache', nodes: [{ id: 'cache', label: 'Cache', note: 'TTL per entry' }] },
+    { title: 'Truth', nodes: [{ id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'app', to: 'cache', label: '1. get' },
+    { from: 'app', to: 'db', label: '2. on miss' },
+    { from: 'app', to: 'cache', label: '3. populate' },
+  ]}
+/>
+
+## Advantages
+
+- **Only what is read gets cached.** Memory is spent on the working set rather than on the whole
+  dataset, which is why hit rates are high relative to cache size.
+- **Cache failure is survivable.** A cache outage degrades to a slower system rather than a
+  broken one, provided the origin can take the load.
+- **No coupling between stores.** The cache can be replaced, resized or removed without touching
+  the database layer.
+- **Explicit control.** The application decides what is cached, for how long, and under what key.
+
+## Costs
+
+- **Staleness up to the TTL**, and the TTL is a product decision disguised as a configuration
+  value.
+- **Every read path must implement the pattern.** A code path that forgets to check the cache is
+  merely slow; one that forgets to invalidate produces wrong data.
+- **The system becomes sized for the cache existing.** An origin serving 5% of read traffic has
+  probably never been able to serve 100%.
+- **A new dependency on the request path**, with its own latency and availability.
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Cache stampede',
+      symptom: 'A popular key expires and thousands of concurrent requests all miss and hit the origin at once.',
+      cause: 'Every concurrent request for an expired key independently decides to rebuild it.',
+      mitigation: 'Request coalescing so one rebuild serves all waiters; jittered TTLs; serving stale while revalidating.',
+    },
+    {
+      what: 'Cold cache overload',
+      symptom: 'A cache restart or flush takes the origin down.',
+      cause: 'The origin is sized for the miss rate, not the request rate.',
+      mitigation: 'Compute the cold-cache overload factor. Add shedding and coalescing, and consider cache persistence.',
+    },
+    {
+      what: 'Stale write after invalidation',
+      symptom: 'A value is updated, the cache invalidated, and the old value reappears moments later.',
+      cause: 'A read that missed before the write completes after the invalidation and writes the pre-write value.',
+      mitigation: 'A short TTL as a backstop, a compare-and-set on the cache write, or versioned keys.',
+    },
+    {
+      what: 'Cache penetration',
+      symptom: 'Requests for non-existent keys bypass the cache every time; trivially exploitable.',
+      cause: 'Only successful lookups are cached, so absence is never remembered.',
+      mitigation: 'Cache negative results with a short TTL; a Bloom filter where the key space is large and sparse.',
+    },
+  ]}
+/>
+
+## When to use it
+
+- Reads substantially outnumber writes for the same key.
+- A stale answer for the length of the TTL is acceptable to the product.
+- The read is genuinely expensive — a computation or several queries — rather than expensive only
+  because of a missing index.
+- The working set fits in affordable memory.
+
+## When NOT to use it
+
+- **When the read is slow for a fixable reason.** A missing index should be added, not cached
+  around. You would be adding staleness, a stampede risk and a dependency to avoid writing DDL,
+  and the first miss still pays the full cost.
+- **When correctness requires the latest value.** Balances, permissions, and inventory at the
+  point of sale. A cached permission is a security decision made with old information.
+- **When data changes as often as it is read.** The hit rate will be poor and you have taken on
+  the costs for none of the benefit.
+- **When you cannot survive the cold-cache case.** If the origin cannot serve the full request
+  rate and you have no shedding, you have built a scheduled outage.
+
+## Example systems
+
+<Claim label="convention" source="redis-docs">
+Cache-aside with an explicit TTL is the most common application caching pattern, and Redis
+documents eviction policies and persistence options that directly affect how the pattern behaves
+under memory pressure and on restart.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Design for the cache being empty. A system whose origin cannot survive its full request rate has
+an outage waiting for the next restart or eviction event, regardless of the cache tier's own
+reliability.
+</Claim>

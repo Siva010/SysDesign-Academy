@@ -1,0 +1,402 @@
+---
+id: when-load-is-not-even
+title: When Load Is Not Even
+level: 2
+module: l2-uneven
+order: 1
+summary: Averages assume load spreads out. It never does. A tiny fraction of keys and users generates most traffic, and breaks any design sized from an average.
+difficulty: core
+minutes: 27
+prerequisites: [caching-a-bet-on-time, load-distribution]
+concepts: [hot-key, hot-partition, load-distribution, key-splitting, local-cache, fanout-on-write]
+unlocks: [consistent-hashing, sharding, cell-architecture, rate-limiting]
+patterns: [key-splitting, fanout-on-write]
+sources: [ddia, dynamo, aws-builders-library, meta-eng]
+status: reviewed
+---
+
+## The problem
+
+You have done the arithmetic properly. 200,000 reads per second, spread across a cache cluster
+of 20 nodes. That is 10,000 per node — comfortable.
+
+A celebrity posts. Two million requests per second arrive for a single item.
+
+Your 20-node cluster does not become a 20-way split of 2 million. Every one of those requests
+hashes to the same key, and that key lives on exactly one node. One node receives 2 million
+requests per second and saturates its network interface. The other nineteen are idle.
+
+Adding nodes does not help. Adding nodes has never helped. **A single key cannot be
+partitioned, because that is what "key" means.**
+
+## Intuition
+
+Almost every distributed design begins with a division: split the work across N machines, each
+gets 1/N.
+
+That division assumes the work is divisible and evenly distributed. Real workloads are neither.
+
+- A few products account for most of the sales.
+- A few users account for most of the API calls.
+- A few keys account for most of the reads.
+- A few hours of the day account for most of the traffic.
+
+This is not an occasional anomaly; it is the normal shape of human-generated demand. Designing
+for the average and discovering the distribution in production is one of the most reliable ways
+to be surprised.
+
+Two distinct problems hide under "uneven load", and they need different answers:
+
+**A hot partition** is one shard receiving far more than its share, because the partition key
+groups too much traffic together. It is fixable by choosing a better key.
+
+**A hot key** is one *individual key* receiving enormous traffic. No partitioning scheme fixes
+it, because there is nothing left to divide.
+
+## Concretely
+
+<Example title="The same skew, three different failures">
+
+**Reads on one key.** Two million requests per second for one cached item. The cache node
+holding it saturates. Every other node is idle. Fixes: serve it from the edge, or replicate it
+into every application instance's local memory, or split the key.
+
+**Writes on one row.** Every purchase of a flash-sale item decrements the same inventory row.
+The database serialises them, so throughput on that feature is the throughput of one row,
+regardless of how many application servers you run. Fixes: split the counter into K sub-rows,
+or move to an append-only reservation model.
+
+**Fanout on one account.** A user with 50 million followers posts. Fanout-on-write means 50
+million writes for one action, which is minutes of work for one post while ordinary posts take
+milliseconds. Fixes: exclude large accounts from fanout and merge their posts at read time.
+
+Notice that all three are the same underlying skew, and none of the three fixes are the same.
+&ldquo;Handle the hot key&rdquo; is not one technique.
+
+</Example>
+
+## Formal explanation
+
+<C id="load-distribution" /> assumes independence between requests. Skew is what happens when
+requests are correlated — and they are correlated because people are correlated. Everyone wants
+the same viral video, buys the same discounted item, follows the same famous account.
+
+Three responses exist, and the choice depends on the read/write mix:
+
+**Replicate the hot thing.** If it is read-heavy and tolerates staleness, put a copy close to
+every reader: a CDN for public content, an in-process
+<C id="local-cache">local cache</C> for internal reads. Load divides by the number of
+replicas. This is by far the cheapest answer when it applies.
+
+**<C id="key-splitting">Split the key</C>.** Turn one key into K sub-keys — `counter:0`
+through `counter:9` — so writes distribute. Reads must now aggregate K values, so you have
+traded a cheap read for a cheap write.
+
+**Detect and route.** Identify hot keys at runtime and treat them differently: pin them to
+dedicated capacity, admit them at a lower rate, or promote them to a local cache. More
+machinery, and it adapts to skew you cannot predict.
+
+<Callout kind="warn" title="Consistent hashing does not solve hot keys">
+Consistent hashing distributes *distinct* keys evenly and keeps redistribution cheap when nodes
+change. It says nothing about one key being popular. Virtual nodes smooth the distribution of
+many keys; they cannot smooth the distribution of one.
+</Callout>
+
+<Deeper title="Why skew gets worse as you scale, not better">
+
+Intuition says more machines means more headroom. For skewed workloads the opposite is often
+true.
+
+With 4 nodes, each holds 25% of the key space, so a hot key sits alongside a lot of other
+traffic — the node is already provisioned for a substantial share. With 100 nodes, each holds
+1% of the key space and is provisioned accordingly, so a hot key represents a far larger
+multiple of what its node expects.
+
+The ratio that matters is not total load over total capacity. It is **the busiest node's load
+over one node's capacity**, and splitting the cluster finer makes the denominator smaller while
+the hot key's numerator stays the same.
+
+<Claim label="inference">
+This is why systems that partition aggressively often need an explicit hot-key mechanism,
+while systems on fewer, larger nodes may never notice the skew. The skew did not change; the
+capacity available to absorb it did.
+</Claim>
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="Three layers, three different ways to absorb the same hot key."
+  columns={[
+    { title: 'Readers', nodes: [{ id: 'client', label: 'Clients' }] },
+    { title: 'Edge', nodes: [{ id: 'cdn', label: 'CDN', note: 'public content', tone: 'accent' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'App instances', note: 'local cache' }] },
+    { title: 'Shared', nodes: [{ id: 'hot', label: 'Hot cache node', note: 'the bottleneck' }, { id: 'cold', label: '19 idle nodes', tone: 'muted' }] },
+    { title: 'Origin', nodes: [{ id: 'db', label: 'Database' }] },
+  ]}
+  edges={[
+    { from: 'client', to: 'cdn' },
+    { from: 'cdn', to: 'app', label: 'miss' },
+    { from: 'app', to: 'hot', label: 'all one key', tone: 'danger' },
+    { from: 'app', to: 'cold' },
+    { from: 'hot', to: 'db' },
+  ]}
+  stages={[
+    {
+      label: 'The problem',
+      show: ['client', 'app', 'hot', 'cold', 'db'],
+      because:
+        'Every request for the hot key lands on one cache node. Nineteen nodes are idle and the twentieth is on fire. Cluster size is irrelevant.',
+    },
+    {
+      label: 'Local cache',
+      show: ['client', 'app', 'hot', 'cold', 'db'],
+      because:
+        'A small in-process cache on each application instance divides hot-key load by the instance count. It costs a little staleness and a little memory, and it is usually the cheapest fix available.',
+    },
+    {
+      label: 'Push it to the edge',
+      show: ['client', 'cdn', 'app', 'hot', 'cold', 'db'],
+      because:
+        'If the content is public and identical for everyone, the edge absorbs it entirely and the request never reaches your infrastructure. This is the only answer that scales to millions per second.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Uniform access',
+      behaviour: 'Load divides evenly. Capacity planning from averages works.',
+      firstToBreak: 'Nothing. This is the world your design document assumed.',
+    },
+    {
+      scale: 'Mild skew: top 1% of keys get 20% of traffic',
+      behaviour:
+        'Some nodes run hotter than others. Averages still roughly work, with headroom absorbing the difference.',
+      firstToBreak: 'The busiest node, at a lower total load than you planned for.',
+    },
+    {
+      scale: 'Heavy skew: top key gets 10% of all traffic',
+      behaviour:
+        'One node carries 10% of total load while others carry a twentieth of that. Cluster utilisation looks fine in aggregate.',
+      firstToBreak:
+        'The node holding the hot key. Aggregate dashboards show a healthy cluster throughout.',
+    },
+    {
+      scale: 'Viral event: one key gets more traffic than the cluster was sized for in total',
+      behaviour:
+        'No partitioning helps. The only options are replication, edge caching, or rejecting traffic.',
+      firstToBreak:
+        'That node, immediately, and then the origin behind it as requests fail over or retry.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Hot key saturates one node',
+      symptom:
+        'One node at 100% while cluster average utilisation is 15%. Latency terrible for a subset of requests, fine for the rest.',
+      cause:
+        'All requests for one key hash to one node. Cluster size is irrelevant to a single key.',
+      mitigation:
+        'Replicate the value closer to readers: local cache or edge. If it must be shared, split the key and aggregate on read.',
+    },
+    {
+      what: 'Hot partition from a poor partition key',
+      symptom:
+        'One shard consistently busier than the others, not for one key but for a whole range.',
+      cause:
+        'The partition key groups correlated traffic: partitioning by date means today is always hot; by country means your largest market is always hot.',
+      mitigation:
+        'Choose a key with high cardinality and even access. Where a natural key is skewed, prefix it with a hash or a bucket to spread it.',
+    },
+    {
+      what: 'Fanout amplification on a large account',
+      symptom:
+        'Publishing latency is fine for almost everyone and catastrophic for a handful of accounts. Queue depth spikes on individual posts.',
+      cause:
+        'Fanout-on-write costs one write per follower, so a 50-million-follower account costs 50 million writes for one action.',
+      mitigation:
+        'Hybrid: fan out for ordinary accounts, and merge large accounts at read time. This is why every large feed system in public writing describes a hybrid.',
+    },
+    {
+      what: 'Rate limits applied per node instead of per identity',
+      symptom:
+        'A single abusive client is not limited, because its requests spread across nodes and no individual node sees enough to trigger the limit.',
+      cause: 'Limits enforced with node-local state on a fleet of nodes.',
+      mitigation:
+        'Enforce limits against shared state, or accept approximate limiting with node-local counters sized for the fleet.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Add a small in-process cache in front of the shared cache to absorb hot keys"
+  options={[
+    'Shared cache only: one consistent view, one node per key',
+    'Local in-process cache with a short TTL, backed by the shared cache',
+    'Split hot keys into K sub-keys and aggregate on read',
+    'Push the hot content to a CDN so it never reaches you',
+  ]}
+  why="A hot key is by definition read by many callers. Putting a copy in each caller divides the load by the number of callers, which is the only mechanism that scales with your fleet rather than against it."
+  gain="Hot-key load on the shared cache divides by instance count. Latency for those reads drops to a memory access with no network hop. It degrades gracefully: if the shared cache is slow, local copies keep serving."
+  sacrifice="Instances now actively disagree with each other for up to the local TTL. A value updated centrally is visible on different instances at different moments, so users can see it appear and disappear as they are load balanced."
+  failureModes={[
+    'Inconsistency between instances, visible to a user moving between them',
+    'Memory pressure if the local cache is unbounded',
+    'A cold local cache on every deploy, so the shared cache sees a burst after each rollout',
+  ]}
+  operationalBurden="Low: a library, a size bound and a TTL. The genuine cost is conceptual — you now have two cache layers with different invalidation stories, and 'why is this value different on one server' becomes a recurring question."
+  cost="A few megabytes per instance. Negligible in money, and one of the highest-leverage changes available for read-heavy skewed workloads."
+  whenNot="When the value must be identical for all users at all times — balances, permissions, inventory at point of sale — per-instance disagreement is a correctness problem rather than a staleness one. And when the hot content is public and identical for everyone, the CDN is strictly better: it absorbs the traffic before it reaches you at all."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="dynamo">
+Dynamo uses consistent hashing with virtual nodes to distribute keys evenly across nodes and to
+limit redistribution when membership changes. The paper addresses distribution of many keys; a
+single popular key remains a separate problem.
+</Claim>
+
+<Claim label="convention" source="meta-eng">
+Public engineering writing on large social platforms consistently describes hybrid fanout
+strategies rather than a single approach, precisely because follower distributions are
+heavy-tailed and no single strategy handles both ends.
+</Claim>
+
+<Claim label="recommendation" source="aws-builders-library">
+Measure the busiest partition, not the average. Aggregate utilisation across a cluster hides
+skew almost perfectly: a cluster at 15% average utilisation can contain a node at 100%, and
+only per-node or per-partition metrics reveal it.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you distinguish aggregate load from skewed load. This is one of the most reliable separators in a design interview, because 'shard it' is the reflexive answer and it is wrong for a hot key."
+  depth="Know that a single key cannot be partitioned, and know at least two mitigations with their costs. Recognising a hot partition as a partition-key problem, distinct from a hot key, is a strong signal."
+  followUps={[
+    'One item gets 2 million requests per second. Does sharding help?',
+    'Your cluster averages 20% utilisation and one node is failing. What is happening?',
+    'A user with 50 million followers posts. What happens in your fanout design?',
+    'How would you detect a hot key at runtime?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We will shard by user ID so the load spreads evenly.',
+      why: 'It spreads distinct users evenly and does nothing about one user generating a disproportionate share. A single tenant with a hundred times the traffic of the others still lands on one shard.',
+      instead:
+        'Say what the access distribution actually looks like. If it is heavy-tailed, name the mechanism for the tail specifically, separately from the mechanism for the bulk.',
+    },
+    {
+      mistake: 'Consistent hashing handles the distribution problem.',
+      why: 'It solves redistribution cost when nodes join or leave, and evens out many keys. It has no effect on one key being popular, because there is nothing to redistribute.',
+      instead:
+        'Be precise about which problem you are solving: rebalancing cost, distribution of many keys, or the load of a single key. These are three problems with three different solutions.',
+    },
+    {
+      mistake: 'Average cluster utilisation is 20%, so we have plenty of headroom.',
+      why: 'The average hides the distribution completely. The relevant number is the busiest node, and under skew that can be at capacity while the average looks comfortable.',
+      instead:
+        'Monitor per-node and per-partition maxima. Alert on the busiest partition, not on the cluster mean.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['hot-key', 'sharding']}
+  prompt="One product page receives 2 million requests per second — more than the rest of your catalogue combined. You currently serve it from a 40-node shared cache. What actually helps?"
+  options={[
+    {
+      id: 'a',
+      text: 'Add more cache nodes so the load spreads further',
+      implies: 'You are treating this as an aggregate capacity problem.',
+      why: 'Every one of those 2 million requests is for the same key, which hashes to one node. Adding nodes gives that key more idle neighbours. It also makes things marginally worse, because each node is now provisioned for a smaller share of the key space.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Serve it from the CDN, and keep a short-TTL local cache in each application instance as a fallback',
+      implies: 'You are replicating the value toward the readers rather than trying to divide something indivisible.',
+      why: 'Public, identical content is exactly what an edge cache is for: the requests never reach your infrastructure. The local cache handles the fraction that misses the edge, dividing residual load by instance count. Both work by replication, which is the only mechanism that scales for a single key.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'Split the key into 40 sub-keys and pick one at random per request',
+      implies: 'You are applying key splitting, which is a real technique.',
+      why: 'It works and it is the right answer for hot *writes*, where you must distribute the contention. For a read-heavy public page it is more complex than replication and it still keeps all the traffic inside your infrastructure, which replication avoids entirely.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates read skew from write skew explicitly: replicate for hot reads, split for hot writes. It also notes the operational point — you need to detect the hot key at runtime, because you cannot know in advance which product will go viral, and a static list of 'important keys' is always out of date."
+/>
+
+<Check
+  concepts={['hot-partition', 'load-distribution']}
+  prompt="You partition an events table by date. Ingest is spread across 100 partitions. Why does one partition run hot?"
+  options={[
+    {
+      id: 'a',
+      text: 'The hash function is producing an uneven distribution',
+      implies: 'You are looking for a defect in the partitioning mechanism.',
+      why: 'The distribution is working exactly as specified. The problem is the key you chose to distribute on, not the function distributing it.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: "All new writes have today's date, so they all land in one partition regardless of how many exist",
+      implies: 'You recognise that a monotonically increasing key concentrates writes by construction.',
+      why: 'Partitioning by date means every write goes to the current partition. The other 99 hold history and receive nothing. You have 100 partitions and one active writer, which is the same write throughput as no partitioning at all.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'That partition holds more historical data than the others',
+      implies: 'You are thinking about storage rather than write distribution.',
+      why: 'Storage imbalance is a real problem, but it would not produce a hot partition for writes — an old partition holding more data is not receiving traffic.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer proposes the fix and its cost: compose the key from something high-cardinality plus the time bucket, for example a hash of the entity id combined with the hour, so writes spread while time-range queries remain answerable. It also names the general rule — any monotonically increasing partition key concentrates writes on one partition, which is why auto-increment IDs and timestamps make poor partition keys."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Partitioning, skew and relieving hot spots', sourceId: 'ddia' },
+    {
+      label: 'Consistent hashing and virtual nodes',
+      sourceId: 'dynamo',
+      note: 'Read for what it does solve — redistribution cost and many-key distribution — and note what it does not.',
+    },
+    { label: 'Measuring the busiest partition rather than the average', sourceId: 'aws-builders-library' },
+    {
+      label: 'Next: how a database actually stores and partitions data',
+      href: '/levels/3',
+    },
+  ]}
+/>

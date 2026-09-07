@@ -1,0 +1,403 @@
+---
+id: reliability-costs-round-trips
+title: Reliability Costs Round Trips
+level: 0
+module: l0-transport
+order: 1
+summary: The network drops, duplicates and reorders packets. Everything that hides this from you does so by adding round trips, memory, or both.
+difficulty: intro
+minutes: 26
+prerequisites: [ip, rtt]
+concepts: [tcp, udp, quic, keep-alive, head-of-line-blocking, connection-pooling]
+unlocks: [connection-exhaustion, littles-law, websocket]
+sources: [rfc9293, rfc9000, rfc9112, rfc9113, hpbn]
+status: reviewed
+---
+
+## The problem
+
+Your service makes a call to another service in the same data centre. It usually takes 2
+milliseconds. Occasionally it takes 200. Nothing in either service's logs explains the
+difference, and CPU on both machines is comfortable.
+
+Then you increase traffic by 50%, and the service falls over — not with high CPU, not with a
+full disk, but with requests hanging until they time out.
+
+Both symptoms come from the same place: the machinery that makes an unreliable network look
+reliable. It works well enough that most of the time you can ignore it, and then it stops
+being ignorable in ways that look like magic if you do not know it is there.
+
+## Intuition
+
+The underlying network is a postal service that occasionally loses letters, occasionally
+delivers two copies, and does not promise to deliver them in the order you posted them.
+
+If you want a conversation on top of that, somebody has to do bookkeeping: number the letters,
+notice which ones did not arrive, send them again, and hold later letters back until the
+missing one turns up so the recipient reads them in order.
+
+That bookkeeping is what TCP does for you. It is genuinely excellent, and it costs three
+things:
+
+1. **A conversation before the conversation.** Both sides must agree on where the numbering
+   starts, which takes a round trip.
+2. **Memory on both ends**, for the letters that have been sent but not yet acknowledged, and
+   for those that arrived out of order.
+3. **Waiting**, when a letter goes missing. Everything behind it is held back until it
+   arrives.
+
+Every performance surprise in this lesson comes from one of those three.
+
+## Concretely
+
+<Example title="Why one dropped packet can delay unrelated work">
+
+You load a page that needs six files. Over one HTTP/2 connection, all six are requested at
+once, interleaved on the same TCP connection.
+
+One packet — belonging to file three — is lost.
+
+TCP delivers bytes in order. It cannot hand the application the data for files four, five and
+six that arrived successfully, because in TCP's view they come *after* the missing bytes in
+the same stream. So it holds everything until the retransmission arrives, roughly one round
+trip later.
+
+Five files that arrived fine are stuck waiting for one that did not. This is
+<C id="head-of-line-blocking">head-of-line blocking</C>, and it is not a bug in TCP: it is the
+direct consequence of promising an ordered byte stream.
+
+<Claim label="fact" source="rfc9000">
+QUIC addresses exactly this by providing multiple streams with independent delivery within a
+single connection, so loss affecting one stream does not block delivery on the others.
+</Claim>
+
+</Example>
+
+## Formal explanation
+
+<C id="tcp" /> gives you an ordered, reliable byte stream between two endpoints. To do that it
+maintains state on both machines: sequence numbers, acknowledgements, a retransmission timer,
+a send buffer, a receive buffer, and a congestion window that estimates how much data the
+path can absorb.
+
+Three properties of that design matter for system design:
+
+- **Connection setup costs a round trip** before any application data can move, because both
+  sides must exchange initial sequence numbers. Add TLS and it is two.
+- **Connections are stateful and finite.** Each one occupies a file descriptor, kernel
+  buffers, and, if TLS is involved, session memory. A machine has a hard ceiling on how many
+  it can hold, and that ceiling is usually reached long before CPU is.
+- **Loss is interpreted as congestion.** TCP responds to loss by slowing down. On a path where
+  loss comes from something else — a flaky wireless link — this makes the connection slower
+  for reasons unrelated to load.
+
+<C id="udp" /> gives you none of this: packets, unordered, unacknowledged. That is not a
+deficiency but an invitation to build exactly the guarantees you need. A video call would
+rather drop a frame than wait for a retransmission of a frame that is now in the past.
+
+<C id="quic" /> takes that invitation. It runs over UDP and rebuilds reliability with two
+changes: the transport and cryptographic handshakes are combined into a single exchange rather
+than performed in sequence, and reliability is per-stream rather than per-connection.
+
+<Deeper title="Why connection reuse matters more than it sounds like it should">
+
+Consider a service making 1,000 calls per second to a dependency 1 ms away, opening a new
+connection each time.
+
+Each call now costs a handshake round trip before the request. That is 1 ms of pure waiting
+added to every call, doubling the latency of a 1 ms request. Worse, each connection occupies a
+socket on both machines for its lifetime plus the operating system's lingering close state,
+so at 1,000 per second you accumulate tens of thousands of sockets in various stages of
+teardown.
+
+With connection reuse you pay the handshake once and amortise it over thousands of requests.
+
+<Claim label="fact" source="rfc9112">
+HTTP/1.1 makes persistent connections the default: a connection is reused for subsequent
+requests unless a party signals otherwise.
+</Claim>
+
+<Claim label="fact" source="rfc9113">
+HTTP/2 goes further, multiplexing concurrent requests over a single connection, so concurrency
+no longer requires opening several connections in parallel.
+</Claim>
+
+This is why <C id="connection-pooling">connection pooling</C> appears in every serious
+service, and why a misconfigured pool is one of the most common causes of mysterious latency.
+
+</Deeper>
+
+## Architecture
+
+<Arch
+  caption="What sits between your code and the wire, and what each layer costs."
+  columns={[
+    { title: 'Your code', nodes: [{ id: 'app', label: 'Application', tone: 'accent' }] },
+    { title: 'Pooling', nodes: [{ id: 'pool', label: 'Connection pool', note: 'bounded' }] },
+    { title: 'Transport', nodes: [{ id: 'tls', label: 'TLS', note: '1 RTT' }, { id: 'tcp', label: 'TCP', note: '1 RTT + buffers' }] },
+    { title: 'Network', nodes: [{ id: 'ip', label: 'IP', note: 'best effort' }] },
+  ]}
+  edges={[
+    { from: 'app', to: 'pool', label: 'borrow' },
+    { from: 'pool', to: 'tls' },
+    { from: 'tls', to: 'tcp' },
+    { from: 'tcp', to: 'ip' },
+  ]}
+  stages={[
+    {
+      label: 'What you write',
+      show: ['app', 'ip'],
+      because:
+        'From the application, a network call looks like a function call that occasionally fails. That model is what makes the surprises surprising.',
+    },
+    {
+      label: 'What is actually there',
+      show: ['app', 'tls', 'tcp', 'ip'],
+      because:
+        'Two handshakes stand between your first byte and the wire, and TCP holds buffers on both machines for the lifetime of the connection.',
+    },
+    {
+      label: 'What you add on purpose',
+      show: ['app', 'pool', 'tls', 'tcp', 'ip'],
+      because:
+        'The pool exists to amortise the handshakes. It also becomes a concurrency limit, which is the second most useful thing about it and the most common source of confusion.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: '10 requests/sec',
+      behaviour: 'Connections are cheap. Opening one per request costs latency you may not notice.',
+      firstToBreak: 'Nothing, but the habit is being formed.',
+    },
+    {
+      scale: '1,000 requests/sec',
+      behaviour:
+        'Handshake cost is now a visible share of latency, and socket churn is measurable.',
+      firstToBreak:
+        'Sockets in teardown state, then ephemeral port exhaustion on the client side.',
+    },
+    {
+      scale: '10,000 concurrent connections',
+      behaviour:
+        'Kernel buffers and TLS session state become a real memory line. Handshake CPU is significant.',
+      firstToBreak: 'File descriptor limits, then memory, long before request-handling CPU.',
+    },
+    {
+      scale: '1,000,000 concurrent connections',
+      behaviour:
+        'A single origin cannot hold them. Connections must be terminated near users and multiplexed onward.',
+      firstToBreak:
+        'The connection tier itself. This is the reason edge termination exists as a product.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Connection pool exhausted',
+      symptom:
+        'Requests hang rather than fail. Latency climbs steeply while CPU stays low. Adding servers helps less than expected.',
+      cause:
+        'Concurrency equals arrival rate times service time. When a dependency slows down, each request holds its connection longer, so the number of connections needed rises even though the request rate has not.',
+      mitigation:
+        'Size the pool from measured concurrency, set an acquisition timeout so waiting is bounded, and set a request timeout so a slow dependency cannot hold connections indefinitely.',
+    },
+    {
+      what: 'No timeout on a network call',
+      symptom:
+        'A dependency becomes slow and your service becomes unavailable, with threads or connections all occupied waiting.',
+      cause:
+        'TCP will retransmit patiently for a long time. Without an application timeout, a request can wait far longer than any user will.',
+      mitigation:
+        'Every network call gets an explicit timeout, derived from the latency budget rather than from how long the dependency usually takes.',
+    },
+    {
+      what: 'Ephemeral port exhaustion',
+      symptom:
+        'Connection attempts fail from one machine to one destination while everything else works.',
+      cause:
+        'Each outbound connection consumes a local port for the duration plus the lingering close period. High connection churn to a single destination exhausts the range.',
+      mitigation:
+        'Reuse connections. This is a symptom of not pooling, and pooling is the fix rather than tuning kernel parameters.',
+    },
+    {
+      what: 'Head-of-line blocking on a multiplexed connection',
+      symptom:
+        'One slow or lost response delays unrelated responses sharing the connection. Appears as correlated latency spikes across unrelated endpoints.',
+      cause:
+        'TCP delivers a single ordered byte stream, so loss stalls everything behind it regardless of which logical stream it belongs to.',
+      mitigation:
+        'HTTP/3 over QUIC gives per-stream reliability. Where that is unavailable, spread traffic over several connections so one stall has a bounded blast radius.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Use a bounded connection pool for calls to a downstream service"
+  options={[
+    'A new connection per request',
+    'An unbounded pool that grows to meet demand',
+    'A bounded pool with an acquisition timeout',
+  ]}
+  why="A bounded pool amortises handshakes and, just as importantly, puts a hard ceiling on how much concurrency you can push at a dependency. That ceiling is a feature: it is backpressure, applied at the point where it is cheapest to apply."
+  gain="Handshake cost is paid once per connection rather than once per request. The dependency is protected from being overwhelmed by your service, and your service fails fast instead of accumulating unbounded in-flight work."
+  sacrifice="Under load, requests wait for a connection. That wait is invisible in the dependency's metrics and shows up as latency in yours, which makes it easy to misdiagnose as the dependency being slow."
+  failureModes={[
+    'Pool too small: requests queue and latency climbs while the dependency looks healthy',
+    'Pool too large: you become the reason the dependency falls over',
+    'No acquisition timeout: the queue for the pool becomes unbounded, which is the problem the bound was meant to prevent',
+  ]}
+  operationalBurden="Low, but it needs monitoring that most teams forget: pool utilisation and acquisition wait time. Without those two metrics this failure is very hard to diagnose from the outside."
+  cost="Memory for idle connections, and idle connections on the dependency too. Usually trivial; occasionally significant when many services each hold a pool to a shared database."
+  whenNot="For calls that are genuinely rare — a nightly job, a one-off admin action — a pool adds a moving part with no benefit. And for connections that are expensive on the server side, such as a database with a low connection limit, the right answer may be a shared external pooler rather than a pool per application instance."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="rfc9293">
+TCP establishes a connection through a three-way handshake and maintains per-connection state
+for sequencing, acknowledgement and retransmission. This state is why connections are a
+bounded resource on both endpoints.
+</Claim>
+
+<Claim label="recommendation">
+Treat connection pool metrics as first-class. Utilisation and acquisition wait time diagnose a
+class of incident that is otherwise invisible: the service is slow, the dependency reports
+normal latency, and CPU is idle on both. The queue is inside your own process.
+</Claim>
+
+<Claim label="convention" source="hpbn">
+Connection reuse, TLS session resumption, and reducing the number of sequential round trips
+are the standard levers for latency on the web, and they matter more than payload size for
+typical page loads. The general principle transfers to service-to-service calls.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you know that a hang is different from an error, and that the resource which runs out first is rarely CPU. This is the foundation for every later conversation about timeouts, backpressure and cascading failure."
+  depth="You should be able to explain why a handshake costs a round trip and why connections are finite. You do not need TCP state machine details unless the role is network-adjacent."
+  followUps={[
+    'Requests are timing out but CPU is at 20%. What do you look at?',
+    'Why does a slow dependency reduce your throughput even though you are not doing more work?',
+    'When would you choose UDP or QUIC over TCP?',
+    'You increase your connection pool size and things get worse. Why might that be?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'We increased the connection pool size to fix the latency.',
+      why: 'If the dependency is the bottleneck, a bigger pool sends it more concurrent work, which makes its latency worse, which makes you need an even bigger pool. This is a feedback loop, and it usually ends with the dependency falling over.',
+      instead:
+        'Find out whether the wait is for a connection or inside the dependency. If the dependency is saturated, the correct move is fewer concurrent requests, not more.',
+    },
+    {
+      mistake: 'We set generous timeouts so we do not fail requests unnecessarily.',
+      why: 'A timeout longer than the caller is willing to wait is not a timeout, it is a resource leak. The request will be abandoned upstream while your service continues holding a connection for it.',
+      instead:
+        'Derive the timeout from the latency budget for the whole user-facing request, then divide it among the calls that must happen in sequence.',
+    },
+    {
+      mistake: 'HTTP/2 multiplexing means we no longer need multiple connections.',
+      why: 'Multiplexing removes the need for parallel connections to achieve concurrency, but everything on one TCP connection still shares one ordered byte stream, so packet loss stalls all of it.',
+      instead:
+        'Understand what multiplexing removed and what it did not. Per-stream reliability requires QUIC, not HTTP/2.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['connection-pooling', 'littles-law']}
+  prompt="Your service handles 500 requests per second. Each request makes one call to a dependency, which normally responds in 20 ms. The dependency slows to 200 ms. Your connection pool holds 20 connections. What happens?"
+  options={[
+    {
+      id: 'a',
+      text: 'Throughput is unaffected, latency rises by 180 ms',
+      implies: 'You are treating the dependency latency as an additive delay only.',
+      why: 'Concurrency is arrival rate times service time. At 20 ms you needed 500 × 0.02 = 10 concurrent connections, which the pool covered. At 200 ms you need 500 × 0.2 = 100, and you have 20. Requests now queue for a connection, so latency rises by far more than 180 ms and throughput is capped.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'Throughput is capped at about 100 requests per second and the rest queue or time out',
+      implies: 'You applied Little’s law and found the new concurrency requirement.',
+      why: 'With 20 connections and a 200 ms service time, the pool can complete at most 20 / 0.2 = 100 requests per second. The remaining 400 per second arrive with nowhere to go, so the queue for the pool grows without bound until something times out.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'The pool grows automatically to meet demand',
+      implies: 'You are assuming elasticity where there is a fixed bound.',
+      why: 'A bounded pool does not grow, and that is deliberate — an unbounded one would push 100 concurrent requests at an already-struggling dependency. The bound converts a dependency problem into a queue you can see and shed from.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer names the second-order effect: the queue for the pool is invisible in the dependency's metrics, so the dependency looks healthy while your service is failing. It then proposes the fix — an acquisition timeout so waiting is bounded, and load shedding so the requests you cannot serve fail fast rather than occupying memory."
+/>
+
+<Check
+  concepts={['head-of-line-blocking', 'quic']}
+  prompt="You move from six parallel HTTP/1.1 connections to a single multiplexed HTTP/2 connection. On a lossy mobile network, page load gets worse. Why?"
+  options={[
+    {
+      id: 'a',
+      text: 'HTTP/2 has more protocol overhead than HTTP/1.1',
+      implies: 'You are looking at bytes on the wire.',
+      why: 'HTTP/2 has less overhead, not more: header compression and binary framing reduce it. Overhead is not what changed here.',
+      credit: 'none',
+    },
+    {
+      id: 'b',
+      text: 'All streams now share one TCP connection, so one lost packet stalls every stream',
+      implies: 'You understand that multiplexing moved the concurrency but not the ordering guarantee.',
+      why: 'With six connections, loss on one stalls one sixth of the work. With one connection, TCP holds back every stream behind the missing bytes, because it delivers a single ordered stream regardless of the logical streams above it. On a lossy path, that concentration hurts.',
+      credit: 'full',
+    },
+    {
+      id: 'c',
+      text: 'A single connection has less bandwidth available than six',
+      implies: 'You are thinking about capacity per connection.',
+      why: 'Partly true historically, because congestion control ramps up per connection, but on a lossy network the dominant effect is head-of-line blocking rather than aggregate bandwidth.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer names the resolution: this is precisely the problem QUIC was designed for, giving each stream independent delivery so loss is contained to the stream it affects. It also notes that the trade-off is workload-dependent — on a clean network, one multiplexed connection is clearly better."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'TCP: connection establishment and reliable delivery', sourceId: 'rfc9293' },
+    {
+      label: 'QUIC: combined handshake and per-stream reliability',
+      sourceId: 'rfc9000',
+      note: 'The design rationale is unusually readable and explains what problem each departure from TCP solves.',
+    },
+    { label: 'Latency, bandwidth and connection behaviour on real networks', sourceId: 'hpbn' },
+    {
+      label: "Next: Little's law, and why concurrency is the number you actually need",
+      href: '/concepts/littles-law',
+    },
+  ]}
+/>

@@ -1,0 +1,429 @@
+---
+id: the-part-that-must-keep-working
+title: The Part That Must Keep Working
+level: 8
+module: l8-evolution
+order: 2
+summary: Every system splits into the part that decides and the part that serves. Most outages start in the first, which is why the second must survive it.
+difficulty: staff
+minutes: 26
+prerequisites: [migrating-a-live-system, how-failures-spread]
+concepts: [control-plane-vs-data-plane]
+unlocks: [blast-radius, graceful-degradation, feature-flag, disaster-recovery, chaos-testing]
+patterns: [cell-based-architecture, circuit-breaker]
+failures: [health-check-collapse]
+sources: [aws-builders-library, sre-book, release-it, rfc1035, aws-well-architected]
+status: reviewed
+---
+
+## The problem
+
+14:02. A configuration change is pushed — a routine one, adding a backend to a service. The
+pipeline validates it, publishes it, and reports success.
+
+14:02:30. The first load balancers poll for the new configuration. A bug in the generator emitted
+an empty backend list. Each balancer receives it, applies it faithfully, and now has zero backends
+for that service.
+
+14:03:30. Every balancer has polled. Every one of them is returning errors. The entire service is
+down.
+
+Not one server failed. Every application instance is healthy, idle, and reachable, running the
+same code it ran at 14:01. They are unreachable because the thing that tells traffic where to go
+was told there is nowhere to go, and believed it.
+
+Each balancer had a perfectly good backend list in memory thirty seconds earlier. It threw that
+away because something newer arrived.
+
+## Intuition
+
+Every system has two parts, and most designs never name them separately.
+
+The **data plane** does the work. It serves requests, moves packets, runs queries, delivers
+messages. It is large, repetitive, and does the same thing millions of times a second.
+
+The **control plane** decides what the data plane should do. Which backends exist. What the routing
+rules are. Who has what quota. Which version is deployed, and to whom. It is small, complex, and
+changes constantly.
+
+Three asymmetries follow from that, and together they produce the whole lesson:
+
+- **Change.** The control plane changes many times a day; the data plane changes rarely. Most
+  outages are caused by change, so most outages originate in the control plane.
+- **Complexity.** The control plane is where the interesting logic lives; the data plane is
+  deliberately dull. That is the right direction — you want the complexity where the blast radius
+  is smallest.
+- **Scale.** The data plane handles the traffic; the control plane is sized for the rate of
+  decisions, which is thousands of times smaller.
+
+Put those together and the rule is not a preference, it is arithmetic: **the data plane must keep
+working when the control plane is unavailable.** Not degrade gracefully, not fail politely — keep
+serving, on the last configuration it knew was good, for as long as it takes.
+
+That property has a name: **static stability**. A statically stable system's steady state does not
+depend on anything continuing to make decisions.
+
+## Concretely
+
+<Example title="The same question, asked of three systems">
+
+The question is always the same: *what does the data plane do when it cannot hear from the control
+plane?*
+
+**DNS.** A resolver holds a record until its TTL expires, then tries to refresh. If the
+authoritative server is unreachable, resolution continues with what it has. The data plane —
+answering queries — is decoupled from the control plane by design, and the TTL is an explicit
+statement of how long that decoupling lasts. This is the oldest and most successful example of the
+pattern in production.
+
+**A load balancer polling for backends.** If it treats a failed fetch as an empty result, it fails
+closed and the service dies. If it treats it as *keep what I have*, it fails static and the service
+continues. Same code path, one line different, and the difference is a total outage.
+
+**A feature flag evaluated by a network call.** When the call fails, does the feature default on or
+off? Whichever you choose, it must be chosen. A library default decides it otherwise, and it will
+decide it during an incident, in a direction nobody predicted.
+
+There are only three possible answers to the question, and only one of them is ever chosen by
+accident:
+
+1. Keep the last known good state. **Static.**
+2. Fall back to a compiled-in default. **Predictable, and possibly wrong.**
+3. Stop. **Almost never intended, and the default in most implementations.**
+
+</Example>
+
+## Formal explanation
+
+<C id="control-plane-vs-data-plane" /> is a split by *responsibility*, not by technology. The
+control plane decides; the data plane executes. Any system can be described this way, and the
+description is useful precisely because it identifies which half you are allowed to lose.
+
+**The prohibition.** The data plane must not have a **synchronous dependency** on the control
+plane. If serving a request requires a live call to the thing that holds configuration, then a
+control-plane outage is a data-plane outage, and every property below is unavailable to you.
+
+This is violated more often by accident than by decision. A per-request authorisation lookup, a
+feature flag evaluated over the network, a quota check against a central service, a service
+discovery call that is not cached — each is a small, reasonable-looking piece of code that quietly
+makes a small complex system a hard dependency of a large simple one.
+
+**Static stability.** The system continues in its current state without needing new instructions.
+An instance that already has its configuration, its certificates, its routing table and its backend
+list serves indefinitely. What it cannot do is *change* — no new deployments, no new backends, no
+scaling — and that is exactly the right thing to lose, because those are the operations that were
+going to be paused during the incident anyway.
+
+**Distinguish no data from no answer.** The 14:02 outage happened because an empty response and a
+failed response were handled identically, and both were treated as truth. They are different
+propositions:
+
+- *The control plane says there are zero backends.* Possible, and almost never what you meant.
+- *The control plane did not answer.* Says nothing about backends at all.
+
+Treat an empty configuration as suspicious by policy: reject a configuration that removes more than
+some fraction of the current state, and require an explicit override for the case where you really
+did mean to empty it. This costs one validation rule and prevents a whole family of total outages.
+
+**Recovery is its own failure mode.** When the control plane returns, every data-plane instance
+notices at once and asks it for the current state. A control plane sized for a steady trickle of
+decisions receives its entire population simultaneously, and falls over again. Jittered polling and
+a server-directed retry delay are not optional extras here — they are what makes the recovery
+survivable.
+
+<Callout kind="warn" title="The rollback path is part of the control plane">
+The uncomfortable case: your configuration is broken, and the mechanism for fixing configuration is
+the thing that is broken.
+
+So the emergency path must not depend on the normal path. A previous configuration cached on each
+instance and applied by a local command; a static fallback baked into the image; a break-glass
+route that bypasses the pipeline entirely. Whichever you choose, it needs to be exercised, because
+a rollback procedure that has never been run is a plan rather than a capability.
+</Callout>
+
+## Architecture
+
+<Arch
+  caption="Configuration flows down on a schedule. A request never travels back up."
+  columns={[
+    { title: 'Operators', nodes: [{ id: 'human', label: 'Change', note: 'deploy, config, scale' }] },
+    { title: 'Control plane', nodes: [{ id: 'cp', label: 'Config service', note: 'small, complex, changes often' }] },
+    { title: 'Distribution', nodes: [{ id: 'poll', label: 'Poll + validate', note: 'jittered', tone: 'accent' }] },
+    { title: 'Data plane', nodes: [{ id: 'cache', label: 'Local cached config', note: 'last known good', tone: 'accent' }, { id: 'serve', label: 'Serving instances', note: 'large, simple, changes rarely' }] },
+    { title: 'Users', nodes: [{ id: 'user', label: 'Traffic' }] },
+  ]}
+  edges={[
+    { from: 'human', to: 'cp' },
+    { from: 'cp', to: 'poll' },
+    { from: 'poll', to: 'cache', label: 'only if sane' },
+    { from: 'cache', to: 'serve' },
+    { from: 'user', to: 'serve' },
+  ]}
+  stages={[
+    {
+      label: 'Ask when you need it',
+      show: ['human', 'cp', 'serve', 'user'],
+      because:
+        'Instances call the config service to find out what to do. Simple, always current, and it makes a small complex system a hard dependency of the whole product. Its outage is a total outage.',
+    },
+    {
+      label: 'Cache the last good state',
+      show: ['human', 'cp', 'poll', 'cache', 'serve', 'user'],
+      because:
+        'Configuration is fetched on a schedule and held locally, so serving never waits on the control plane. The system now survives a control-plane outage of any length, and gives up the ability to change during one — which is the right thing to lose.',
+    },
+    {
+      label: 'Refuse configurations that look wrong',
+      show: ['human', 'cp', 'poll', 'cache', 'serve', 'user'],
+      because:
+        'A validation step between fetch and apply rejects a config that removes most of the current state, and treats a failed fetch as no news rather than as an empty answer. This is the single line that separates the 14:02 outage from a logged warning.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'One service, config in a file',
+      behaviour:
+        'The control plane is a deploy. There is no runtime dependency to lose, and static stability is free.',
+      firstToBreak:
+        'Nothing. The pressure that eventually introduces a config service is wanting to change something without a deploy.',
+    },
+    {
+      scale: 'Runtime configuration and flags',
+      behaviour:
+        'A config service appears. Changing behaviour no longer needs a release, which is a real gain.',
+      firstToBreak:
+        'The first flag evaluated with a synchronous network call. From that moment the flag service is on the critical path of every request.',
+    },
+    {
+      scale: 'Service discovery and dynamic routing',
+      behaviour:
+        'The control plane now decides where traffic goes. Its outage becomes plausible as a total outage.',
+      firstToBreak:
+        'Any component that treats a missing or empty answer as authoritative. This is where the 14:02 failure lives.',
+    },
+    {
+      scale: 'Multi-region, many services',
+      behaviour:
+        'The control plane is global and the data planes are regional. A regional data plane can serve while the global control plane is unreachable.',
+      firstToBreak:
+        'The recovery, when every instance in every region re-synchronises at the same moment against a control plane sized for a trickle.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Empty configuration applied as truth',
+      symptom: 'Total outage seconds after a routine configuration push. Every server is healthy.',
+      cause: 'An empty result was treated as a valid instruction rather than as an implausible one.',
+      mitigation: 'Reject a configuration that removes more than a set fraction of the current state, and require an explicit override for a genuine emptying. Treat a failed fetch as no news, never as no data.',
+    },
+    {
+      what: 'Synchronous dependency on the control plane',
+      symptom: 'A config or flag service degrades and every request slows or fails, across every service.',
+      cause: 'Serving a request required a live call to the control plane, so its latency and availability became the product\’s.',
+      mitigation: 'Cache locally with a background refresh, and make the request path read only from local state. A control-plane call on the request path is a design defect regardless of how fast it usually is.',
+    },
+    {
+      what: 'Config cache expires mid-outage',
+      symptom: 'The system survives a control-plane outage for exactly the cache lifetime, then fails all at once.',
+      cause: 'The cached configuration had a hard expiry, so it failed closed precisely when the control plane could not refresh it.',
+      mitigation: 'Serve the last known good state past its expiry, and alarm on its age instead. Staleness is visible and survivable; expiry during an outage is neither.',
+    },
+    {
+      what: 'Recovery stampede',
+      symptom: 'The control plane comes back, is immediately overwhelmed, and goes down again in a cycle.',
+      cause: 'Every data-plane instance re-synchronised at the same instant against a service sized for a trickle of decisions.',
+      mitigation: 'Jittered polling, a server-directed retry delay, and enough control-plane capacity to serve a full re-synchronisation — which is a separate capacity number from steady state.',
+    },
+    {
+      what: 'Rollback needs the broken thing',
+      symptom: 'The bad configuration cannot be reverted because reverting goes through the pipeline that produced it.',
+      cause: 'The emergency path was the normal path with a different input.',
+      mitigation: 'A local previous-configuration file, applied by a command that touches nothing central. Exercise it on a schedule, because it is only useful on the day everything else is unavailable.',
+    },
+    {
+      what: 'Silent config drift',
+      symptom: 'Instances behave differently and nobody can say which configuration each is running.',
+      cause: 'Fetches happen at different times, some fail silently, and nothing reports the applied version.',
+      mitigation: 'Emit the applied configuration version and its age as metrics, and alarm on spread across the fleet as well as on absolute age.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Serve the last known good configuration indefinitely rather than expiring it"
+  options={[
+    'Fetch configuration per request from the control plane',
+    'Cache with a hard expiry, and fail when it lapses',
+    'Cache with a hard expiry, and keep serving the stale copy past it',
+    'Compile configuration into the deployment artefact, so it changes only on release',
+  ]}
+  why="An expiry that lapses during a control-plane outage converts a survivable incident into a total one, at the exact moment refresh is impossible. Nothing about the configuration became wrong when the clock passed a threshold — only your confidence in it did, and confidence is not a reason to stop serving."
+  gain="The data plane survives a control-plane outage of any duration. Recovery is a resynchronisation rather than a restart. The blast radius of the most change-prone, most complex component stops including the serving path."
+  sacrifice="A stale configuration can persist without limit and without anyone noticing. A revoked permission, a disabled feature or a removed backend stays in effect until the next successful fetch, which may be much later than anyone assumes."
+  failureModes={[
+    'A permission revoked in the control plane still honoured by an instance that has not refreshed',
+    'Drift, where instances run different configurations because they last fetched at different times',
+    'A stale configuration that is never noticed because nothing alarms on its age',
+  ]}
+  operationalBurden="Low in code, real in discipline. It needs the applied version and its age exported as metrics, an alarm on both age and fleet-wide spread, and a local override path that is exercised rather than documented."
+  cost="Negligible. This is one of the few reliability improvements that is close to free, which is a good reason to be suspicious of designs that have not taken it."
+  whenNot="When the configuration carries something that must be revocable within a bounded time — an access grant, a compromised credential, a legal hold. There, unbounded staleness is the failure rather than the protection, and the right shape is a bounded window with an explicit, decided behaviour when it lapses. Note that this is an argument for keeping revocation *out* of the same channel as routing configuration, so that one can fail static while the other fails closed."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="convention" source="aws-builders-library">
+Static stability is described as a design goal in which a system continues to operate correctly
+without needing to make changes during a failure, on the grounds that the mechanisms which make
+changes are themselves likely to be impaired at that moment.
+</Claim>
+
+<Claim label="fact" source="rfc1035">
+DNS records carry a time to live, and resolvers answer from cache for that duration without
+contacting an authoritative server. Resolution therefore continues while the authoritative side is
+unreachable, which is a decoupling of serving from control expressed as a protocol field.
+</Claim>
+
+<Claim label="convention" source="sre-book">
+A significant share of production incidents originate in change — configuration pushes and
+releases — rather than in hardware or organic load, which is why limiting the blast radius of
+change is treated as a primary reliability practice.
+</Claim>
+
+<Claim label="convention" source="release-it">
+A component that every request depends on transmits its own failures to everything downstream, so
+shared dependencies on the request path deserve scrutiny in proportion to how many callers they
+have rather than to how often they fail.
+</Claim>
+
+<Claim label="recommendation" source="aws-well-architected">
+Workloads should be designed so that the data plane can continue to operate when the control plane
+is unavailable, and recovery mechanisms should avoid depending on the components most likely to be
+impaired during the event they exist to recover from.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can identify which half of your own design is allowed to fail. Most candidates draw a config or discovery service and never say what happens when it is unreachable, which is the question that separates a diagram from a design."
+  depth="Be able to point at the control plane and the data plane in your own drawing. Have an answer for what a serving instance does when it cannot reach configuration. Recognise that recovery is a separate capacity problem."
+  followUps={[
+    'Your service discovery is unreachable for twenty minutes. What is serving traffic?',
+    'A config push produces an empty list. What stops that being a total outage?',
+    'How do you roll back a bad configuration if the pipeline that pushed it is broken?',
+    'The control plane comes back. What happens in the next five seconds?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Evaluating a feature flag with a network call on the request path.',
+      why: 'It puts a small, frequently changed service into the critical path of every request in the product. Its latency becomes your latency and its outage becomes your outage, in exchange for a freshness nobody asked for.',
+      instead:
+        'Fetch the flag set in the background, evaluate locally, and define what each flag does when the set is stale or missing. The default for an unreachable flag service should be a decision recorded next to the flag, not a library default.',
+    },
+    {
+      mistake: 'Treating an empty response as an authoritative answer.',
+      why: 'Zero backends, zero rules or zero tenants is almost always a bug rather than an instruction, and applying it faithfully turns a producer-side defect into a consumer-side total outage within one poll interval.',
+      instead:
+        'Validate the shape of the change, not only its syntax. Reject anything that removes most of the current state unless it carries an explicit override, and log loudly when you do.',
+    },
+    {
+      mistake: 'Assuming the control plane is available during an incident.',
+      why: 'It is the most complex and most frequently changed part of the system, so it is disproportionately likely to be involved in the incident. Building recovery procedures on top of it means the tools are unavailable exactly when they are needed.',
+      instead:
+        'Make every emergency path independent of the normal path, and exercise it on a schedule. A procedure that has only ever been written down is a hypothesis about your own system.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['control-plane-vs-data-plane', 'blast-radius']}
+  prompt="Your service fetches its routing rules from a central configuration service every 30 seconds and caches them for 5 minutes. The configuration service is down for 20 minutes. What happens, and what would you change?"
+  options={[
+    {
+      id: 'a',
+      text: 'It serves for five minutes and then fails, because the cache expires and cannot be refreshed. Serve the last known good state past expiry and alarm on its age instead.',
+      implies: 'You see that a hard expiry fails closed at the worst possible moment.',
+      why: 'Nothing about the rules became wrong at the five-minute mark. What lapsed was confidence, and confidence is not a reason to stop serving — especially when the mechanism for restoring it is the thing that is broken. Serving stale rules with a loud alarm on their age is strictly better: the operator sees the problem, and users do not.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'It serves fine for the whole twenty minutes, since it has a cache.',
+      implies: 'You are reading the cache as protection without checking what happens at its boundary.',
+      why: 'A cache with a hard expiry protects you for exactly its lifetime and then removes the protection. Five minutes into a twenty-minute outage the system fails, and it fails everywhere at once because every instance expires on roughly the same schedule.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Increase the cache lifetime to an hour so it covers longer outages.',
+      implies: 'You are extending the window rather than removing the cliff.',
+      why: 'It covers this outage and not the next one, and it makes ordinary staleness worse for every hour of every normal day. The cliff is still there; you have moved it somewhere less convenient to discover.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer adds the recovery. When the configuration service returns, every instance notices within one poll interval and asks at once — so it needs jittered polling and enough capacity to serve a full fleet resynchronisation, which is a different capacity number from steady state. It also notes what you deliberately give up by serving stale indefinitely: the ability to make a change take effect, which is fine for routing and not fine for a revocation, and that difference is an argument for putting revocations on their own channel."
+/>
+
+<Check
+  concepts={['control-plane-vs-data-plane']}
+  prompt="Which of these is a control-plane failure that should not affect serving, and which is a data-plane failure?"
+  options={[
+    {
+      id: 'a',
+      text: 'The deployment pipeline is broken — control plane, no serving impact. A serving instance runs out of memory — data plane, immediate impact.',
+      implies: 'You are classifying by whether the component participates in serving a request.',
+      why: 'The test is direct: does a user request pass through this? A broken pipeline means nothing new can ship, which is inconvenient and invisible to users. An instance out of memory is serving traffic badly right now. The classification is not about which team owns it or how central it feels — it is about whether it is on the path.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Both are control-plane failures, because both are infrastructure rather than application logic.',
+      implies: 'You are dividing by layer rather than by responsibility.',
+      why: 'The split is not infrastructure versus application. A load balancer is infrastructure and is squarely data plane; a business-rules service that decides quotas is application code and is squarely control plane. What matters is whether it decides or whether it serves.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'It depends on whether serving instances need the pipeline while running — if they pull code or config from it per request, its failure is a data-plane failure.',
+      implies: 'You are testing for a synchronous dependency rather than assuming the label.',
+      why: 'This is the sharper version of the distinction and it is worth holding. A control-plane component that the data plane calls synchronously has stopped being a control plane in any useful sense: its failure is a serving failure, whatever the architecture diagram calls it. That is precisely the design defect the whole lesson is about.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer notes that the classification is a property of the design rather than of the component, and that it can be lost by accident. A service discovery system is control plane when instances cache its answers and data plane the moment somebody adds an uncached lookup to a request handler. So the useful practice is not labelling the boxes once, but auditing the request path for calls to anything in the control-plane half — because that is where the property quietly disappears."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Static stability, and why recovery must not depend on the impaired component', sourceId: 'aws-builders-library' },
+    { label: 'TTLs as the original decoupling of serving from control', sourceId: 'rfc1035' },
+    { label: 'Change as the dominant source of production incidents', sourceId: 'sre-book' },
+    { label: 'Shared dependencies and how failures travel along them', sourceId: 'release-it' },
+    { label: 'Next: why the org chart ends up in the system diagram', href: '/lessons/people-shape-architecture' },
+  ]}
+/>

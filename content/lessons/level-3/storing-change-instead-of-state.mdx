@@ -1,0 +1,445 @@
+---
+id: storing-change-instead-of-state
+title: Storing Change Instead of State
+level: 3
+module: l3-specialised
+order: 2
+summary: Every UPDATE destroys information. Usually that is fine. When it is not, the fix must be chosen before the first row is written.
+difficulty: advanced
+minutes: 28
+prerequisites: [other-shapes-of-store, transactions-across-machines]
+concepts: [event-sourcing, cqrs, immutability, denormalisation]
+unlocks: [cdc, audit-log, replay, eventual-consistency, olap, outbox]
+patterns: [cqrs, transactional-outbox]
+sources: [ddia, martin-fowler, kafka-docs, elasticsearch-docs, clickhouse-docs]
+status: reviewed
+---
+
+## The problem
+
+A customer says their account balance is wrong. It reads 47.
+
+The support engineer opens the row. It says 47. There is a `updated_at` from Tuesday and nothing
+else. What did it used to be? What changed it? Was it one adjustment or nine? Did a retry apply a
+credit twice?
+
+Nobody can say, because the answer was overwritten. The column holds the current value and the
+system was never asked to remember anything else. So the investigation becomes a search through
+application logs, which were sampled, rotated after fourteen days, and never designed to answer
+this question.
+
+Meanwhile a second team wants a report on how balances moved through the quarter. That data does
+not exist. It never existed. It was destroyed continuously, one `UPDATE` at a time, by a system
+working exactly as designed.
+
+## Intuition
+
+There are two ways to record what a bank account is doing.
+
+**Write down the balance and change it.** The current value is instantly available and one row per
+account. Every change replaces the previous truth.
+
+**Write down each transaction and add them up.** The balance is derived. Every change is a new
+line and nothing is ever removed.
+
+A real bank does the second, and not for technical reasons. It does it because &ldquo;how did we
+get here&rdquo; is a question someone will certainly ask, and a system that stores only the answer
+cannot answer it.
+
+The trade is genuine in both directions:
+
+- Storing state is cheap to read, cheap to store, and forgets.
+- Storing changes remembers everything, costs more to read, and grows forever.
+
+And the asymmetry that decides it: **you can always compute the state from the changes, and you can
+never recover the changes from the state.** Choosing to store state is choosing to destroy
+information permanently, which is fine when nobody will want it and catastrophic when they do —
+and you find out which several years later.
+
+## Concretely
+
+<Example title="The same account, two designs">
+
+**State.** `accounts(id, balance)`. Reading is one lookup. The question &ldquo;why 47?&rdquo; has
+no answer inside the system. A duplicate credit from a retried request is invisible: the balance is
+simply 10 higher than it should be, and there is no record distinguishing that from a legitimate
+credit.
+
+**Changes.** `entries(account_id, amount, reason, source_id, occurred_at)`. The balance is a sum.
+Every question about history is a query. The duplicate credit is *visible* — two entries with the
+same `source_id` — and it is also *preventable*, because a unique constraint on `source_id` makes
+the double application impossible rather than merely detectable.
+
+Then the costs arrive.
+
+Reading a balance is now a sum over every entry ever written. For an account with 400,000 entries
+that is unacceptable, so you add a **snapshot**: a stored balance as of entry 399,000, plus the
+entries since. The snapshot is a cache of a fold, and it must be rebuildable, because it will be
+wrong at some point.
+
+And correcting a mistake changes shape entirely. You cannot edit an entry, because entries are what
+happened. You append a **correcting entry**, and the wrong value stays in history with its
+correction next to it. Accountants have done this for centuries and call it a reversal. Engineers
+usually find it uncomfortable the first time, because &ldquo;just fix the data&rdquo; is no longer
+available.
+
+</Example>
+
+## Formal explanation
+
+<C id="immutability" /> is the shared foundation. Append-only data can be cached without
+invalidation, replicated without conflict, and read without locking, because nothing it says will
+ever change. The costs are that storage grows monotonically and that nothing can be corrected in
+place.
+
+<C id="event-sourcing" /> stores the sequence of changes as the source of truth and derives current
+state by folding them. What it buys:
+
+- **A complete history**, by construction rather than by remembering to log.
+- **New views over old data.** A question invented next year can be answered over events already
+  stored, which is impossible when only current state was kept.
+- **Debugging by replay.** Reproduce the exact state at the moment of a bug.
+- **An audit trail** that cannot silently disagree with the data, because it *is* the data.
+
+What it costs, and none of these are small:
+
+- **Reads become folds**, so snapshots are mandatory at any real volume, and snapshots are derived
+  data that must be rebuildable.
+- **Event schemas are permanent.** A five-year-old event must still be readable by today's code,
+  so every schema change is additive and every old shape is supported forever.
+- **Correction is by compensation**, never by editing. Operationally this is the largest change,
+  and it is cultural as much as technical.
+- **Deletion becomes hard.** An immutable log and a legal obligation to erase personal data are in
+  direct conflict.
+
+<Callout kind="warn" title="Erasure and immutability have to be reconciled at design time">
+&ldquo;Delete everything you hold about this person&rdquo; cannot be satisfied by appending an
+event that says they asked. Two workable approaches, both of which must be chosen before the first
+event is written:
+
+- **Keep personal data out of the log.** Events carry a reference; the personal data lives in a
+  mutable store that can be deleted. The log keeps the shape of what happened without the identity.
+- **Encrypt per subject and delete the key.** The events remain, and become permanently
+  unreadable. Sometimes called crypto-shredding, and it requires a key management story that exists
+  from day one.
+
+Retrofitting either onto a log that already contains names and addresses means rewriting the log,
+which is exactly the operation the design said was impossible.
+</Callout>
+
+<C id="cqrs" /> separates the model used for writes from the models used for reads. The write model
+enforces invariants; read models are shaped for particular queries and derived asynchronously.
+
+Two things are routinely misunderstood:
+
+**It is independent of event sourcing.** Either can be adopted without the other, and adopting both
+at once is two large increases in complexity taken simultaneously. They are frequently discussed
+together because event sourcing makes read models natural to build, not because either requires
+the other.
+
+**It is applied per query, not per system.** A specific query poorly served by the write model gets
+a read model. Applying it globally makes every read eventually consistent, including the ones that
+must not be — a permission check, a balance at the point of payment.
+
+<C id="denormalisation" /> is what a read model is made of: data pre-joined and duplicated so a
+query becomes a lookup. And here is the distinction worth carrying away:
+
+**Denormalisation in a derived read model is safe. Denormalisation in a hand-maintained table is
+not.** Both duplicate data and both can drift. The difference is that a derived model has an
+authority to be rebuilt from, so drift is a temporary condition with a known remedy. A denormalised
+table maintained by application code has no authority, so drift is permanent and each instance
+needs a bespoke repair. The duplication is identical; the recoverability is not, and that is the
+whole difference between a technique and a liability.
+
+## Architecture
+
+<Arch
+  caption="One authority, several derived views, each rebuildable from it."
+  columns={[
+    { title: 'Commands', nodes: [{ id: 'cmd', label: 'Commands' }] },
+    { title: 'Authority', nodes: [{ id: 'log', label: 'Event log', note: 'append only', tone: 'accent' }, { id: 'state', label: 'Current state', note: 'the alternative' }] },
+    { title: 'Fold', nodes: [{ id: 'snap', label: 'Snapshots', note: 'cache of a fold' }] },
+    { title: 'Read models', nodes: [{ id: 'rm1', label: 'Reporting view' }, { id: 'rm2', label: 'Search index' }, { id: 'rm3', label: 'Summary cache' }] },
+    { title: 'Queries', nodes: [{ id: 'q', label: 'Queries' }] },
+  ]}
+  edges={[
+    { from: 'cmd', to: 'state' },
+    { from: 'cmd', to: 'log' },
+    { from: 'log', to: 'snap' },
+    { from: 'log', to: 'rm1' },
+    { from: 'log', to: 'rm2' },
+    { from: 'log', to: 'rm3' },
+    { from: 'snap', to: 'q' },
+    { from: 'rm1', to: 'q' },
+    { from: 'rm2', to: 'q' },
+  ]}
+  stages={[
+    {
+      label: 'Store the state',
+      show: ['cmd', 'state', 'q'],
+      because:
+        'One row per entity, updated in place. Cheap, obvious, and correct for most systems. It also destroys history continuously, and that is invisible until someone asks a question about the past.',
+    },
+    {
+      label: 'Store the changes',
+      show: ['cmd', 'log', 'snap', 'q'],
+      because:
+        'The log becomes the source of truth and state is derived. History, replay and audit come for free; reads become folds, so snapshots are required, and correcting a mistake now means appending a correction.',
+    },
+    {
+      label: 'Shape views per query',
+      show: ['cmd', 'log', 'snap', 'rm1', 'rm2', 'rm3', 'q'],
+      because:
+        'Each read model is built for one question and can use a different technology. All of them lag the log, all of them can drift, and all of them are rebuildable — which is precisely what makes their denormalisation safe.',
+    },
+  ]}
+/>
+
+## Scaling
+
+<ScaleTable
+  rows={[
+    {
+      scale: 'Small entity, few changes',
+      behaviour: 'Fold the whole event stream on every read. Simple and fast enough.',
+      firstToBreak: 'Nothing, until a single entity accumulates thousands of events.',
+    },
+    {
+      scale: 'Long-lived entities',
+      behaviour:
+        'Read latency grows with entity age, so snapshots become mandatory and are themselves derived data to manage.',
+      firstToBreak: 'The oldest and busiest accounts, which are usually the most important ones.',
+    },
+    {
+      scale: 'Multiple query shapes',
+      behaviour:
+        'Read models proliferate, each with its own lag, its own store and its own rebuild procedure.',
+      firstToBreak:
+        'Rebuild time. When rebuilding a read model takes eight hours, an urgent bug fix in a projection is an outage rather than a deploy.',
+    },
+    {
+      scale: 'Years of history',
+      behaviour:
+        'Old event versions must still be readable, and total storage grows without bound.',
+      firstToBreak:
+        'Schema evolution and legal retention, together. Every old shape is still supported and some of it is data you are now required to erase.',
+    },
+  ]}
+/>
+
+## Failure modes
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Reads slow down as entities age',
+      symptom: 'Latency grows steadily over months and is worst for the oldest, most valuable accounts.',
+      cause: 'Every read folds the entire event history and no snapshots exist.',
+      mitigation: 'Snapshot at intervals and read from the snapshot plus subsequent events. Treat snapshots as a rebuildable cache, never as an authority.',
+    },
+    {
+      what: 'An old event can no longer be read',
+      symptom: 'A replay or rebuild fails on data written years ago.',
+      cause: 'The event schema changed in a non-additive way, or serialised objects were stored whose classes have since been refactored.',
+      mitigation: 'Additive changes only, versioned events, upcasting functions from old shapes to new. Store data, never serialised object graphs.',
+    },
+    {
+      what: 'Nobody can fix the data',
+      symptom: 'A bad batch of events is in the log and there is no way to remove them.',
+      cause: 'The log is immutable by design, and the team expected to be able to correct it in place.',
+      mitigation: 'Design the correction path deliberately: compensating events, and projections that understand them. Rehearse it before you need it.',
+    },
+    {
+      what: 'Read model drift',
+      symptom: 'A derived view disagrees with the log and nobody knows for how long.',
+      cause: 'A projection bug, a dropped event, or a schema change applied to one side only.',
+      mitigation: 'Reconcile periodically by comparing counts and checksums, and keep a tested rebuild. A read model that cannot be rebuilt has become an authority by accident.',
+    },
+    {
+      what: 'Erasure obligation cannot be met',
+      symptom: 'A legal request to delete personal data arrives and the architecture makes it impossible.',
+      cause: 'Personal data was written into an immutable log with no scheme for removing it.',
+      mitigation: 'Keep personal data out of events, or encrypt per subject so the key can be destroyed. Both are design-time decisions.',
+    },
+    {
+      what: 'Both patterns adopted at once, for neither reason',
+      symptom: 'A small team is operating an event store, several projections and a rebuild pipeline for a system whose queries one database served well.',
+      cause: 'The two patterns were treated as one modern architecture rather than as two independent decisions.',
+      mitigation: 'Adopt each in response to a specific measured problem. One at a time, with the problem named first.',
+    },
+  ]}
+/>
+
+## Trade-offs
+
+<TradeOff
+  decision="Store the sequence of changes as the source of truth instead of current state"
+  options={[
+    'Current state only, updated in place',
+    'Current state plus an append-only audit table maintained alongside it',
+    'Event sourcing: events are the truth, state is derived',
+    'Current state plus change data capture, so history is derived from the database log',
+  ]}
+  why="History, replay and audit stop being features to build and become properties of the storage model. Any question about the past becomes answerable, including questions nobody has thought of yet."
+  gain="Complete history by construction. New derived views over old data. Debugging by replay. An audit trail that cannot disagree with the data because it is the data. Duplicate operations become detectable and preventable by natural key."
+  sacrifice="Reads become folds, requiring snapshots. Event schemas must be supported forever. Corrections are appended rather than applied. Deletion becomes a design problem rather than a statement. Storage grows without bound."
+  failureModes={[
+    'Fold latency growing with entity age',
+    'Old event versions becoming unreadable',
+    'Read models drifting with no reconciliation',
+    'An erasure obligation the architecture cannot satisfy',
+  ]}
+  operationalBurden="High. Snapshot management, projection rebuilds, event schema governance, and a team that must be comfortable correcting data by appending rather than editing — which is a habit change, not a tooling change."
+  cost="Storage grows monotonically, and compute is spent folding and projecting. Both are usually affordable; the expensive part is the engineering discipline the model requires indefinitely."
+  whenNot="When history genuinely does not matter — a cache, a session, a derived aggregate — the audit trail is cost with no buyer. When the team has not operated one before and the deadline is short, because the operational habits are harder to acquire than the code. And note the cheaper alternative that covers most of the need: current state plus change data capture gives you a history of changes derived from the database's own log, without making every read a fold. Reach for full event sourcing when the events themselves are the domain — ledgers, orders, medical records — rather than when history would merely be useful."
+/>
+
+## In production
+
+<RealWorld>
+
+<Claim label="fact" source="ddia">
+Deriving views from an immutable event log allows a view to be rebuilt after a bug by reprocessing
+the log, which is not possible when state has been updated in place and the previous values
+overwritten.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Immutable data simplifies caching and replication because a value that cannot change cannot become
+stale, and it removes the need for invalidation on the copies.
+</Claim>
+
+<Claim label="convention" source="martin-fowler">
+CQRS is described as separating the model used for updates from the model used for queries, with
+explicit warnings that it adds significant complexity and should be applied to the specific parts
+of a system that need it rather than universally, and that it is independent of event sourcing.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Log compaction retains at least the most recent value for each key, which allows a topic to serve
+as a durable, replayable record of current state while bounding its growth by the number of keys
+rather than the number of events.
+</Claim>
+
+<Claim label="fact" source="elasticsearch-docs">
+A search index becomes searchable only after a refresh, so a derived index is near-real-time rather
+than immediately consistent with its source. That refresh interval is the consistency window of
+that read model.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Column-oriented storage reads only the columns a query references, which is what makes
+recomputing aggregates over a large event history practical rather than prohibitive.
+</Claim>
+
+</RealWorld>
+
+## The interview lens
+
+<InterviewLens
+  tests="Whether you can say what an UPDATE destroys and whether that matters here. Also whether you treat CQRS and event sourcing as two decisions rather than one fashion."
+  depth="Know that reads become folds and need snapshots. Know that corrections are appended. Have an answer for erasure obligations. Be able to say why a derived denormalised view is safe when a hand-maintained one is not."
+  followUps={[
+    'How do you fix a bad event that is already in the log?',
+    'A user asks you to delete their personal data. What happens?',
+    'Reading one account takes 400 ms. Why, and what do you do?',
+    'Do you need event sourcing, or would change data capture give you what you want?',
+  ]}
+/>
+
+## Common mistakes
+
+<Mistakes
+  items={[
+    {
+      mistake: 'Adopting event sourcing and CQRS together as one architecture.',
+      why: 'They are independent decisions with independent justifications, and taking both at once is two large complexity increases with no way to tell which one is causing the difficulty you are having.',
+      instead:
+        'Name the specific problem. If a query is poorly served, add one read model. If history is the domain, store events. Do one, measure, and only then consider the other.',
+    },
+    {
+      mistake: 'Putting personal data in an immutable log.',
+      why: 'Erasure obligations and immutability are in direct conflict, and no amount of process resolves it after the fact — the only remedy is rewriting the log, which is exactly what the design forbids.',
+      instead:
+        'Reference personal data rather than embedding it, or encrypt per subject so a key deletion makes the events unreadable. Decide before the first event is written.',
+    },
+    {
+      mistake: 'Letting a read model accumulate state that exists nowhere else.',
+      why: 'A derived view that holds unreconstructible data has quietly become a source of truth, so it can no longer be rebuilt — and rebuildability was the entire property that made its denormalisation safe.',
+      instead:
+        'Test the rebuild regularly. If rebuilding loses information, that information belongs in the write model, and the discovery is a bug rather than an inconvenience.',
+    },
+  ]}
+/>
+
+## Check yourself
+
+<Check
+  concepts={['event-sourcing']}
+  prompt="Six months of events contain a bug: a credit was recorded twice for about 3,000 accounts. How do you fix it?"
+  options={[
+    {
+      id: 'a',
+      text: 'Append compensating events that reverse the duplicates, and let projections recompute',
+      implies: 'You are correcting by appending, which is what an immutable log allows.',
+      why: 'The log records what happened, and what happened includes the mistake. A reversal entry alongside the original is how ledgers have handled this for centuries: the history stays true, the current state becomes correct, and an auditor can see both the error and its correction. Projections fold the new events and converge.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'Delete the duplicate events from the log and rebuild every projection',
+      implies: 'You are editing history.',
+      why: 'It produces the right current state and destroys the property the log exists for. Anything already derived, exported or reported from those events now disagrees with a history that claims the error never happened — which is worse for an audit than the error was.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Correct the current balances directly in the read model',
+      implies: 'You are fixing what users see.',
+      why: 'Fastest, and it lasts until the next rebuild, which recomputes from the log and reintroduces the duplicates. Worse, the read model now disagrees with its authority and nothing will report that — you have converted a visible bug into an invisible one.',
+      credit: 'none',
+    },
+  ]}
+  stronger="A stronger answer adds the prevention: the duplicate was possible because nothing enforced uniqueness on the originating operation. A unique constraint on a source identifier in the event store makes the double application impossible rather than detectable, which is the difference between a class of bug and an instance of one. It also notes that the compensating events need the same identifier discipline, or a retried correction reverses twice."
+/>
+
+<Check
+  concepts={['denormalisation', 'cqrs']}
+  prompt="Two designs both duplicate a product name into an orders table. One is a projection rebuilt from an event log; the other is written by application code at order time. Why is one riskier?"
+  options={[
+    {
+      id: 'a',
+      text: 'The projection can be rebuilt from an authority, so drift is temporary. The hand-written copy has no authority to be rebuilt from, so drift is permanent.',
+      implies: 'You are distinguishing duplication from unrecoverable duplication.',
+      why: 'Both copies can go wrong in the same ways — a bug, a missed update, a partial failure. What differs is the remedy. A projection is recomputed and is correct again; a hand-maintained copy needs a bespoke repair script for each incident, written under pressure, and nothing tells you it has drifted in the first place.',
+      credit: 'full',
+    },
+    {
+      id: 'b',
+      text: 'The projection is eventually consistent, so it is riskier',
+      implies: 'You are comparing them on freshness.',
+      why: 'The projection is indeed briefly stale, which is a bounded and well-understood condition. The hand-written copy is not stale — it is permanently wrong whenever an update path missed it, and there is no window after which it corrects itself.',
+      credit: 'none',
+    },
+    {
+      id: 'c',
+      text: 'Neither is risky, because a product name rarely changes',
+      implies: 'You are judging by change frequency.',
+      why: 'Low change frequency reduces how often drift occurs and makes it far harder to notice, because the copy is right for months and wrong quietly afterwards. In this specific case there is also a subtlety worth separating out.',
+      credit: 'partial',
+    },
+  ]}
+  stronger="A stronger answer separates two reasons to copy a value. Copying for speed is a cache and must be rebuildable. Copying because the order must record the name as it was at purchase time is not duplication at all — it is a distinct fact, deliberately frozen, and it must never be refreshed from the current product. Confusing the two produces a design that either drifts or helpfully rewrites history on old invoices."
+/>
+
+## Going deeper
+
+<GoDeeper
+  items={[
+    { label: 'Immutable events, derived views, and rebuilding after a bug', sourceId: 'ddia' },
+    { label: 'CQRS, its costs, and its independence from event sourcing', sourceId: 'martin-fowler' },
+    { label: 'Compacted logs as durable, replayable state', sourceId: 'kafka-docs' },
+    { label: 'Refresh intervals as the consistency window of a derived index', sourceId: 'elasticsearch-docs' },
+    { label: 'Next: reasoning without certainty', href: '/levels/4' },
+  ]}
+/>
