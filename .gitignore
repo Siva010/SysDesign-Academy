@@ -1,6 +1,8 @@
 node_modules/
 .next/
 out/
+.wrangler/
+.dev.vars
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store

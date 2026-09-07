@@ -33,29 +33,49 @@ That is a deliberate property rather than a coincidence. It means the site is se
 with no origin, no server runtime, no cold starts and nothing to patch — and the only stateful
 thing in the product, a learner's progress, lives in their own browser.
 
-**Cloudflare Pages** is the recommended host. Connect the repository and use:
+**Cloudflare** is the recommended host, deployed as a Worker that serves static assets and
+runs no code. `wrangler.jsonc` in the repository root declares exactly that:
+
+```jsonc
+"assets": {
+  "directory": "./out",
+  "html_handling": "force-trailing-slash",
+  "not_found_handling": "404-page"
+}
+```
+
+That file is not optional, and the reason is worth knowing. With no Wrangler configuration
+present, `wrangler deploy` inspects the repository, recognises Next.js, and runs the OpenNext
+adapter — which builds a server bundle from `.next/standalone`. There is no server here, so the
+adapter finds nothing and the deploy fails *after* a build that succeeded, which is a confusing
+place to fail. Declaring the project explicitly stops the guessing.
+
+Dashboard settings:
 
 | Setting | Value |
 |---|---|
-| Framework preset | None |
 | Build command | `npm run validate:content && npm run build` |
-| Build output directory | `out` |
+| Deploy command | `npx wrangler deploy` |
 | Node version | from `.nvmrc` |
 
-Putting the content validator in the build command is the point of having it: a broken concept
-reference or a missing lesson section fails the deploy rather than reaching production.
+Putting the content validator ahead of the build is the point of having written it: a dangling
+concept reference or a missing lesson section fails the deploy rather than reaching production.
 
-`public/_headers` sets caching and security headers, and Cloudflare reads it from the build
-output. Hashed build assets get a one-year immutable lifetime; HTML revalidates every time, so a
-deploy is visible immediately and no stale document can reference an asset that no longer exists.
+Wrangler is pinned as a devDependency so the deploy uses a known version rather than whatever
+`npx` resolves that morning.
+
+`public/_headers` sets caching and security headers, and Cloudflare reads it from the assets
+directory. Hashed build assets get a one-year immutable lifetime; HTML revalidates every time, so
+a deploy is visible immediately and no stale document can reference an asset that no longer
+exists.
 
 The Content-Security-Policy allows `'unsafe-inline'` for scripts, which is worth being honest
 about: Next.js inlines its hydration payload and the no-flash theme script, and a static export
 cannot issue per-request nonces. The site renders no user input and loads nothing from a third
 party, so the practical exposure is small — but it is a real weakening, not a strong policy.
 
-Any other static host works the same way: GitHub Pages, Netlify, S3 with CloudFront. Only the
-headers file is Cloudflare-specific.
+Any other static host works the same way: point it at `out/`. Only `wrangler.jsonc` and the
+`_headers` syntax are Cloudflare-specific.
 
 `npm run validate:content` should be run before committing content. It catches dangling concept
 references, prerequisite cycles, missing lesson sections, unknown source citations, and the MDX

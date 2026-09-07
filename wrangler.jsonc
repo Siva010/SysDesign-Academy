@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  /*
+   * This file exists to stop Wrangler guessing.
+   *
+   * With no configuration present, `wrangler deploy` inspects the repository, sees Next.js,
+   * and runs the OpenNext adapter — which builds a server bundle from `.next/standalone`.
+   * This application has no server: `output: 'export'` writes plain files to `out/`, so the
+   * adapter finds nothing and the deploy fails after a build that succeeded.
+   *
+   * Declaring the project explicitly makes it what it actually is: static assets, uploaded
+   * to Cloudflare's edge, with no Worker code and therefore no runtime, no cold starts and
+   * no invocations to pay for.
+   */
+  "name": "sysdesign-academy",
+  "compatibility_date": "2026-09-03",
+
+  "assets": {
+    "directory": "./out",
+
+    /*
+     * The export writes `out/lessons/foo/index.html` and every internal link carries a
+     * trailing slash, because next.config.mjs sets trailingSlash. Forcing the same shape here
+     * means `/lessons/foo` redirects to `/lessons/foo/` rather than both resolving, so each
+     * page has exactly one URL.
+     */
+    "html_handling": "force-trailing-slash",
+
+    /* Next exports out/404.html. Serve it for unknown paths, with a 404 status. */
+    "not_found_handling": "404-page"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
