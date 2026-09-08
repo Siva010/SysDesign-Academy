@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { SIGNATURE_LABEL, SIGNATURE_ORDER } from '@/content/signatures';
 import { loadAllCaseStudies } from '@/lib/content-node';
+import { ReadMark } from '@/components/ReadMark';
 
 export const metadata: Metadata = {
   title: 'Case studies',
@@ -49,6 +50,7 @@ export default function CaseStudiesPage() {
             {studies.map((c) => (
               <Link key={c.id} href={`/case-studies/${c.id}`} className="list-row">
                 <div className="list-row-head">
+                  <ReadMark kind="case-study" id={c.id} />
                   <span className="list-row-title">{c.title}</span>
                   <span className="chip">{c.difficulty}</span>
                   <span className="tiny faint">{c.minutes} min</span>

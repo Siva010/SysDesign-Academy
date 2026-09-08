@@ -1161,3 +1161,35 @@ ol.tight li {
     grid-template-columns: 6rem 1fr 2rem;
   }
 }
+
+/* The read tick in lesson and case-study lists. Sized to sit on the metadata line beside the
+   running time, so it reads as one more fact about the row rather than as a badge. */
+.read-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--accent);
+  flex: none;
+  /* The row head aligns on the text baseline, which an SVG does not have - it would otherwise
+     hang below the title. Centre it against the line instead. */
+  align-self: center;
+  /* Fixed width whether or not there is a tick, so titles stay in a column and nothing shifts
+     when stored progress arrives after the first paint. */
+  min-width: 12px;
+  justify-content: center;
+}
+
+.read-mark.empty {
+  /* Occupies the gutter and draws nothing. */
+  visibility: hidden;
+}
+
+.read-mark.due {
+  color: var(--warn);
+}
+
+.read-mark-count {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  line-height: 1;
+}

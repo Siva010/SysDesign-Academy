@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { LevelProgress } from '@/components/LevelProgress';
+import { ReadMark } from '@/components/ReadMark';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { LEVELS, LEVEL_BY_INDEX, modulesForLevel } from '@/content/curriculum';
 import { LEVEL_CONCEPTS } from '@/content/level-concepts';
@@ -71,6 +72,7 @@ export default async function LevelPage({ params }: { params: Promise<{ level: s
                         className="list-row"
                       >
                         <div className="list-row-head">
+                          <ReadMark kind="case-study" id={study.id} />
                           <span className="list-row-title">{study.title}</span>
                           <span className="chip">{study.difficulty}</span>
                           <span className="tiny faint">{study.minutes} min</span>
@@ -92,6 +94,7 @@ export default async function LevelPage({ params }: { params: Promise<{ level: s
                         className={`list-row${lesson.status === 'stub' ? ' status-stub' : ''}`}
                       >
                         <div className="list-row-head">
+                          <ReadMark kind="lesson" id={lesson.id} />
                           <span className="list-row-title">{lesson.title}</span>
                           <span className="tiny faint">{lesson.minutes} min</span>
                           {lesson.status !== 'reviewed' && (
