@@ -51,25 +51,69 @@ export const CLUSTER_ORDER: ConceptCluster[] = [
 
 /* ------------------------------------------------------------------ graph queries */
 
+/**
+ * Reverse adjacency, built once at module load.
+ *
+ * Two of the three edge kinds are only ever written from one side. `requires` is directed and
+ * its inverse has no name in the data; `tensionWith` is genuinely undirected but declaring it
+ * twice would mean two places to keep in agreement, so it is declared from whichever side reads
+ * more naturally. Both facts used to be handled by scanning all 297 concepts inside the
+ * accessor, which meant every caller that forgot to use the accessor silently saw half the
+ * graph - and the neighbourhood diagram did exactly that, disagreeing with the list printed
+ * underneath it on the same page.
+ *
+ * Materialising the reverse direction once removes both problems: the scans happen a fixed
+ * three times instead of once per call, and there is no longer a raw field worth reading.
+ */
+function reverseIndex(pick: (c: Concept) => string[] | undefined): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const c of CONCEPTS) {
+    for (const target of pick(c) ?? []) {
+      (out[target] ??= []).push(c.id);
+    }
+  }
+  return out;
+}
+
+const DEPENDENTS = reverseIndex((c) => c.requires);
+const PRECEDENTS = reverseIndex((c) => c.leadsTo);
+
+/** Undirected, so each concept's entry is the union of the edges it declares and those declared at it. */
+const TENSIONS: Record<string, string[]> = (() => {
+  const reverse = reverseIndex((c) => c.tensionWith);
+  const out: Record<string, string[]> = {};
+  for (const c of CONCEPTS) {
+    const both = new Set([...(c.tensionWith ?? []), ...(reverse[c.id] ?? [])]);
+    both.delete(c.id);
+    out[c.id] = [...both];
+  }
+  return out;
+})();
+
+const lookup = (ids: string[] | undefined): Concept[] =>
+  (ids ?? []).map((x) => CONCEPT_BY_ID[x]).filter((c): c is Concept => Boolean(c));
+
 /** Concepts that list `id` in their own `requires`. */
 export function dependents(id: string): Concept[] {
-  return CONCEPTS.filter((c) => c.requires?.includes(id));
+  return lookup(DEPENDENTS[id]);
 }
 
 /** Concepts that point at `id` via leadsTo. */
 export function precedents(id: string): Concept[] {
-  return CONCEPTS.filter((c) => c.leadsTo?.includes(id));
+  return lookup(PRECEDENTS[id]);
 }
 
 /**
- * Tension edges are conceptually undirected but stored on one side only.
- * This returns both directions so a concept page shows every trade-off it participates in.
+ * Every trade-off `id` participates in, in both directions. Prefer this over reading
+ * `tensionWith`, which is only ever half the answer.
  */
 export function tensions(id: string): Concept[] {
-  const own = CONCEPT_BY_ID[id]?.tensionWith ?? [];
-  const reverse = CONCEPTS.filter((c) => c.tensionWith?.includes(id)).map((c) => c.id);
-  const ids = Array.from(new Set([...own, ...reverse])).filter((x) => x !== id);
-  return ids.map((x) => CONCEPT_BY_ID[x]).filter((c): c is Concept => Boolean(c));
+  return lookup(TENSIONS[id]);
+}
+
+/** The same set as ids, for callers that only need to count or lay out. */
+export function tensionIds(id: string): string[] {
+  return TENSIONS[id] ?? [];
 }
 
 /**
@@ -121,8 +165,8 @@ export function neighbourhood(id: string, depth = 1): Concept[] {
       const adjacent = [
         ...(c.requires ?? []),
         ...(c.leadsTo ?? []),
-        ...(c.tensionWith ?? []),
-        ...dependents(cur).map((x) => x.id),
+        ...tensionIds(cur),
+        ...(DEPENDENTS[cur] ?? []),
       ];
       for (const a of adjacent) {
         if (!seen.has(a)) {

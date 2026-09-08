@@ -8,10 +8,11 @@
  * Exit code 1 on any error. Warnings do not fail the run but are printed.
  */
 import { CONCEPTS, CONCEPT_BY_ID } from '../src/content/concepts';
-import { SOURCE_BY_ID } from '../src/content/sources';
+import { SOURCES, SOURCE_BY_ID } from '../src/content/sources';
 import { LEVELS, MODULES } from '../src/content/curriculum';
 import { SYMPTOMS } from '../src/content/symptoms';
 import { DECISIONS } from '../src/content/decisions';
+import { PRIMITIVE_SIGNATURES } from '../src/lib/types';
 import {
   loadAllCaseStudies,
   loadAllFailures,
@@ -276,6 +277,57 @@ for (const d of DECISIONS) {
   for (const s of d.sources) {
     if (!SOURCE_BY_ID[s]) err(`decision "${d.id}" cites unknown source "${s}"`);
   }
+}
+
+/* ------------------------------------------------------- reachability and coverage
+
+   Everything above checks that a reference resolves. These check the other direction: that
+   each thing the curriculum promises to cover is actually reached by something. Both failure
+   modes are silent - a concept with no lesson still renders its own page, an unreferenced
+   failure still sits in the failure index - so nothing surfaces them except a check like this.
+
+   Each of these was verified by hand at some point, which is exactly the reason to encode it:
+   a hand check is true on the day it is run and says nothing about the next commit. */
+
+const taughtConcepts = new Set(lessons.flatMap((l) => l.concepts ?? []));
+for (const c of CONCEPTS) {
+  if (!taughtConcepts.has(c.id)) {
+    err(`concept "${c.id}" is taught by no lesson; every concept needs a home (see npm run untaught)`);
+  }
+}
+
+const linkedFailures = new Set(lessons.flatMap((l) => l.failures ?? []));
+for (const f of failures) {
+  if (!linkedFailures.has(f.id)) {
+    err(`failure "${f.id}" is linked from no lesson, so it is reachable only from the failure index`);
+  }
+}
+
+const linkedPatterns = new Set([
+  ...lessons.flatMap((l) => l.patterns ?? []),
+  ...caseStudies.flatMap((c) => c.patterns ?? []),
+]);
+for (const p of patterns) {
+  if (!linkedPatterns.has(p.id)) {
+    err(`pattern "${p.id}" is linked from no lesson or case study`);
+  }
+}
+
+const signatureCount = new Map(PRIMITIVE_SIGNATURES.map((s) => [s, 0]));
+for (const c of caseStudies) {
+  for (const sig of c.signatures) signatureCount.set(sig, (signatureCount.get(sig) ?? 0) + 1);
+}
+for (const [sig, n] of signatureCount) {
+  if (n === 0) err(`primitive signature "${sig}" has no case study`);
+}
+
+/* The bibliography page states that where a detail is publicly documented it is cited. A source
+   nothing draws on makes that claim slightly false and pads the list with breadth-signalling. */
+const citedSources = new Set(
+  [...lessons, ...caseStudies, ...patterns, ...failures].flatMap((x) => x.sources ?? []),
+);
+for (const s of SOURCES) {
+  if (!citedSources.has(s.id)) err(`source "${s.id}" is cited by nothing; cite it or remove it`);
 }
 
 /* ---------------------------------------------------------------- report */

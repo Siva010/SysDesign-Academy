@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { CONCEPT_BY_ID } from '@/content/concepts';
+import { CONCEPT_BY_ID, tensionIds } from '@/content/concepts';
 
 /**
  * The local neighbourhood of one concept, as a diagram.
@@ -77,7 +77,7 @@ export function ConceptNeighbourhood({ id }: { id: string }) {
 
   const requiresAll = resolve(concept.requires ?? []);
   const leadsToAll = resolve(concept.leadsTo ?? []);
-  const tensionsAll = resolve(concept.tensionWith ?? []);
+  const tensionsAll = resolve(tensionIds(concept.id));
 
   /* Nothing around it is not a diagram worth drawing. */
   if (requiresAll.length + leadsToAll.length + tensionsAll.length === 0) return null;

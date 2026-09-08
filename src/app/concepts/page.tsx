@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import { CLUSTER_LABELS, CLUSTER_ORDER, conceptsByCluster } from '@/content/concepts';
+import { CLUSTER_LABELS, CLUSTER_ORDER, conceptsByCluster, tensionIds } from '@/content/concepts';
 import { CONCEPT_LEVEL } from '@/content/level-concepts';
 
 export const metadata: Metadata = {
@@ -41,9 +41,7 @@ export default function ConceptsPage() {
                       <span className="tiny faint">Level {CONCEPT_LEVEL[c.id]}</span>
                     )}
                     {c.myth && <span className="chip chip-warn">myth</span>}
-                    {(c.tensionWith?.length ?? 0) > 0 && (
-                      <span className="chip">trade-off</span>
-                    )}
+                    {tensionIds(c.id).length > 0 && <span className="chip">trade-off</span>}
                   </div>
                   <div className="list-row-summary">{c.oneLiner}</div>
                 </Link>

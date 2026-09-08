@@ -1,0 +1,442 @@
+---
+id: geofence-alerting
+title: Geofence Alerting
+ask: Design a system that tells an application the moment one of its users enters or leaves a region it cares about, for a hundred thousand regions and ten million moving devices.
+difficulty: advanced
+minutes: 50
+signatures: [geo-index, fanout]
+concepts: [geospatial-index, geo-routing, inverted-index, fanout-on-write, fanout-on-read, fanout-latency-amplification, push-vs-pull, stream-processing, windowing, watermark, partition-ordering, hot-key, hot-partition, partitioning, partition-key, at-least-once, idempotency, idempotency-key, backpressure, load-shedding, sampling, batching, staleness, clock-skew, tenant-isolation, blast-radius, graceful-degradation, capacity-headroom, write-amplification, cache-generic, timeout, retry, bloom-filter, throughput, latency, websocket]
+patterns: [fanout-on-write, token-bucket, bulkhead, circuit-breaker]
+prerequisites: [when-load-is-not-even, computing-on-a-stream]
+sources: [ddia, database-internals, kafka-docs, redis-docs, uber-eng, sre-book, aws-builders-library]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design a system that tells an application the moment one of its users enters or leaves a
+> region it cares about, for a hundred thousand regions and ten million moving devices.&rdquo;
+
+The words look like the proximity problem and the shape is inverted. When you match a rider to
+drivers, the **data** is known and the **query** arrives unpredictably: someone opens an app, and
+you go looking for the nearest points. Here the queries are registered in advance and never change
+from moment to moment, while the data arrives continuously and never stops.
+
+That inversion is the whole case study. Almost every wrong answer to this question comes from
+carrying over an instinct that was correct for the other problem.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Are the regions circles or arbitrary polygons? | A circle is a distance comparison. A polygon needs a real point-in-polygon test and a bounding-box pre-filter. |
+| How fast must an alert be after the crossing? | Five seconds and five minutes are different systems. The first forces streaming, the second permits batch. |
+| Does the device report location, or do we infer it? | If the device reports, the client can do some of the work &mdash; which changes everything about cost. |
+| Can a fence contain millions of devices? | An airport or a city centre makes one region a hot key regardless of how the index is built. |
+| What happens to crossings while a device is offline? | Deciding whether to fire an hour-late alert is a product question with a large engineering consequence. |
+| Do subscribers want every crossing, or a current state? | &ldquo;Tell me when anything happens&rdquo; and &ldquo;tell me who is inside now&rdquo; are different products. |
+
+## Requirements
+
+**Functional.** Register and remove regions. Ingest device location updates. Emit an entry event
+when a device crosses into a region and an exit event when it leaves. Let a subscriber ask who is
+currently inside a region.
+
+**Non-functional.** Alert within five seconds of the crossing at the 99th percentile. Never emit an
+entry without a matching exit. Do not emit a storm of alerts for a device sitting on a boundary.
+One customer's pathological region must not degrade anybody else's alerts.
+
+**Out of scope.** Map rendering, routing, address geocoding, and the privacy and consent framework
+that any real version of this would need before a single line of it were written.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+- **10,000,000 devices**, of which perhaps **20% are moving** at any moment.
+- A moving device reports every **5 seconds**: 2,000,000 / 5 = **400,000 location updates per
+  second.**
+- **100,000 registered regions**, mostly small, changing rarely.
+- A location update &mdash; device id, latitude, longitude, accuracy, timestamp &mdash; is about
+  **50 bytes**, so ingest is roughly **20 MB/s**, which is unremarkable.
+
+The unremarkable ingest is a trap. The cost is not in receiving the points; it is in deciding what
+each one means.
+
+<Claim label="inference">
+Testing every update against every region is 400,000 &times; 100,000 = **4 &times; 10<sup>10</sup>
+point-in-polygon tests per second.** That is not a number you optimise your way out of with faster
+hardware or a bigger cluster; it is four orders of magnitude beyond what the whole design can
+afford, and it means the naive evaluation is not a starting point to improve but an approach to
+discard in the first minute.
+</Claim>
+
+So the arithmetic forces the central move, which is worth stating as a general principle rather
+than a trick:
+
+<Claim label="inference">
+When the data streams and the queries are fixed and known in advance, **index the queries, not the
+data.** A spatial index over the 100,000 regions turns each update from 100,000 tests into one
+logarithmic lookup plus a handful of exact tests &mdash; roughly 400,000 index probes per second,
+which is an ordinary workload for an ordinary machine.
+</Claim>
+
+This is the same inversion an <C id="inverted-index">inverted index</C> makes for text, and the
+same one a rules engine makes for events. It is worth recognising by name, because the moment you
+see it the problem stops being exotic.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Region | region id | Polygon or circle, owning tenant, bounding box, precomputed cell cover |
+| Region index | spatial cell | Cell to region ids. The queries, indexed. Small, read constantly, written rarely. |
+| Device position | device id | Last known point and timestamp. Ephemeral, overwritten, never a historical record. |
+| Membership | (device id, region id) | The inside/outside bit that makes a crossing detectable. The only state that must persist. |
+| Crossing event | (device id, region id, at) | Emitted, delivered, retained briefly for replay |
+
+Membership is the entry worth dwelling on. A crossing is a **change** in a boolean, so detecting
+one requires remembering the previous value. Store it only for pairs that are plausibly near each
+other &mdash; a device carries membership rows for the handful of regions whose cells it has
+touched, not a row for each of the 100,000 regions &mdash; and this stays small.
+
+## Design v1
+
+<Arch
+  caption="Points in, membership compared, crossings out. The region index is small and cached everywhere; the membership store is the only thing that must remember anything."
+  columns={[
+    { title: 'Devices', nodes: [{ id: 'dev', label: 'Devices', note: '10M, 20% moving' }] },
+    { title: 'Ingest', nodes: [{ id: 'gw', label: 'Ingest gateway', note: 'batched, shed-able' }, { id: 'log', label: 'Partitioned log', note: 'by device id' }] },
+    { title: 'Evaluate', nodes: [{ id: 'idx', label: 'Region index', note: 'cells to regions, cached', tone: 'accent' }, { id: 'eval', label: 'Matcher', note: 'lookup then exact test' }] },
+    { title: 'Compare', nodes: [{ id: 'mem', label: 'Membership store', note: 'previous inside/outside', tone: 'accent' }] },
+    { title: 'Emit', nodes: [{ id: 'out', label: 'Crossing stream' }, { id: 'sub', label: 'Subscriber delivery', note: 'per-tenant budget' }] },
+  ]}
+  edges={[
+    { from: 'dev', to: 'gw' },
+    { from: 'gw', to: 'log' },
+    { from: 'log', to: 'eval', label: 'per device, ordered' },
+    { from: 'idx', to: 'eval', label: 'candidate regions' },
+    { from: 'eval', to: 'mem', label: 'compare and set' },
+    { from: 'mem', to: 'out', label: 'only on change' },
+    { from: 'out', to: 'sub' },
+  ]}
+  stages={[
+    {
+      label: 'Test everything',
+      show: ['dev', 'gw', 'eval'],
+      because:
+        'Compare each incoming point against every region. Correct, trivially explainable, and four orders of magnitude too expensive. It exists here only so the next stage has something to be a response to.',
+    },
+    {
+      label: 'Index the regions',
+      show: ['dev', 'gw', 'idx', 'eval'],
+      because:
+        'A spatial index over the regions turns each update into one lookup and a few exact tests. The evaluation cost now scales with how many regions are near the device rather than with how many exist.',
+    },
+    {
+      label: 'Remember, then emit only changes',
+      show: ['dev', 'gw', 'log', 'idx', 'eval', 'mem', 'out', 'sub'],
+      because:
+        'A crossing is a change in a boolean, so it cannot be detected without the previous value. Partitioning the log by device keeps one device on one evaluator, which is what makes the comparison a local read rather than a distributed one.',
+    },
+  ]}
+/>
+
+The index itself is the one place where the choice of structure matters. Regions are areas, not
+points, so a structure that stores points will not do:
+
+- **Cell cover.** Precompute the set of grid cells each region touches and store a cell-to-regions
+  map. A lookup is a hash of the device's cell. Simple, fast, trivially cacheable, and slightly
+  wasteful for long thin regions that cover many mostly-empty cells.
+- **R-tree.** Bounding boxes in a balanced tree, which handles awkward shapes gracefully and is
+  harder to distribute and to update concurrently.
+
+Prefer the cell cover here. The regions change rarely, so precomputation is nearly free; the index
+is small enough to hold in memory on every evaluator; and a hash lookup with no coordination beats
+an elegant tree that has to be shared.
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;Why not just check every region on every update?&rdquo;
+
+Because of the estimate above: 4 &times; 10<sup>10</sup> tests per second. Say the number out loud
+early. It is the fastest way to establish that the design is forced rather than chosen, and an
+interviewer who hears the arithmetic will usually skip ahead with you.
+
+The cell cover gets it to about 400,000 hash lookups per second, each returning a handful of
+candidate regions, followed by an exact test only for those. The bounding box is the cheap filter;
+the polygon test is the expensive one; run them in that order and the expensive one almost never
+runs.
+
+### Round 2 &mdash; &ldquo;A courier parks on the boundary. We send two hundred alerts in a minute.&rdquo;
+
+GPS is noisy &mdash; typically tens of metres, worse among tall buildings &mdash; so a stationary
+device near an edge will appear to cross it repeatedly. The naive design is working exactly as
+specified and the product is unusable.
+
+Three mechanisms, and it is worth being clear that they are different:
+
+**Hysteresis.** Enter at the boundary; exit only after moving a margin beyond it. The entry and
+exit tests use different geometry, which feels wrong for about a minute and then feels obviously
+right.
+
+**Dwell time.** Require the device to be inside for *n* consecutive seconds before the entry fires.
+This converts flapping into latency, and it is the knob the customer should control, because only
+they know whether a three-second delay or a false alert costs them more.
+
+**Accuracy gating.** Every fix carries an accuracy radius. If that radius is larger than the
+distance to the boundary, the reading cannot answer the question. Do not guess &mdash; wait for a
+better fix.
+
+<Callout kind="warn" title="The requirement nobody states">
+No customer asks for hysteresis, and every customer notices its absence within an hour of going
+live. Boundary behaviour is the difference between a demo and a product, and it is the part of this
+design that experience shows up in.
+</Callout>
+
+### Round 3 &mdash; &ldquo;One region contains a million devices.&rdquo;
+
+An airport, a stadium, a city centre. Two separate problems hide in this and they need separating.
+
+The **evaluation** is fine: work is partitioned by device, so a million devices inside one region
+are spread across every evaluator. Nothing concentrates.
+
+The **membership and delivery** are not. Every one of those devices writes a membership row keyed
+by the same region, and every crossing produces a message for the same subscriber. That is a
+<C id="hot-key">hot key</C> on the write path and a <C id="fanout-on-write">fanout</C> on the
+delivery path.
+
+Key the membership store by device rather than by region, so writes spread and the hot region is
+only hot for the reader who asks &ldquo;who is inside?&rdquo; &mdash; a question that is rare and
+can be served from a maintained count rather than a scan. For delivery, batch: a subscriber to a
+stadium wants a rate, not a million individual notifications, so aggregate over a short window and
+send a summary with a cursor into the detail.
+
+### Round 4 &mdash; &ldquo;Updates for one device arrive out of order.&rdquo;
+
+Then the membership bit flips backwards and you emit an exit after an entry that has not happened
+yet. This is the failure that produces alerts nobody can reproduce.
+
+Partition the log by **device id**, so every update for one device is handled by one evaluator in
+one order. Then carry the device's own timestamp and **discard any update older than the one
+already applied**. Ordering within a device is all that is needed here; there is no requirement to
+order two different devices relative to each other, and trying to would be enormously expensive
+for no benefit.
+
+<Claim label="fact">
+A device clock can be wrong by minutes and, on a handset whose user has changed the time, by
+years. Compare a device's timestamps only against its own, use them for ordering rather than for
+deciding what &ldquo;now&rdquo; is, and attach the server's receipt time for anything that has to
+be reasoned about across devices.
+</Claim>
+
+### Round 5 &mdash; &ldquo;A device was offline for an hour and just uploaded its whole trail.&rdquo;
+
+Ask what the customer wants, because both answers are defensible and they build different systems.
+
+If alerts are **operational** &mdash; a driver arrived, unlock the gate &mdash; then an
+hour-old entry event is worse than useless and should be dropped. Emit only crossings that are
+still current, and record the rest as history.
+
+If alerts are for **compliance** &mdash; did this vehicle enter a restricted zone &mdash; then
+every crossing matters no matter how late, and the trail must be replayed through the same
+evaluation path.
+
+Build the second and make dropping a policy on top. The reverse is not possible, because
+information you declined to compute is not recoverable, and the replay path is also what you will
+use when a customer registers a region and asks who is inside it right now.
+
+### Round 6 &mdash; &ldquo;Battery complaints. The app is the top drain on the phone.&rdquo;
+
+The radio, not your servers. Reporting every five seconds is expensive on the device, and this is
+the round where the right answer is to move work outward rather than inward.
+
+Push the small set of nearby regions **down to the device** and let it evaluate locally, reporting
+only crossings. The operating system's own geofencing API does exactly this, backed by hardware
+that is far cheaper than a GPS fix. Server-side evaluation continues for devices that cannot or
+will not do this, so the design keeps both paths.
+
+The costs are real and should be named: fence definitions on the device are stale until it next
+syncs; a device can lie about its own crossings, so anything with money or access attached still
+needs server confirmation; and the local set has to be refreshed as the device moves, which is
+itself a geospatial query.
+
+### Round 7 &mdash; &ldquo;A customer registers a region covering an entire country.&rdquo;
+
+Its cell cover is enormous, it matches nearly every update, and the exact test now runs constantly.
+One tenant has just made themselves everybody's problem &mdash; and note that they have not done
+anything wrong, which is what makes this a design failure rather than an abuse case.
+
+Bound it explicitly. Cap the cell cover a single region may occupy and reject or simplify beyond
+it. Meter evaluation cost per tenant rather than per request, since a request's cost varies by
+orders of magnitude with the geometry behind it. Give large regions a coarser cover, trading
+precision for cost where precision at a national boundary is meaningless anyway. And keep per-tenant
+delivery budgets so one customer's storm cannot consume another's.
+
+### Round 8 &mdash; &ldquo;Guarantee the alert within five seconds.&rdquo;
+
+Write down the budget and see what is left:
+
+| Stage | Budget |
+|---|---|
+| Device reporting interval | up to 5 s |
+| Network and ingest | 200 ms |
+| Log append and pickup | 300 ms |
+| Index lookup and exact test | 10 ms |
+| Membership compare and set | 20 ms |
+| Delivery to subscriber | 500 ms |
+
+The reporting interval alone can consume the entire budget, which means the guarantee is
+unachievable at a five-second cadence no matter how fast the backend is. Either the device reports
+more often &mdash; and Round 6 says what that costs &mdash; or it evaluates locally and reports
+crossings immediately, or the number changes. Presenting this table is a better answer than any
+optimisation, because it locates the constraint outside the part of the system you were being asked
+about.
+
+### Round 9 &mdash; &ldquo;An evaluator dies holding membership state for two million devices.&rdquo;
+
+Membership must be durable outside the evaluator, or a restart silently re-emits entries for every
+device that was already inside. Keep it in a store keyed by device, read it on the first update
+after a reassignment, and cache it locally afterwards.
+
+Then accept that delivery is <C id="at-least-once">at-least-once</C> and make the subscriber's life
+easy: a stable event id per (device, region, transition) so duplicates are detectable, and
+crossings that carry the resulting state rather than only the change, so a subscriber who missed one
+can reconcile without asking.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Alert storm at a boundary',
+      symptom: 'One stationary device generates hundreds of entry and exit alerts. Support hears about it before monitoring does.',
+      cause: 'Raw point-in-polygon results were emitted with no hysteresis, dwell time, or accuracy gating, and GPS noise did the rest.',
+      mitigation: 'Different geometry for entry and exit, a customer-controlled dwell, and refusal to decide when the accuracy radius exceeds the distance to the boundary.',
+    },
+    {
+      what: 'Exit without entry',
+      symptom: 'Subscribers receive exits for regions the device was never reported as entering. Irreproducible in testing.',
+      cause: 'Updates for one device were evaluated out of order, on more than one evaluator, or against membership state that had been lost.',
+      mitigation: 'Partition by device id, discard updates older than the last applied, and hold membership in a durable store rather than in evaluator memory.',
+    },
+    {
+      what: 'One tenant degrades everyone',
+      symptom: 'Latency rises across all customers after a single region is registered.',
+      cause: 'A region with an unbounded cell cover matched nearly every update and made the exact test the hot path.',
+      mitigation: 'Cap cover size, meter evaluation cost per tenant rather than per request, and coarsen large geometries deliberately.',
+    },
+    {
+      what: 'Silent stall behind a backlog',
+      symptom: 'Alerts stop, no errors are logged, and the system appears healthy. Discovered hours later.',
+      cause: 'Ingest continued to accept updates faster than evaluation could consume them, and the lag grew without a signal attached to it.',
+      mitigation: 'Alert on consumer lag rather than on error rate, shed at the gateway with sampling for moving devices, and prefer dropping a redundant position to falling behind.',
+    },
+    {
+      what: 'Duplicate entries after a deploy',
+      symptom: 'Every device inside every region generates a fresh entry event when evaluators restart.',
+      cause: 'Membership lived only in memory, so a restart made a known-inside device look newly arrived.',
+      mitigation: 'Durable membership, read on reassignment. Treat evaluator memory strictly as a cache of it.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Index the regions, not the points | Four orders of magnitude of evaluation cost | The index must be rebuilt when regions change | Regions changed as fast as positions do |
+| Cell cover over R-tree | Hash lookups, cacheable, no shared structure | Wasted cells for long thin geometries | Geometries were mostly awkward shapes |
+| Partition by device id | Ordering per device is free; membership reads are local | &ldquo;Who is in this region?&rdquo; needs a maintained count | Region queries outnumbered position updates |
+| Durable membership store | Restarts do not re-emit entries | A store read on the path of every reassignment | Re-emitting on restart were acceptable |
+| Dwell and hysteresis | Boundary behaviour becomes usable | Alerts are deliberately later than the raw crossing | False alerts were cheaper than delay |
+| On-device evaluation where possible | Large battery and ingest savings | Stale fences, untrusted client, a second code path | Devices could not be trusted at all |
+| At-least-once delivery with stable ids | Simple, survives everything | Subscribers must deduplicate | Subscribers could not be changed |
+| Per-tenant cost metering | One customer cannot degrade another | More accounting, and some legitimate use is refused | The system were single-tenant |
+
+## Cost
+
+Ingest is 20 MB/s, which is nothing. The region index is a few hundred megabytes and sits in memory
+on every evaluator. Neither is where the money goes.
+
+The spend is **evaluation and delivery**, and both scale with movement rather than with the number
+of devices installed. That is the useful thing to know commercially: a customer with a million
+devices that mostly sit still costs less than one with fifty thousand vehicles driving all day, and
+pricing that ignores this will be wrong in both directions.
+
+The largest available saving remains Round 6. Moving evaluation onto devices removes most of the
+ingest and most of the evaluation at once, and it is the reason the platform APIs exist in the form
+they do.
+
+## What we did NOT build
+
+**A general spatial database.** We support one query &mdash; which registered regions contain this
+point &mdash; and precompute for exactly that. A general engine would serve queries nobody asks and
+be slower at the one that matters.
+
+**Global ordering of updates.** Ordering is per device, which is all correctness requires. Ordering
+across devices would need a shared clock or a consensus round on the hottest path in the system.
+
+**Historical trajectory storage.** Positions are overwritten. The crossing stream is the durable
+record. Storing every point for ten million devices is a separate system with separate economics
+and a much larger privacy surface.
+
+**Prediction.** Estimating arrival before it happens is a modelling problem, not an indexing one,
+and it belongs on top of this rather than inside it.
+
+## Evidence
+
+<Claim label="fact" source="ddia">
+Multi-dimensional data can be indexed by a one-dimensional structure by translating coordinates
+into a single value with a space-filling curve, which is what allows an ordinary ordered index to
+answer a two-dimensional range query. This is the basis of the cell-cover approach used here.
+</Claim>
+
+<Claim label="fact" source="redis-docs">
+Redis stores geospatial members in a sorted set scored by a 52-bit integer derived from a geohash
+of the coordinates, so a proximity query becomes a range scan over that score. It is a working
+example of the same encoding, available without building anything.
+</Claim>
+
+<Claim label="fact" source="uber-eng">
+Uber published H3, a hierarchical hexagonal grid system for indexing geographic data, and describes
+using cell identifiers as index keys for location workloads. Hexagonal cells have uniform distance
+to all neighbours, which a square grid does not.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Records are ordered within a partition but not across partitions, and consumers track their
+position by offset against a retained log. Partitioning by device id is therefore what buys
+per-device ordering, and the retention is what makes the replay in Round 5 possible.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+A spatial query is conventionally executed in two stages: a cheap filter over bounding boxes that
+over-approximates the answer, followed by an exact geometric test on the survivors. The ordering of
+those two stages is the reason the expensive test rarely runs.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+Shedding load at the edge of a system, before work is admitted, keeps a service responsive under
+overload in a way that queuing the work does not, because a queue converts an overload into
+unbounded latency rather than removing it.
+</Claim>
+
+<Claim label="fact" source="sre-book">
+Alerting should be driven by symptoms a user would notice rather than by internal causes. For this
+system the symptom is consumer lag: alerts stop arriving long before any error rate moves, which is
+why Round 9's stall is invisible to error-based monitoring.
+</Claim>
+
+<Claim label="speculation">
+Device counts, the fraction moving, reporting intervals and the 100,000 regions are illustrative
+figures chosen to make the arithmetic legible. They are the right order of magnitude for a
+fleet-tracking product and should be re-derived for any real one.
+</Claim>
+
+<Claim label="convention">
+GPS accuracy on a consumer handset is commonly a few metres in the open and tens of metres among
+tall buildings, and degrades further indoors. Treat the figure in Round 2 as an order of magnitude
+rather than a specification; the design consequence - that a fix can be too imprecise to answer the
+question being asked of it - holds regardless of the exact number.
+</Claim>

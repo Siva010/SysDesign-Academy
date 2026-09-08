@@ -172,18 +172,29 @@ export interface Pattern extends PatternMeta {
 
 /* ------------------------------------------------------------------ case studies */
 
-export type PrimitiveSignature =
-  | 'id-generation'
-  | 'fanout'
-  | 'hot-key'
-  | 'exactly-once-effect'
-  | 'geo-index'
-  | 'large-object'
-  | 'time-series-ingest'
-  | 'search-index'
-  | 'scheduling'
-  | 'inventory-contention'
-  | 'stream-join';
+/**
+ * The primitive signatures from docs/06-case-study-taxonomy.md: the shapes a system problem
+ * reduces to, of which every case study is an instance of at least one.
+ *
+ * A runtime array rather than a bare union, so the validator can assert that each one is
+ * actually taught by a case study. A union alone vanishes at compile time and the coverage
+ * claim becomes something a human has to re-check by hand.
+ */
+export const PRIMITIVE_SIGNATURES = [
+  'id-generation',
+  'fanout',
+  'hot-key',
+  'exactly-once-effect',
+  'geo-index',
+  'large-object',
+  'time-series-ingest',
+  'search-index',
+  'scheduling',
+  'inventory-contention',
+  'stream-join',
+] as const;
+
+export type PrimitiveSignature = (typeof PRIMITIVE_SIGNATURES)[number];
 
 export interface CaseStudyMeta {
   id: string;

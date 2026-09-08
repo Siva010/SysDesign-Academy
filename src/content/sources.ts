@@ -673,14 +673,6 @@ export const SOURCES: Source[] = [
     kind: 'engineering-blog',
     authoritativeFor: ['USE method', 'performance analysis methodology', 'latency profiling'],
   },
-  {
-    id: 'aosa',
-    title: 'The Architecture of Open Source Applications',
-    url: 'https://aosabook.org/',
-    tier: 3,
-    kind: 'book',
-    authoritativeFor: ['real system architectures', 'design decisions in open-source projects'],
-  },
 
   /* ------------------------------------------------------ tier 4: interview convention */
   {
@@ -699,14 +691,6 @@ export const SOURCES: Source[] = [
     tier: 4,
     kind: 'interview-prep',
     authoritativeFor: ['common interview topic coverage', 'question inventory'],
-  },
-  {
-    id: 'bytebytego',
-    title: 'ByteByteGo',
-    url: 'https://bytebytego.com/',
-    tier: 4,
-    kind: 'interview-prep',
-    authoritativeFor: ['visual explanation conventions', 'commonly asked systems'],
   },
   {
     id: 'exponent',
