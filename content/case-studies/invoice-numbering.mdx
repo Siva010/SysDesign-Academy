@@ -1,0 +1,435 @@
+---
+id: invoice-numbering
+title: Invoice Numbering
+ask: Design identifiers for a payments platform. Orders need ids at high volume, and invoices in several jurisdictions must carry a gapless sequential number per legal entity per year.
+difficulty: advanced
+minutes: 50
+signatures: [id-generation, exactly-once-effect]
+concepts: [idempotency, idempotency-key, exactly-once, effectively-once, at-least-once, correlation-id, btree, lsm-tree, index, write-amplification, clock-skew, sharding, partitioning, partition-key, hot-partition, locking, two-phase-locking, deadlock, optimistic-concurrency, serializability, isolation-levels, snapshot-isolation, acid, distributed-transaction, saga, wal, durability, audit-log, lease, leader-election, data-residency, expand-contract, versioning, schema-migration, tenant-isolation, blast-radius, graceful-degradation, throughput, latency, backpressure, retry, timeout, capacity-headroom]
+patterns: [idempotency-key, transactional-outbox, expand-contract, saga]
+prerequisites: [transactions-across-machines, delivery-and-duplicates]
+sources: [ddia, database-internals, postgres-docs, mysql-docs, stripe-eng, aws-builders-library]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design identifiers for a payments platform. Orders need ids at high volume, and invoices
+> in several jurisdictions must carry a gapless sequential number per legal entity per
+> year.&rdquo;
+
+The trap is hearing one problem. There are two, they want opposite things, and a candidate who
+designs a single scheme for both will produce something that is either too slow for orders or
+illegal for invoices.
+
+An **order id** should be unguessable, cheap to mint anywhere, and never a coordination point.
+An **invoice number** must be sequential with no gaps, which is a statement about a shared counter
+and therefore about serialisation. One is designed to avoid agreement; the other is defined by it.
+
+The interesting work is establishing that these are different populations with different rates,
+and then making the expensive requirement apply only to the small one.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Does gapless apply everywhere, or in specific jurisdictions? | If it is a subset, most invoices avoid the serialisation point entirely. Designing for the strictest rule globally is the expensive mistake. |
+| Gapless per what? Legal entity, document series, year? | This is the shard key for the whole problem. The narrower the scope, the lower the rate on any one sequence. |
+| Must a cancelled invoice keep its number? | Almost always yes, corrected by a credit note. If numbers could be reclaimed, the design would be very different and much worse. |
+| What fraction of orders become invoices? | Decides whether the constrained path carries 5% of traffic or all of it. |
+| Is the order id ever shown to a customer? | If yes, it must not leak volume. A visible incrementing id tells a competitor your daily order count. |
+| Who owns &ldquo;the year&rdquo;? | Year rollover happens in a timezone, and the entity's jurisdiction decides which one. |
+
+## Requirements
+
+**Functional.** Mint an order id on every order. Allocate an invoice number when an invoice is
+issued, sequential and gapless within its (entity, series, year). Render, store, and retain both.
+Support cancellation by credit note. Answer an auditor's question about completeness.
+
+**Non-functional.** Never reuse a number. Never skip one. A retried request must not consume two.
+Allocation must survive a crash at any point. One entity's volume must not stall another's.
+
+**Out of scope.** Tax calculation, invoice rendering and delivery, dunning, and the actual legal
+advice, which is not an engineering artefact.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+- **20,000 orders per second** at peak; roughly 1.5 billion a year.
+- An order id at 16 bytes, indexed, is a few hundred gigabytes a year with its index. Unremarkable.
+- **5% of orders produce an invoice**: about **1,000 invoices per second** at peak.
+- Those invoices are spread over **200 legal entities** and several document series each.
+
+Now the number that decides the design:
+
+<Claim label="inference">
+One thousand invoices per second across roughly six hundred (entity, series) pairs is **under two
+per second on any one sequence**, and the busiest is perhaps fifty. A serialised counter at fifty
+writes per second is *nothing* &mdash; a single row updated fifty times a second is comfortable on
+hardware from twenty years ago.
+</Claim>
+
+That single observation is the whole design, and it is worth being explicit about why:
+
+<Claim label="inference">
+The gapless requirement is impossible at 20,000 per second and trivial at 50. The engineering task
+is therefore not to make a distributed gapless counter &mdash; which is a genuinely hard problem,
+and one nobody here needs solved. It is to establish that the constrained path carries a
+thousandth of the traffic, and then to keep it that way.
+</Claim>
+
+A candidate who starts inventing distributed sequence protocols has skipped the arithmetic and is
+solving a problem the requirements do not pose.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Order | order id | Time-ordered, unguessable, minted anywhere without coordination |
+| Sequence | (entity id, series, year) | A counter row. The only serialisation point in the system. |
+| Invoice | invoice id | Carries its allocated number, its sequence key, and the idempotency key that produced it |
+| Allocation | idempotency key | Maps a logical issuance to the number it received. Makes retries free. |
+| Credit note | credit note id | Its own sequence. Corrects an invoice; never replaces its number. |
+
+Two identifiers per invoice, and the separation is deliberate. The **invoice id** is an internal,
+unguessable primary key minted like an order id. The **invoice number** is the human- and
+regulator-facing sequential string. Conflating them forces every foreign key in the system through
+the serialisation point, which is exactly what we are trying to keep small.
+
+## Design v1
+
+<Arch
+  caption="Two paths that never touch. Orders mint locally and never coordinate; invoices take one row lock inside the transaction that commits them."
+  columns={[
+    { title: 'Write', nodes: [{ id: 'api', label: 'Order API', note: 'stateless' }, { id: 'inv', label: 'Invoice service' }] },
+    { title: 'Mint', nodes: [{ id: 'local', label: 'Local id mint', note: 'time-ordered, no coordination', tone: 'accent' }] },
+    { title: 'Allocate', nodes: [{ id: 'alloc', label: 'Number allocation', note: 'in the invoice transaction', tone: 'accent' }, { id: 'idem', label: 'Allocation record', note: 'keyed by idempotency key' }] },
+    { title: 'Store', nodes: [{ id: 'seq', label: 'Sequence rows', note: 'one per entity, series, year' }, { id: 'db', label: 'Invoice store' }] },
+    { title: 'Prove', nodes: [{ id: 'audit', label: 'Completeness check', note: 'scheduled' }] },
+  ]}
+  edges={[
+    { from: 'api', to: 'local', label: 'every order' },
+    { from: 'inv', to: 'alloc', label: 'on issue' },
+    { from: 'alloc', to: 'idem', label: 'same transaction' },
+    { from: 'alloc', to: 'seq', label: 'update returning' },
+    { from: 'alloc', to: 'db' },
+    { from: 'db', to: 'audit', label: 'max vs count' },
+  ]}
+  stages={[
+    {
+      label: 'One scheme for everything',
+      show: ['api', 'inv', 'seq'],
+      because:
+        'A single sequential id for orders and invoices alike. It satisfies the regulator and puts every one of 20,000 orders per second through a counter that can serve perhaps a few thousand. The system is correct and unusable.',
+    },
+    {
+      label: 'Split the populations',
+      show: ['api', 'inv', 'local', 'alloc', 'seq', 'db'],
+      because:
+        'Orders mint time-ordered ids locally with no coordination at all. Only the 5% that become invoices touch a counter, and that counter is scoped per entity, series and year so no single row sees meaningful load.',
+    },
+    {
+      label: 'Idempotent, and provable',
+      show: ['api', 'inv', 'local', 'alloc', 'idem', 'seq', 'db', 'audit'],
+      because:
+        'Recording the allocation against the idempotency key in the same transaction makes a retry return the number it already got rather than consume another. A scheduled completeness check turns the legal claim into something monitored rather than assumed.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;Why not use a random UUID for everything?&rdquo;
+
+For orders it is nearly right, and the reason to hesitate is not uniqueness but **insertion
+order**.
+
+A random identifier used as the clustering key of a <C id="btree">B-tree</C> writes to a random leaf
+page every time. With a working set larger than memory, each insert touches a different page, so
+every page must be read before being written and dirtied for the sake of one row. Insertions
+arriving in ascending order all land in the same rightmost page, which stays in memory and is
+written once per fill.
+
+The fix is a **time-ordered** identifier: a millisecond timestamp in the high bits, then a node or
+shard identifier, then a per-millisecond counter. Ordered enough to keep insertion local,
+unguessable enough not to leak, and mintable with no coordination whatsoever.
+
+<Callout kind="info" title="What the timestamp prefix costs">
+Time-ordered ids leak approximate creation time, and adjacent ids from one node reveal that node's
+rate. For an internal order id that is fine. If the identifier is shown to customers or partners,
+decide deliberately whether you are comfortable publishing your volume, because a visible
+incrementing id is a business metric anyone can read.
+</Callout>
+
+### Round 2 &mdash; &ldquo;Fine. Use a database sequence for the invoice numbers.&rdquo;
+
+This is the round that separates people who have shipped this from people who have read about it,
+because the obvious answer is wrong for a reason that is documented and still surprises almost
+everyone.
+
+<Claim label="fact" source="postgres-docs">
+Sequences are non-transactional. A number obtained from `nextval` is not returned if the
+surrounding transaction rolls back, and concurrent transactions receive distinct values that may
+commit out of order. Sequences are explicitly documented as producing gaps.
+</Claim>
+
+That property is not a defect; it is the entire point. A sequence is fast **because** it refuses to
+participate in your transaction. Participating is what would serialise it. So the mechanism whose
+name sounds exactly like the requirement is the one mechanism guaranteed not to satisfy it.
+
+The same is true of auto-increment columns, for the same reason.
+
+### Round 3 &mdash; &ldquo;So how do you actually get a gapless number?&rdquo;
+
+You take the lock the sequence exists to avoid. The counter becomes an ordinary row, updated inside
+the same transaction that writes the invoice:
+
+    UPDATE invoice_sequence SET last = last + 1
+    WHERE entity_id = ? AND series = ? AND year = ?
+    RETURNING last
+
+Because the update holds a row lock until commit, every other issuance for that sequence waits.
+Because the increment is in the transaction, a rollback returns the number. Gapless follows
+directly from both facts, and neither can be relaxed.
+
+This is a deliberate serialisation point, and the honest way to present it is with the number from
+the estimate attached: the sequence is serialised at about fifty writes per second in the worst
+case, and a row lock held for the length of a small transaction supports that with room to spare.
+
+<Claim label="inference">
+The design is not clever, and that is the argument for it. Every alternative &mdash; block
+pre-allocation, distributed counters, optimistic retry &mdash; either reintroduces gaps or costs
+more than the lock it replaces. When a requirement genuinely demands serialisation, the useful
+skill is bounding its scope, not evading it.
+</Claim>
+
+### Round 4 &mdash; &ldquo;The client times out and retries. Do we burn two numbers?&rdquo;
+
+With the design so far, yes, and this is the failure that produces a gap in the sequence you
+promised had none &mdash; because the first transaction may well have committed.
+
+The issuance carries an <C id="idempotency-key">idempotency key</C> derived from the invoice's
+identity rather than from the attempt. Allocation writes `(key, number)` in the same transaction
+that increments the counter, with a uniqueness constraint on the key. A retry either finds the
+existing row and returns the same number, or loses the race on the constraint and reads it.
+
+<Claim label="inference">
+Delivery is <C id="at-least-once">at-least-once</C> and no design here changes that. What is
+exactly-once is the **allocation**, which holds because the counter increment and the allocation
+record commit atomically. Split them across two transactions or two stores and the guarantee is
+gone, which is why this must not become a distributed transaction.
+</Claim>
+
+### Round 5 &mdash; &ldquo;An invoice was issued in error. Take the number back.&rdquo;
+
+No. Cancel by issuing a **credit note**, which carries its own number from its own sequence and
+references the invoice it corrects. The original number stays allocated, its invoice stays stored,
+and the pair records what happened.
+
+This is worth arguing with an interviewer who pushes, because reclamation is not merely
+inconvenient: a number that once existed and later does not is precisely the gap the requirement
+prohibits, and it destroys the audit trail that makes the number worth having. The domain's answer
+&mdash; corrections are additions, never deletions &mdash; is the same shape as an append-only
+<C id="audit-log">log</C>, and recognising that is the transferable part.
+
+### Round 6 &mdash; &ldquo;It is 23:59 on the 31st of December.&rdquo;
+
+The sequence key contains a year, so at some instant a new sequence begins at one. Which instant is
+a question about the entity's jurisdiction, not about your servers, and getting it wrong is a
+filing error rather than a bug.
+
+Take the boundary from the **entity's** configured timezone, evaluated at the moment of issuance,
+and store both the number and the resolved period on the invoice so the decision is auditable
+later. Never take it from the server's clock, which is in UTC and belongs to whichever region
+happened to serve the request. Related: an entity that moves jurisdiction changes its boundary,
+which is a data change, not a deploy.
+
+<Claim label="convention">
+Several jurisdictions require invoice numbers that are sequential and unbroken within a period,
+and the details &mdash; whether the period is a calendar year, whether series may be split by
+branch or document type, what a correction must reference &mdash; vary between them and change
+over time. Treat the scope of the sequence key as configuration to be confirmed with counsel per
+market, not as a constant to be compiled in.
+</Claim>
+
+### Round 7 &mdash; &ldquo;One entity issues forty per cent of all invoices.&rdquo;
+
+Then its sequence runs at a few hundred writes per second and is still comfortable, but it is now
+worth being precise about what cannot be done: **the sequence cannot be sharded.** Splitting one
+entity's numbering across two counters produces two interleaved sequences, and interleaving is
+indistinguishable from gaps.
+
+What is available is narrowing the key. If the jurisdiction permits a **series** per branch, per
+site, or per document type, then each series is an independent gapless sequence and the load
+divides legitimately. Note the shape of this: the relief comes from a change in the *requirement's
+scope*, negotiated with the business, and not from anything technical. Recognising which
+constraints are negotiable is most of what senior judgment consists of here.
+
+Keep the entity's sequence rows away from the noisiest tenants' — a lock convoy on one entity's
+counter must not become everyone's latency.
+
+### Round 8 &mdash; &ldquo;Pre-allocate blocks of a thousand numbers to each server.&rdquo;
+
+This is the most attractive wrong answer in the problem, and it should be refused precisely.
+
+A server holding numbers 4001&ndash;5000 that dies after using six leaves 994 numbers that will
+never appear on an invoice. That is a gap. Every variant fails the same way: the block is either
+committed before use, which loses the unused remainder, or after, which means two servers can hold
+the same block.
+
+Block allocation is the right answer to the *adjacent* problem &mdash; identifiers that must be
+unique and roughly increasing but may skip. It is worth naming the distinction out loud, because
+&ldquo;sequential&rdquo; and &ldquo;gapless&rdquo; are used interchangeably in conversation and
+mean different things here. Only one of them forbids the optimisation.
+
+### Round 9 &mdash; &ldquo;An auditor asks you to prove no invoice is missing.&rdquo;
+
+The design makes this cheap, which is the payoff for accepting the lock:
+
+    SELECT entity_id, series, year, COUNT(*), MIN(number), MAX(number)
+    FROM invoices GROUP BY entity_id, series, year
+
+Completeness holds when the count equals the maximum minus the minimum plus one, per group. Run it
+on a schedule rather than when asked, and alert on a discrepancy, because the useful time to learn
+that the invariant broke is the day it breaks and not the day somebody audits it.
+
+The migration case is the one that will actually produce a discrepancy: importing a legacy system
+that issued numbers up to 84,312 means seeding the counter above that and accepting that history
+began mid-sequence, so the completeness check needs a per-sequence floor rather than assuming one.
+Run both systems' numbering side by side through a cutover, using
+<C id="expand-contract">expand and contract</C>, and switch reads only once the new sequence has
+been issuing correctly for a period.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Gaps in a sequence that must not have them',
+      symptom: 'Discovered by an auditor or a tax filing rejection, typically months later.',
+      cause: 'The number came from a database sequence or auto-increment column, which are documented as non-transactional and skip on rollback.',
+      mitigation: 'Increment a counter row inside the same transaction that writes the invoice. Accept the row lock, and bound its scope with the sequence key.',
+    },
+    {
+      what: 'Two numbers for one invoice',
+      symptom: 'A duplicate document reaches the customer, and the sequence contains an unexplained extra entry.',
+      cause: 'A timeout was retried and the first attempt had in fact committed. Allocation was keyed by the attempt rather than by the invoice.',
+      mitigation: 'A stable idempotency key with a uniqueness constraint, and the allocation record written in the same transaction as the increment.',
+    },
+    {
+      what: 'Order inserts collapse under their own index',
+      symptom: 'Write throughput degrades steadily as the table grows, with no change in traffic and heavy random read activity during writes.',
+      cause: 'Random identifiers as the clustering key send every insert to a different page, so each write reads and dirties a page for one row.',
+      mitigation: 'Time-ordered identifiers, so insertions stay in the rightmost pages and the working set for writes stays small.',
+    },
+    {
+      what: 'Lock convoy on one sequence',
+      symptom: 'Invoice issuance latency for one large entity rises sharply, then spreads to unrelated entities.',
+      cause: 'A long transaction held the counter row lock, queueing every other issuance behind it and consuming the shared connection pool.',
+      mitigation: 'Keep the transaction that holds the counter as short as possible, do external work outside it, and isolate the pool so one entity cannot exhaust it.',
+    },
+    {
+      what: 'Wrong period at the boundary',
+      symptom: 'Invoices issued around new year carry the wrong year, or a sequence restarts a day early.',
+      cause: 'The period was resolved from the server clock in UTC rather than from the entity jurisdiction timezone.',
+      mitigation: 'Resolve the period from entity configuration, store the resolved period on the invoice, and test the boundary in both directions.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Separate id schemes for orders and invoices | The expensive rule applies to 5% of traffic | Two concepts to explain and keep straight | Invoice volume equalled order volume |
+| Time-ordered order ids | Index locality, no coordination | Approximate creation time and rate are inferable | Ids were public and volume were sensitive |
+| Counter row in the invoice transaction | Genuinely gapless, and simple to reason about | A deliberate serialisation point per sequence | Gaps were permitted, which makes a sequence correct and far faster |
+| Sequence keyed by entity, series and year | Per-sequence load stays trivial | The key is regulatory configuration, not a constant | A jurisdiction demanded one global sequence |
+| Idempotency record in the same transaction | Retries cannot consume a number | Every issuance carries a key from its caller | Callers could not supply a stable key |
+| Credit notes rather than reclamation | The audit trail is append-only | More documents, and users must understand two kinds | Numbers could legally be reused, which they cannot |
+| No block pre-allocation | No gaps from a dead holder | The lock stays on the hot path | The requirement were sequential-but-skippable |
+| Scheduled completeness check | The invariant is monitored, not assumed | A recurring query over a large table | The count were too large to aggregate, which it is not |
+
+## Cost
+
+The order path costs what its volume costs and nothing extra: ids are minted in process, so there
+is no service, no round trip, and no dependency to run.
+
+The invoice path's cost is not throughput but **latency under a lock**, and the sensitivity worth
+knowing is that it scales with transaction duration rather than with invoice rate. A transaction
+that holds the counter for two milliseconds supports hundreds per second on one sequence; one that
+calls a tax service while holding it supports perhaps ten. Keeping foreign work outside the lock is
+worth more than any amount of hardware.
+
+Storage is unremarkable. The audit obligation is the durable cost: invoices are retained for years
+by law, which makes this a system whose data outlives most of the services around it, and a good
+reason for the invoice record to be self-describing rather than needing a join to something that
+may have been refactored away.
+
+## What we did NOT build
+
+**A distributed gapless counter.** It is a real problem, it needs consensus on every allocation,
+and the arithmetic says nobody here has it. Solving it would be the most impressive wrong answer
+available.
+
+**One identifier for both purposes.** Every foreign key in the platform would then run through the
+serialisation point, and the 5% path would become the 100% path.
+
+**Number reclamation.** Prohibited by the requirement, and it would destroy the completeness check
+that makes the requirement verifiable.
+
+**A central id service.** Time-ordered ids need no coordination, so a service to hand them out
+would add a network hop and a shared dependency in exchange for nothing.
+
+## Evidence
+
+<Claim label="fact" source="postgres-docs">
+PostgreSQL documents that sequences are non-transactional: a value obtained from `nextval` is not
+returned to the sequence when the transaction rolls back, so gaps are expected and the mechanism is
+explicitly unsuitable for a gapless requirement.
+</Claim>
+
+<Claim label="fact" source="mysql-docs">
+MySQL's AUTO_INCREMENT behaves the same way. Values consumed by a rolled-back or failed statement
+are not reused, and the lock mode chosen for InnoDB trades gap-freedom against concurrency rather
+than offering both.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Inserting rows in random key order into a B-tree scatters writes across pages and forces reads
+before writes as the index outgrows memory, whereas ascending keys concentrate insertions in the
+rightmost pages. This is the mechanism behind Round 1.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+B-tree insertion cost is dominated by page splits and by whether the target page is resident.
+Sequential insertion patterns keep the working set for writes small, which is why the ordering of
+an identifier is a storage-engine concern and not only an aesthetic one.
+</Claim>
+
+<Claim label="fact" source="stripe-eng">
+Idempotency keys supplied by the caller allow a retried request to return the result of the
+original rather than perform the operation again, and the key must identify the logical operation
+rather than the attempt for this to hold.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+A client that times out cannot distinguish a request that failed from one that succeeded with a
+lost response, which is why the retry must be made safe at the server rather than avoided at the
+client.
+</Claim>
+
+<Claim label="speculation">
+The order rate, the 5% invoice fraction, and the two hundred legal entities are illustrative
+figures chosen so the arithmetic is legible. The conclusion they support &mdash; that per-sequence
+load is orders of magnitude below total load &mdash; holds across a wide range of inputs, and is
+the first thing to re-derive for a real platform.
+</Claim>
+
+<Claim label="convention">
+Sequential invoice numbering obligations exist in a number of jurisdictions and differ in scope,
+period, and what a correcting document must reference. Nothing here is legal advice; the design
+treats the sequence key as configuration precisely because the rule is a moving external input
+rather than an engineering constant.
+</Claim>

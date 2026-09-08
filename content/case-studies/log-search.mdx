@@ -1,0 +1,425 @@
+---
+id: log-search
+title: Log Search
+ask: Design log storage and search for a fleet of fifty thousand services, retained for thirty days and searchable during an incident.
+difficulty: advanced
+minutes: 55
+signatures: [search-index, time-series-ingest]
+concepts: [inverted-index, index, secondary-index, cardinality, bloom-filter, lsm-tree, compaction, immutability, retention, ttl, time-series-storage, columnar-storage, object-storage, partitioning, partition-key, hot-partition, write-amplification, read-amplification, fanout-on-read, fanout-latency-amplification, cross-shard-query, tail-latency, hedged-request, sampling, downsampling, load-shedding, backpressure, batching, queue-depth, tenant-isolation, blast-radius, graceful-degradation, capacity-headroom, staleness, throughput, latency, timeout, retry, retry-amplification, correlation-id, replay, backfill]
+patterns: [bulkhead, token-bucket, circuit-breaker, cell-based-architecture]
+prerequisites: [finding-things-again, when-load-is-not-even]
+sources: [elasticsearch-docs, clickhouse-docs, ddia, database-internals, datadog-eng, sre-book, aws-builders-library]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design log storage and search for a fleet of fifty thousand services, retained for thirty
+> days and searchable during an incident.&rdquo;
+
+The words say search, and the instinct is to reach for the machinery that serves a product
+catalogue: tokenise everything, build an inverted index, rank the results. That machinery is
+correct and it is pointed the wrong way round, because the ratio it was designed for is inverted
+here.
+
+A catalogue index is written once and read a thousand times. A log index is written a thousand
+times and read once, if ever. Almost every decision follows from that one reversal, and a candidate
+who states it in the first two minutes has most of the design.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Who queries, and how often? | A handful of engineers during incidents is a different system from a dashboard that every service polls. |
+| Is the common query &ldquo;this service, last hour&rdquo; or &ldquo;this string, last month&rdquo;? | The first is served by partitioning alone. The second needs an index and is far more expensive. |
+| Do logs have structure, or are they lines of text? | Structured fields can be indexed cheaply and selectively. Free text cannot be, at this volume. |
+| Is losing some logs acceptable, and which ones? | The answer decides what happens at the moment the system is most stressed, which is also when logs matter most. |
+| Must all thirty days be equally fast? | If day 29 may take minutes, most of the storage bill and most of the index disappears. |
+| Are trace or request ids searched directly? | The highest-cardinality field in the data is also the one people most want to look up, and that tension drives the whole index design. |
+
+## Requirements
+
+**Functional.** Ingest structured and unstructured log events from fifty thousand sources. Retain
+thirty days. Search by time range, by service and host, by severity, and by content. Look up a
+single request across the whole retention window.
+
+**Non-functional.** Never let query load compromise ingest. Bounded, predictable retention cost.
+One noisy team must not degrade another's ingest or search. Recent data must stay fast while an
+incident is in progress.
+
+**Out of scope.** Metrics and traces as separate products, alerting rules, log parsing at the
+source, and the retention policy negotiation that decides whether thirty days is even the right
+number.
+
+## Estimate
+
+<Estimator preset="storage" />
+
+- **50,000 services** producing **500,000 log lines per second** in aggregate.
+- At an average **500 bytes** a line: **250 MB/s**, or about **21 TB per day** raw.
+- Compressed at roughly 10:1: **2.1 TB per day**, and **63 TB** for thirty days.
+- Query load: perhaps **two searches per second** in normal operation, from a few dozen engineers.
+
+Put the two rates beside each other, because the comparison is the design.
+
+<Claim label="inference">
+Five hundred thousand writes per second against two reads per second is a ratio of roughly
+**250,000 : 1**. Product search runs the same ratio the other way. Every technique that is obviously
+correct for a catalogue &mdash; index every field, precompute rankings, denormalise generously
+&mdash; is paid for once and recovered over a thousand reads. Here it is paid for a quarter of a
+million times and recovered once.
+</Claim>
+
+The second number that decides things is the cost of the index itself, which is the part people
+consistently underestimate.
+
+<Claim label="inference">
+A full inverted index over log content typically costs as much as or more than the compressed data
+it indexes, so indexing everything roughly **doubles the storage bill and adds the index write to
+every one of 500,000 events per second**. At this ratio the index is not an optimisation that pays
+for itself; it is the single largest line item, bought to serve two queries a second.
+</Claim>
+
+So the design problem is not how to search 63 TB. It is **how little indexing you can get away
+with**, and the answer turns out to be surprisingly little, because of what the queries look like.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Event | (tenant, service, hour, offset) | The log line, plus structured fields. Immutable, never updated, never individually deleted. |
+| Block | (tenant, service, hour, block id) | A few thousand events, compressed together. The unit of storage, retention and scan. |
+| Label index | (tenant, service, severity, hour) | Small, structured, low cardinality. Prunes to a set of blocks. |
+| Block filter | block id | A Bloom filter over the tokens the block contains. Prunes further without an inverted index. |
+| Retention unit | (tenant, hour) | Whole partitions, dropped rather than deleted. |
+
+The partition key contains **time**, and that is load-bearing rather than tidy. It means a query
+with a time range touches only the blocks in that range, that retention is the removal of whole
+partitions, and that yesterday's data is never rewritten by today's arrivals.
+
+## Design v1
+
+<Arch
+  caption="Index the labels, filter the blocks, scan what survives. The expensive structure that a catalogue would build is deliberately absent."
+  columns={[
+    { title: 'Sources', nodes: [{ id: 'agent', label: 'Agents', note: '50k services, batched' }] },
+    { title: 'Ingest', nodes: [{ id: 'gw', label: 'Ingest tier', note: 'per-tenant quota' }, { id: 'buf', label: 'Buffer', note: 'absorbs bursts' }] },
+    { title: 'Build', nodes: [{ id: 'blk', label: 'Block builder', note: 'compress, Bloom filter', tone: 'accent' }] },
+    { title: 'Store', nodes: [{ id: 'hot', label: 'Hot store', note: 'recent, on SSD' }, { id: 'cold', label: 'Object storage', note: 'the other 28 days' }] },
+    { title: 'Query', nodes: [{ id: 'lbl', label: 'Label index', note: 'prunes to blocks', tone: 'accent' }, { id: 'q', label: 'Query fan-out', note: 'bounded, sheddable' }] },
+  ]}
+  edges={[
+    { from: 'agent', to: 'gw' },
+    { from: 'gw', to: 'buf' },
+    { from: 'buf', to: 'blk' },
+    { from: 'blk', to: 'hot' },
+    { from: 'hot', to: 'cold', label: 'after 2 days' },
+    { from: 'blk', to: 'lbl', label: 'labels only' },
+    { from: 'lbl', to: 'q', label: 'candidate blocks' },
+    { from: 'q', to: 'hot' },
+    { from: 'q', to: 'cold' },
+  ]}
+  stages={[
+    {
+      label: 'Index everything',
+      show: ['agent', 'gw', 'blk', 'hot', 'q'],
+      because:
+        'A full inverted index over every field. Queries are fast and the index costs more than the data, is written half a million times a second, and must be maintained for content nobody will ever search.',
+    },
+    {
+      label: 'Index labels, scan the rest',
+      show: ['agent', 'gw', 'buf', 'blk', 'lbl', 'hot', 'q'],
+      because:
+        'Index only the low-cardinality structured fields - tenant, service, host, severity, time. They prune a 63 TB corpus to a few gigabytes, and brute-force scanning a few gigabytes is fast and enormously cheaper than maintaining the index that would avoid it.',
+    },
+    {
+      label: 'Tiered, filtered, bounded',
+      show: ['agent', 'gw', 'buf', 'blk', 'lbl', 'hot', 'cold', 'q'],
+      because:
+        'Bloom filters per block prune content queries without an inverted index. Recent data lives on fast storage and the rest on object storage. Query fan-out is bounded so a single expensive search cannot consume the capacity that ingest depends on.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;Why not just put it all in a search engine?&rdquo;
+
+Because of the ratio, and it is worth being concrete rather than dismissive: a full-text search
+engine is an excellent piece of technology being asked to do the thing it is worst at.
+
+Its index is optimised for many reads amortising one write. Here each write is amortised over
+roughly zero reads, and the index must still be built, merged, compacted and replicated. You pay
+for the index in ingest capacity, in storage, and in the merge work that continues long after
+anybody stopped caring about that hour of logs.
+
+The alternative is not &ldquo;no index&rdquo;. It is **an index over the fields that prune, and a
+scan over the content that does not**. Which brings the next question.
+
+### Round 2 &mdash; &ldquo;Then which fields do you index?&rdquo;
+
+The low-cardinality structured ones: tenant, service, host, severity, and time. Perhaps a dozen
+values to a few thousand each.
+
+The arithmetic that justifies the choice is worth doing out loud. A query for one service, one
+hour, at error severity, selects perhaps one part in a hundred thousand of the corpus. Sixty-three
+terabytes becomes a few hundred megabytes, and a few hundred megabytes can simply be **read**.
+
+<Claim label="inference">
+An index earns its cost by pruning. Once the pruning is good enough that the survivors can be
+scanned inside the query budget, further indexing buys nothing and still costs the same to
+maintain. Log search sits well past that point with only a handful of fields indexed, which is why
+the design that looks lazy is the correct one.
+</Claim>
+
+What you must **not** index is the high-cardinality content. A request id appears in a handful of
+lines out of billions, so an index entry for it is nearly one entry per event: an index the size of
+the data, which prunes perfectly and costs everything.
+
+### Round 3 &mdash; &ldquo;I have a trace id and I need every line for it across thirty days.&rdquo;
+
+This is the query the previous round just refused to index for, it is the single most valuable
+query during an incident, and reconciling those two facts is the heart of the design.
+
+Attach a **Bloom filter per block** over the distinct tokens the block contains. At query time, ask
+each block's filter whether it might contain the id. Filters are small &mdash; a few kilobytes for
+a block of thousands of events &mdash; and a false-positive rate of one per cent means scanning one
+per cent of the corpus rather than all of it.
+
+<Claim label="fact">
+A Bloom filter answers &ldquo;definitely not present&rdquo; exactly, and &ldquo;possibly
+present&rdquo; with a tunable error rate, in space independent of the size of the values stored.
+That asymmetry is what makes it usable here: a false positive costs one wasted block scan, and a
+false negative &mdash; which cannot occur &mdash; would cost a wrong answer.
+</Claim>
+
+So the trace lookup becomes: filter check on every block in range, then scan the survivors. It is
+orders of magnitude slower than an inverted index lookup and orders of magnitude cheaper to
+maintain, and at two queries a second that trade is obviously right.
+
+### Round 4 &mdash; &ldquo;Delete everything older than thirty days.&rdquo;
+
+If retention is a `DELETE` over rows, it is the most expensive operation in the system: every
+deletion rewrites index structures, generates tombstones, and produces compaction work that
+competes with ingest &mdash; forever, because the deletions never stop.
+
+Because the partition key leads with time, retention is instead **dropping whole partitions**.
+No row is examined, no index is rewritten, and the cost is closing files.
+
+<Callout kind="info" title="A general shape">
+When data has a lifetime, partition by it. Retention then becomes deletion of a whole partition,
+which is close to free, rather than deletion of rows, which is close to the most expensive thing a
+storage engine does. This applies well beyond logs, and it is a common reason that a table which
+worked fine for a year becomes unmanageable in its second.
+</Callout>
+
+### Round 5 &mdash; &ldquo;There is an incident. Ingest triples and every engineer queries at once.&rdquo;
+
+This is the round that separates this system from most others in the library, and it should be
+named explicitly:
+
+<Claim label="inference">
+Ingest load and query load are **positively correlated**. An outage produces more logs, because
+errors log more than successes and retries multiply requests, and simultaneously produces more
+queries, because that is when people look. The peaks coincide by construction, so any capacity plan
+that treats them as independent is wrong in exactly the situation the system exists for.
+</Claim>
+
+Two consequences. First, **isolate the paths**: query capacity and ingest capacity must not come
+from one pool, or an incident's searches will consume the capacity needed to record the incident.
+That is a <C id="bulkhead">bulkhead</C>, and it is not optional here.
+
+Second, decide the priority in advance, because the moment is too late. Ingest wins. A missing log
+line is permanently missing; a slow query is an inconvenience to somebody who will run it again.
+
+### Round 6 &mdash; &ldquo;We are dropping logs at the ingest tier.&rdquo;
+
+Then drop deliberately rather than arbitrarily, because uniform shedding destroys the errors along
+with the noise, and the errors are the reason anybody built this.
+
+Shed by **severity first**: debug and info before warnings, warnings before errors, and errors
+essentially never. Then by tenant against quota, so the team generating the flood absorbs its own
+consequences. Sample rather than truncate where a rate must simply come down &mdash; one line in
+ten with a recorded sampling rate preserves the ability to estimate the true rate, which
+truncation does not.
+
+Buffer at the agent as well. A short outage in the ingest tier then costs nothing, because the
+agents hold their lines and deliver them late, and late logs are worth almost as much as prompt
+ones.
+
+<Callout kind="warn" title="Backpressure has to reach the source">
+If the ingest tier accepts everything and queues internally, an overload becomes unbounded latency
+and then loss with no signal. Refuse explicitly at the edge so agents can buffer, and alert on
+queue depth rather than error rate &mdash; the failure here is silent and slow.
+</Callout>
+
+### Round 7 &mdash; &ldquo;Somebody just ran a thirty-day content search. It has been forty minutes.&rdquo;
+
+Unbounded queries are the main way a shared log system fails, and the fix is that the system, not
+the user, owns the bound.
+
+Require a time range, and default it to something short. Give every query a cost estimate from the
+label index before it runs, and refuse or downgrade the ones that exceed a budget. Return
+**progressive results** &mdash; newest blocks first, streaming as they are scanned &mdash; because
+the engineer usually stops reading after the first few matches, and a query that can be abandoned
+early is one that mostly costs nothing. Cap concurrent scans per user and per tenant.
+
+Offer sampling explicitly for the genuinely large search: scanning one block in ten answers
+&ldquo;does this happen and roughly how often&rdquo; ten times faster, and that is the actual
+question most of the time.
+
+### Round 8 &mdash; &ldquo;One team's debug logging is sixty per cent of the volume.&rdquo;
+
+Common, and mostly not a technical problem. Meter per tenant and publish the numbers, because
+volume is invisible to the team producing it and obvious the moment they are shown a bill.
+
+Technically: hard quotas with shedding at the ingest tier, separate ingest partitions so one
+tenant's flood cannot make another's blocks late, and a per-tenant retention that can be shortened
+independently. The <C id="tenant-isolation">isolation</C> has to be real; a shared queue with a
+fairness policy behaves fairly right up to the moment it saturates.
+
+### Round 9 &mdash; &ldquo;Nobody can actually query day twenty-nine.&rdquo;
+
+Usually true, and worth confronting rather than claiming otherwise. Data on object storage has high
+per-request latency, so a scan that touches thousands of objects is dominated by round trips rather
+than bytes.
+
+Make the tiering honest. Keep two days hot, and accept that older queries are slower by a stated
+factor rather than pretending they are equivalent. Fetch cold blocks with high parallelism, since
+the bandwidth is available even when the latency is not. Keep the **label index and the Bloom
+filters on fast storage for the whole retention window** &mdash; they are a tiny fraction of the
+size and they are what makes a cold query touch a hundred objects instead of a million.
+
+And if the honest answer is that thirty days of content search is not affordable, say so and
+propose what is: thirty days of retention with full search over the recent window, and structured
+fields only over the rest.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Logs lost exactly during an incident',
+      symptom: 'The window around the outage is empty or thin. Discovered while writing the post-mortem.',
+      cause: 'Ingest and query shared capacity, and the surge in searches consumed what the surge in logs needed.',
+      mitigation: 'Separate the paths, prioritise ingest over query explicitly, and buffer at the agent so a brief ingest outage delays rather than destroys.',
+    },
+    {
+      what: 'Retention that never keeps up',
+      symptom: 'Storage grows past the stated window, and deletion work competes with ingest indefinitely.',
+      cause: 'Retention was implemented as row deletion, generating tombstones and compaction that cost more than the writes they remove.',
+      mitigation: 'Partition by time and drop whole partitions. Retention should be a metadata operation.',
+    },
+    {
+      what: 'The index outgrows the data',
+      symptom: 'Storage cost roughly doubles and ingest throughput falls, with no change in log volume.',
+      cause: 'A high-cardinality field - request id, user id, full message - was added to the index, producing roughly one index entry per event.',
+      mitigation: 'Index only low-cardinality fields. Serve high-cardinality lookups with Bloom filters and scanning. Alert on index-to-data ratio.',
+    },
+    {
+      what: 'One query stalls the cluster',
+      symptom: 'All searches become slow, ingest lags, and one very large scan is running.',
+      cause: 'Queries were unbounded, so a thirty-day content search fanned out to every block with no cost ceiling.',
+      mitigation: 'Estimate cost before execution, require and default the time range, stream results newest-first, and cap concurrency per tenant.',
+    },
+    {
+      what: 'Silent ingest lag',
+      symptom: 'Recent logs are minutes or hours behind. No errors anywhere; dashboards look healthy.',
+      cause: 'The ingest tier queued rather than refusing, so overload appeared as latency rather than as failure.',
+      mitigation: 'Shed at the edge with an explicit refusal, and alert on queue depth and end-to-end lag rather than on error rate.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Index labels only | Index cost stays a small fraction of storage | Content queries scan rather than seek | Query rate approached write rate |
+| Bloom filters per block | High-cardinality lookup without a high-cardinality index | A false-positive scan rate, and slower than a real index | Trace lookup were the dominant query |
+| Time-leading partition key | Retention is a drop; ranges prune for free | Queries without a time range are pathological | Data had no natural lifetime |
+| Two days hot, rest on object storage | Most of the bill disappears | Older queries are honestly slower | All thirty days needed equal latency |
+| Ingest prioritised over query | The record survives the incident | Searches degrade when they are most wanted | Logs were reproducible, which they are not |
+| Severity-ordered shedding | What survives overload is what matters | Debug data disappears first, and sometimes it mattered | Every line were equally valuable |
+| Per-tenant quotas and partitions | One team cannot starve another | Capacity sits reserved and idle | The system were single-tenant |
+| Bounded, streaming queries | No single search can take the system down | Some legitimate large searches are refused | Query volume were low and trusted |
+
+## Cost
+
+Storage dominates and is easy to compute: 63 TB compressed, most of it on object storage, plus the
+recent window on SSD. The label index and Bloom filters together are a low single-digit percentage
+of that, which is the entire argument for the design &mdash; the rejected alternative is not
+slower, it is roughly twice the storage plus a continuous merge workload.
+
+The two elastic levers are **retention** and **the hot window**, and they behave very differently.
+Halving retention halves the storage bill and changes nothing about performance. Halving the hot
+window saves much less money and makes many more queries slow. Reach for retention first, which
+also means the most valuable conversation about this system's cost is not with engineers.
+
+Ingest compute is real but unremarkable, and it is dominated by compression rather than by parsing
+or indexing &mdash; which is the expected shape once the index is small.
+
+## What we did NOT build
+
+**A full inverted index over log content.** Its cost is proportional to write volume and its
+benefit to read volume, and those differ here by five orders of magnitude.
+
+**Relevance ranking.** Log search wants everything matching, in time order. Ranking answers a
+question nobody asked and would need to be maintained per write.
+
+**Updates or deletes of individual events.** Logs are immutable. Nothing except a legal erasure
+request should ever modify one, and that is best handled by making the affected partition
+re-writable as a rare exception rather than by making every partition mutable.
+
+**Strong consistency for search.** A line may be searchable a few seconds after it is written.
+Making that instantaneous would force the index onto the write path, which is the choice this whole
+design exists to avoid.
+
+## Evidence
+
+<Claim label="fact" source="elasticsearch-docs">
+Index size varies substantially with mapping choices, and indexing high-cardinality fields or
+enabling full-text analysis on large text fields materially increases both storage and indexing
+cost. The documentation's tuning guidance is largely a list of things to stop indexing.
+</Claim>
+
+<Claim label="fact" source="clickhouse-docs">
+Columnar storage with a time-leading sort key answers range-scoped queries by reading only the
+relevant granules, and partitions can be dropped as a metadata operation rather than by deleting
+rows. This is the mechanism behind the retention design here.
+</Claim>
+
+<Claim label="fact" source="ddia">
+A Bloom filter reports set membership with false positives but no false negatives, in space that
+does not grow with the size of the stored values. Storage engines use it to avoid reading segments
+that cannot contain a key, which is exactly the use in Round 3.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+In log-structured storage, deletion is recorded as a tombstone and the space is reclaimed only by
+later compaction, so a delete-heavy workload generates continuing background work in addition to
+the write itself.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+A service that queues work it cannot process converts overload into unbounded latency, and shedding
+load at admission keeps a system responsive under conditions where queueing does not.
+</Claim>
+
+<Claim label="fact" source="sre-book">
+Monitoring should alert on symptoms visible to users rather than on internal causes. For an ingest
+pipeline the symptom is end-to-end lag, which moves long before any error rate does.
+</Claim>
+
+<Claim label="speculation">
+The fleet size, line rate, average line length and 10:1 compression ratio are illustrative. The
+compression figure in particular varies widely with log structure and is worth measuring rather
+than assuming, since the storage estimate is directly proportional to it.
+</Claim>
+
+<Claim label="inference">
+The claim that a full content index costs about as much as the compressed data is a working rule of
+thumb rather than a constant. It depends on tokenisation, field selection and compression, and the
+useful discipline is to monitor the index-to-data ratio continuously, because the number moves
+whenever somebody adds a field.
+</Claim>
