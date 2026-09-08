@@ -13,7 +13,7 @@ functional:
 | Concept graph, 297 concepts | Complete, **all taught by at least one lesson**, with a per-concept neighbourhood diagram |
 | Lesson reader with the 13-section template | Complete, with progressive disclosure |
 | Pattern library | 14 patterns, each with the full 9-section shape |
-| Case studies with pressure rounds | 9 written; **all 11 primitive signatures covered** |
+| Case studies with pressure rounds | 15 written; **every primitive signature has at least two** |
 | Failure library | 10 incident walkthroughs, cross-linked from the lessons that motivate them |
 | Decision tables | 12, interactive, constraint → consequence → choice |
 | Estimation toolkit | 4 presets, adjustable assumptions, interpretation |
@@ -26,7 +26,7 @@ functional:
 | Sources and evidence page | 60+ sources with tiers and scope |
 | Glossary, myths | Derived from the concept graph |
 
-**Content written:** 50 lessons, 14 patterns, 9 case studies, 10 failure walkthroughs, 12 decision
+**Content written:** 50 lessons, 14 patterns, 15 case studies, 10 failure walkthroughs, 12 decision
 tables, 4 interview scenarios, 32 symptom mappings, 297 concepts, 60+ registered sources.
 
 ## Lessons per level
@@ -55,22 +55,20 @@ search apart. Twenty-six lessons carry these links.
 
 ## Case studies by primitive signature
 
-All eleven signatures from `docs/06-case-study-taxonomy.md` now have at least one worked example,
-which is what makes the index by signature usable rather than aspirational.
+Every signature in `docs/06-case-study-taxonomy.md` has **at least two** worked examples. One
+example teaches the instance; two that disagree teach the pattern, which is the transfer claim the
+taxonomy makes. The pairings and what separates each pair are listed in that document.
 
-| Signature | Case study |
-|---|---|
-| id-generation | URL shortener |
-| fanout | Social feed, URL shortener |
-| hot-key | Proximity matching, Search and autocomplete, Social feed, Ticket booking, URL shortener |
-| exactly-once-effect | Job scheduler, Real-time attribution, Ticket booking |
-| inventory-contention | Ticket booking |
-| large-object | File sync, Social feed |
-| search-index | Search and autocomplete |
-| geo-index | Proximity matching |
-| time-series-ingest | Metrics platform |
-| scheduling | Job scheduler |
-| stream-join | Real-time attribution |
+The counts are not repeated here, because a hand-typed table is correct on the day it is written
+and silently wrong afterwards. Run:
+
+```bash
+npm run coverage
+```
+
+It reports volume, case studies per signature, untaught concepts, lessons per level, and uncited
+sources. The validator enforces the floor: an error when a signature has no case study, a warning
+when it has only one.
 
 ## Every concept is taught
 

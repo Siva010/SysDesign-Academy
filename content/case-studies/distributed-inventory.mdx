@@ -1,0 +1,426 @@
+---
+id: distributed-inventory
+title: Distributed Inventory
+ask: Design inventory for a retailer selling ten million products from two hundred warehouses and stores, where the same item can be fulfilled from many places.
+difficulty: advanced
+minutes: 55
+signatures: [inventory-contention, hot-key]
+concepts: [lost-update, write-skew, optimistic-concurrency, locking, hot-key, hot-partition, key-splitting, thundering-herd, cache-stampede, cache-generic, cache-invalidation, hit-rate, request-coalescing, ttl, staleness, eventual-consistency, read-your-writes, replication-lag, cdc, cqrs, event-sourcing, outbox, anti-entropy, read-repair, audit-log, immutability, saga, distributed-transaction, two-phase-commit, idempotency, idempotency-key, effectively-once, at-least-once, partitioning, partition-key, cross-shard-query, admission-control, rate-limiting, load-shedding, backpressure, graceful-degradation, blast-radius, capacity-headroom, back-of-envelope, availability, latency, throughput, timeout, retry, cost]
+patterns: [cqrs, cache-aside, transactional-outbox, idempotency-key, key-splitting]
+prerequisites: [when-load-is-not-even, transactions-across-machines]
+sources: [ddia, database-internals, postgres-docs, aws-builders-library, sre-book, stripe-eng]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design inventory for a retailer selling ten million products from two hundred warehouses
+> and stores, where the same item can be fulfilled from many places.&rdquo;
+
+Ticket booking taught the primitive: a conditional update on a row, checked by affected row count,
+which cannot oversell. That primitive is still here and it is no longer sufficient, because three
+things about this problem are inverted.
+
+Units are **fungible**. Nobody wants that specific tin; any unit of the product will do. There is
+no J14 to adjudicate, only a count.
+
+Stock is **physically distributed**. The same product exists in two hundred places, and the
+question is not only whether it can be sold but from where it should ship, which is an
+optimisation rather than a lock.
+
+And &mdash; the one that changes everything &mdash; **the count is a belief, not a fact.** A seat
+exists because your database says so. A tin of beans exists because it is on a shelf, and the
+number in your database is a model of a physical world that drifts away from it continuously.
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Is overselling recoverable? | Backorder, substitute, or ship from further away are all real remedies. That makes this a cost optimisation rather than a hard invariant, which ticket booking was not. |
+| How accurate is the physical count? | If shrinkage and miscounts are material, exactness in the database buys less than it costs. |
+| Must we promise a delivery date at checkout? | Promising a date binds you to a location and a shipment, which is far stronger than promising a unit. |
+| Can we sell stock that has not arrived? | Selling against inbound supply raises availability and adds a new way to fail. |
+| Who owns the stock, us or a marketplace seller? | Third-party counts arrive by feed, are stale by construction, and cannot be trusted the way your own can. |
+| What is the read-to-write ratio? | Browsing checks availability constantly and buying is rare. The answer decides where the caching goes. |
+
+## Requirements
+
+**Functional.** Show availability on every product view. Reserve stock at checkout. Allocate a
+fulfilment location. Release reservations that lapse. Reconcile against physical counts. Support
+returns and restocking.
+
+**Non-functional.** Oversell rarely enough that the remedy cost is acceptable. Never lose a
+reservation that was confirmed to a customer. Survive a flash sale on one product. Keep browsing
+available even when reservation is saturated.
+
+**Out of scope.** Replenishment and forecasting, pricing, warehouse robotics and pick paths, and
+carrier selection beyond choosing the shipping location.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+- **10,000,000 products** across **200 locations**. Stocked combinations are sparse: perhaps
+  **100,000,000** (product, location) rows, not two billion.
+- A row &mdash; product, location, on-hand, reserved, damaged, inbound &mdash; at about 100 bytes is
+  **10 GB**. Once again the contended dataset is small.
+- **5,000 orders per second** at peak, so roughly 5,000 reservations per second spread over millions
+  of products.
+- **500,000 availability reads per second**, because every product page, search result and basket
+  view asks.
+
+<Claim label="inference">
+Reads exceed writes by about **100 : 1**, which is the reverse of ticket booking, where nearly every
+request was a purchase attempt destined to fail. The consequence is architectural: the display path
+and the commit path have almost nothing in common and should not share a mechanism. Browsing is a
+cache problem; reserving is a concurrency problem.
+</Claim>
+
+Then the number that decides how much correctness is worth buying:
+
+<Claim label="convention">
+Retail inventory record accuracy is commonly reported in the mid-90s as a percentage, meaning a
+material fraction of (product, location) counts disagree with the shelf at any moment, through
+shrinkage, damage, misplacement and receiving error. Treat the specific figure as something to
+measure in your own operation rather than a constant, but treat the existence of the gap as
+certain.
+</Claim>
+
+<Claim label="inference">
+If several per cent of counts are already wrong physically, then engineering the database to be
+perfectly consistent buys accuracy the warehouse cannot honour. The design objective is therefore
+not to prevent overselling absolutely &mdash; that is not achievable from software &mdash; but to
+make overselling **rare, detectable, and cheap to remedy**, and to spend the effort where the count
+is actually trustworthy.
+</Claim>
+
+That reframing is the whole case study, and it is the thing a candidate who has only done ticket
+booking will resist.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Stock | (product, location) | On-hand, reserved, damaged, inbound. The contended row. |
+| Availability | product | Aggregate across locations, cached and deliberately approximate |
+| Reservation | reservation id | Product, location, quantity, expiry, order reference |
+| Ledger entry | (product, location, seq) | Every movement, append-only. The audit trail and the repair mechanism. |
+| Count event | (product, location, at) | A physical count. Truth arriving from outside the system. |
+
+The ledger is not decoration. Because the count is a belief, you need to be able to answer &ldquo;how
+did it get to this number?&rdquo; when it disagrees with a shelf. An append-only movement log makes
+the current value derivable and the discrepancy attributable, and it is what a cycle count corrects
+against.
+
+## Design v1
+
+<Arch
+  caption="Two paths with different guarantees: an approximate one serving half a million reads, and an exact one serving five thousand writes."
+  columns={[
+    { title: 'Browse', nodes: [{ id: 'page', label: 'Product pages', note: '500k reads/s' }, { id: 'cache', label: 'Availability cache', note: 'approximate, short TTL', tone: 'accent' }] },
+    { title: 'Commit', nodes: [{ id: 'res', label: 'Reservation service', note: 'exact, 5k/s' }] },
+    { title: 'Truth', nodes: [{ id: 'stock', label: 'Stock rows', note: 'per product and location', tone: 'accent' }, { id: 'ledger', label: 'Movement ledger', note: 'append-only' }] },
+    { title: 'Allocate', nodes: [{ id: 'alloc', label: 'Allocation', note: 'which location ships' }] },
+    { title: 'Reality', nodes: [{ id: 'wms', label: 'Warehouse systems', note: 'picks, receipts, counts' }, { id: 'recon', label: 'Reconciliation', note: 'cycle counts' }] },
+  ]}
+  edges={[
+    { from: 'page', to: 'cache' },
+    { from: 'cache', to: 'stock', label: 'on miss, coalesced' },
+    { from: 'res', to: 'stock', label: 'conditional update' },
+    { from: 'res', to: 'alloc' },
+    { from: 'stock', to: 'ledger', label: 'every movement' },
+    { from: 'alloc', to: 'wms' },
+    { from: 'wms', to: 'recon', label: 'what was actually there' },
+    { from: 'recon', to: 'stock', label: 'corrections' },
+  ]}
+  stages={[
+    {
+      label: 'One count per product',
+      show: ['page', 'res', 'stock'],
+      because:
+        'A single number per product, decremented on sale. It cannot say where the item is, so it cannot promise a delivery date or choose a shipment, and it makes every read of every product page hit the contended row.',
+    },
+    {
+      label: 'Split the paths',
+      show: ['page', 'cache', 'res', 'stock', 'alloc'],
+      because:
+        'Availability for browsing is served from a cache and is allowed to be slightly wrong. Reservation is exact, per location, and is the only moment that must be right. The 100:1 ratio means the expensive guarantee is bought for 1% of traffic.',
+    },
+    {
+      label: 'Ledger and reconciliation',
+      show: ['page', 'cache', 'res', 'stock', 'ledger', 'alloc', 'wms', 'recon'],
+      because:
+        'Physical reality disagrees with the record continuously, so the system needs a movement history to explain a discrepancy and a path for counts to correct it. Without these the count drifts and nobody can say why.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;Two customers order the last unit at the same instant.&rdquo;
+
+The same primitive as ticket booking, now against a quantity rather than a state:
+
+    UPDATE stock SET reserved = reserved + 1
+    WHERE product_id = ? AND location_id = ? AND on_hand - reserved >= 1
+
+Affected row count of one means the reservation is yours. This is a
+<C id="lost-update">lost update</C> waiting to happen if you split it into a read and a write, and
+the predicate in the statement is what prevents it.
+
+What is new is that failing on one location is not failing. There are 199 others, and the natural
+implementation &mdash; try locations in preference order until one succeeds &mdash; is correct and
+gives far better availability than a single global count ever could.
+
+### Round 2 &mdash; &ldquo;The warehouse says there are four. There are three.&rdquo;
+
+Nothing in the database caused this and nothing in the database can prevent it. Someone dropped
+one, or it was mis-scanned at receiving, or it walked out of the store.
+
+So the system needs three things it did not need for seats. A **movement ledger**, so a discrepancy
+can be attributed rather than merely absorbed. **Cycle counting**, where locations physically count
+a rotating subset and emit corrections, treated as authoritative because they came from reality.
+And a **safety buffer**: hold back a small quantity per (product, location) so the sellable count is
+deliberately lower than the believed count.
+
+<Claim label="inference">
+The buffer is the honest response to an inaccurate model, and it is a business decision expressed
+as a number: a larger buffer means fewer oversells and more stock that exists but cannot be sold.
+Because units are fungible, this knob exists at all &mdash; it has no analogue in ticket booking,
+where holding back seat J14 means nobody can buy J14.
+</Claim>
+
+### Round 3 &mdash; &ldquo;We oversold. Now what?&rdquo;
+
+You find out at the pick, when someone reaches for an item that is not there. The remedies are
+ordinary commerce: ship from another location at higher cost, substitute with the customer's
+consent, backorder with a revised date, or cancel and refund.
+
+Each has a cost, and those costs are what set the safety buffer. That is the loop worth making
+explicit in an interview: **measure the oversell rate, price the remedy, and tune the buffer until
+the marginal cost of a lost sale equals the marginal cost of a failed one.** That sentence is the
+difference between treating this as a correctness problem and treating it as what it is.
+
+<Callout kind="info" title="Why ticket booking cannot do this">
+There, overselling is unrecoverable: two people hold seat J14 and only one can sit in it, and no
+amount of money fixes the second person's evening. Here, every failure has a price and a remedy. The
+same primitive &mdash; a conditional update on a contended row &mdash; sits inside two completely
+different design philosophies because the cost of being wrong differs by orders of magnitude.
+</Callout>
+
+### Round 4 &mdash; &ldquo;A single product goes viral. Ten thousand attempts per second.&rdquo;
+
+Now you have ticket booking again, in miniature: a <C id="hot-key">hot key</C> on a handful of
+(product, location) rows, and the same techniques apply.
+
+Split the row: divide one location's stock into *n* sub-rows and reserve against a random one,
+which multiplies contention capacity by *n* at the cost of a slightly conservative count when the
+remainder is scattered across buckets. Admit at a controlled rate rather than letting every attempt
+reach the row. Coalesce the availability reads &mdash; 500,000 people looking at one product page
+is one cache entry, not 500,000 database reads, provided the regeneration is guarded against
+<C id="cache-stampede">stampede</C>.
+
+The transferable observation: the hot-key techniques are the same everywhere. What differs is that
+here the hot key is rare, temporary, and identifiable in advance from the marketing calendar, so it
+can be handled by exception rather than by designing the whole system around it.
+
+### Round 5 &mdash; &ldquo;The customer wants it tomorrow. The nearest warehouse is empty.&rdquo;
+
+Reservation and **allocation** are different decisions and conflating them is a common error.
+Reservation asks whether a unit can be promised at all. Allocation asks which location should ship
+it, and it is an optimisation over shipping cost, delivery speed, stock-out risk at that location,
+and whether the order can be shipped whole.
+
+Splitting an order across two locations doubles the shipping cost and is sometimes the only way to
+meet a promised date. That is a business rule with a number attached, and the design should keep it
+as configuration rather than embedding it in code, because it will be tuned constantly and by
+people who do not deploy.
+
+Allocate **late** where you can. The longer you wait, the more you know &mdash; other orders have
+arrived, receipts have landed, and the decision improves. Deciding at checkout is simpler and
+strictly less informed.
+
+### Round 6 &mdash; &ldquo;Can we sell what has not arrived yet?&rdquo;
+
+Yes, and it is where a lot of revenue lives. Available-to-promise counts confirmed inbound
+shipments against a date, so a product with none on hand and a container arriving Thursday is
+sellable for delivery Friday.
+
+The risk added is a supply-chain risk rather than a software one: the container is late, and now the
+promise breaks for every order that depended on it, all at once and in a correlated way. Keep the
+inbound quantity and its confidence separate from on-hand stock, discount it by supplier
+reliability, and never let it silently become indistinguishable from what is physically on a shelf.
+
+### Round 7 &mdash; &ldquo;Half the catalogue belongs to marketplace sellers.&rdquo;
+
+Their counts arrive by feed, are minutes to hours stale, and are maintained by systems with a wide
+range of quality. They cannot be trusted the way your own warehouse can.
+
+Treat third-party stock as a separate class: larger buffers, no promised dates, and a per-seller
+reliability score derived from how often their fulfilment fails. Cancellation rate per seller is
+the metric that matters and it belongs in the allocation decision, so persistently unreliable
+sellers are ranked down automatically rather than by escalation.
+
+### Round 8 &mdash; &ldquo;It is Black Friday and the inventory service is the bottleneck.&rdquo;
+
+Check which path is actually saturated, because the answer is almost always the read path, and the
+read path does not need to be exact.
+
+Serve availability from cache with a short lifetime. Better, serve a **band** rather than a number
+&mdash; &ldquo;in stock&rdquo;, &ldquo;low stock&rdquo;, &ldquo;out of stock&rdquo; &mdash; because
+a band changes far less often than a count, so it caches vastly better and tells the customer
+everything they actually use. Precision in the display is a cost with no corresponding benefit.
+
+Under real pressure, degrade deliberately: freeze the cache for longer, show bands only, and keep
+the reservation path exact. Reservation is 1% of traffic and it is the 1% that must not be wrong.
+
+### Round 9 &mdash; &ldquo;Prove the numbers are right.&rdquo;
+
+You cannot, and the useful answer is what you do instead. Reconstruct the count from the movement
+ledger and compare it against the stock row on a schedule; a divergence means a bug, because the
+ledger and the row should agree by construction even when both disagree with the shelf.
+
+Compare against cycle counts to measure the drift from physical reality, and track that as a
+service level for the warehouse rather than for the software. Alert on oversell rate by location,
+because a location whose rate jumps has an operational problem &mdash; a broken scanner, an
+untrained shift &mdash; that the inventory system can detect long before the warehouse notices.
+
+<Claim label="inference">
+The system cannot make the count true. What it can do is make the count **explainable**, its
+divergence **measurable**, and the cost of divergence **visible to the people who can reduce it.**
+That is the achievable version of correctness here, and stating it plainly is a better answer than
+claiming a guarantee the physical world does not support.
+</Claim>
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Oversell at scale on one product',
+      symptom: 'Hundreds of orders accepted for stock that does not exist, all within a few minutes.',
+      cause: 'Availability was read from a cache and used to decide the sale, so a stale count was treated as a reservation.',
+      mitigation: 'The cache may inform the display and must never authorise a commit. Reserve with a conditional update against the row, always.',
+    },
+    {
+      what: 'Stock that exists but cannot be sold',
+      symptom: 'Products show out of stock while pallets sit in the warehouse. Revenue lost silently.',
+      cause: 'Reservations were created without expiry, or a failed checkout never released one, so reserved quantity grew monotonically.',
+      mitigation: 'Expiry evaluated in the reservation predicate, plus a sweeper for the displayed figure. Alert on reserved-to-on-hand ratio by location.',
+    },
+    {
+      what: 'Count drift nobody notices',
+      symptom: 'Oversell rate creeps up over months with no incident and no deploy to blame.',
+      cause: 'Physical accuracy degraded and nothing measured the gap between the ledger, the row, and the shelf.',
+      mitigation: 'Scheduled reconstruction from the ledger, cycle-count comparison as a tracked metric, and oversell rate reported per location.',
+    },
+    {
+      what: 'Flash sale takes down browsing',
+      symptom: 'The whole catalogue slows during a promotion on one product.',
+      cause: 'Availability reads for the hot product were not coalesced, so cache expiry sent a stampede at the contended row and exhausted the shared pool.',
+      mitigation: 'Request coalescing, jittered expiry, split hot rows, and an isolated pool so one product cannot consume the capacity of the rest.',
+    },
+    {
+      what: 'Promised dates broken in bulk',
+      symptom: 'Thousands of orders miss their delivery date simultaneously.',
+      cause: 'Stock was promised against an inbound shipment that arrived late, and inbound quantity had been merged into on-hand.',
+      mitigation: 'Keep inbound separate and discounted by supplier reliability. Never let a projection become indistinguishable from a physical count.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Separate display and commit paths | The exact guarantee is bought for 1% of traffic | Two representations that can disagree | Reads and writes were balanced |
+| Availability as a band, not a number | Caches enormously better; matches what customers use | Precision the customer never needed | Exact counts were contractually shown |
+| Stock per (product, location) | Can promise a date and choose a shipment | More rows, and cross-location queries | Fulfilment were from one place |
+| Safety buffer per location | Oversell rate falls to a chosen level | Stock that exists cannot be sold | Physical counts were reliable |
+| Tolerate oversell, remedy it | Availability stays high and the system stays simple | Real remedy cost, and some unhappy customers | Oversell were unrecoverable, as with seats |
+| Append-only movement ledger | Discrepancies are attributable and repairable | Storage, and a second thing to keep consistent | Nothing ever disagreed, which it always does |
+| Late allocation | Better decisions with more information | Complexity, and a later commitment to a location | A date had to be promised at checkout |
+| Split hot rows by exception | Normal products stay simple | Hot products need detection and handling | Every product were hot, as in ticket booking |
+
+## Cost
+
+Ten gigabytes of stock rows is nothing, and the ledger is the only thing that grows without bound
+&mdash; every movement of every unit, retained for years because it is the audit trail. Partition
+it by time and tier it out; this is the one place where a retention policy genuinely matters.
+
+The operational cost is the **read path**, and it is dominated by cache hit rate. At 500,000 reads
+per second, the difference between 95% and 99% hit rate is 20,000 versus 5,000 database reads per
+second, which is the difference between a modest cluster and a large one. Serving bands rather than
+counts is worth more here than any amount of hardware, because it changes the invalidation rate
+rather than the capacity.
+
+The cost that dwarfs both is **the remedy**: expedited shipping, split shipments, and cancellations
+run to real money per incident. A one percentage point improvement in oversell rate is worth more
+than the entire infrastructure bill, which is the argument for spending engineering effort on
+reconciliation and buffer tuning rather than on shaving milliseconds.
+
+## What we did NOT build
+
+**A globally consistent count.** It would require distributed coordination on every read of a
+number that is already wrong by several per cent for physical reasons. The coordination would be
+real and the accuracy would not.
+
+**Exact availability on product pages.** Bands cache better, change less, and answer the customer's
+actual question.
+
+**A distributed transaction across reservation and payment.** They are separate steps with
+compensations, in the same shape as ticket booking, for the same reason: an external call must not
+sit inside a lock on a contended row.
+
+**Forecasting and replenishment.** Deciding what to buy is a different discipline with a different
+failure mode, and it consumes this system's output rather than living inside it.
+
+## Evidence
+
+<Claim label="fact" source="postgres-docs">
+A read followed by a separate update permits a concurrent transaction to invalidate the read at
+levels below serialisable, which is the classic lost update. Making the check a predicate of the
+update statement, and testing the affected row count, avoids it without explicit locking.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Where a value is derived from a sequence of events, retaining the events allows the current value to
+be recomputed and discrepancies to be attributed, which a system storing only the current value
+cannot do. This is the argument for the movement ledger.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+Contention on a single row limits throughput regardless of the storage engine, since serialisation
+occurs at the row rather than at the system. Distributing one logical quantity across several
+physical rows is the standard remedy and trades read cost for write concurrency.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+Coalescing concurrent identical requests and adding jitter to expiry prevents the synchronised
+regeneration that follows a cache expiry on a hot key, which would otherwise deliver the full read
+load to the origin at once.
+</Claim>
+
+<Claim label="fact" source="stripe-eng">
+Operations made safe to retry through caller-supplied idempotency keys return the original outcome
+rather than repeating the effect, which is what keeps a retried checkout from reserving twice.
+</Claim>
+
+<Claim label="fact" source="sre-book">
+Service levels should be set at the point where the cost of additional reliability exceeds its
+value, rather than at the highest achievable number. Applied here, that is the argument for tuning
+the safety buffer against remedy cost rather than pursuing zero oversell.
+</Claim>
+
+<Claim label="speculation">
+The catalogue size, location count, order rate and 100:1 read-to-write ratio are illustrative. The
+ratio is the load-bearing one, and it is worth measuring first in any real system, because it
+decides whether the caching layer or the contention layer is the design's centre of gravity.
+</Claim>
+
+<Claim label="convention">
+Published figures for retail inventory record accuracy vary by sector, by counting method and by
+how the measurement is defined, and the widely cited mid-90s range should be treated as an
+indication that the gap is material rather than as a number to design against. Measure your own,
+per location; the variation between locations is usually larger than the average is informative.
+</Claim>

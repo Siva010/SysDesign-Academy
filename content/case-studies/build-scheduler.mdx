@@ -1,0 +1,433 @@
+---
+id: build-scheduler
+title: Build Scheduler
+ask: Design the scheduler for a shared build and test fleet — fifty thousand jobs a day from five thousand engineers onto two thousand machines.
+difficulty: advanced
+minutes: 50
+signatures: [scheduling]
+concepts: [queue, queue-depth, head-of-line-blocking, littles-law, back-of-envelope, admission-control, backpressure, load-shedding, rate-limiting, tenant-isolation, blast-radius, capacity-headroom, autoscaling, horizontal-scaling, lease, fencing-token, heartbeat, failure-detector, leader-election, idempotency, idempotency-key, at-least-once, effectively-once, retry, exponential-backoff, timeout, dead-letter-queue, poison-message, thundering-herd, batching, cache-generic, hit-rate, graceful-degradation, tail-latency, latency, throughput, cost, observability, bulkhead, feature-flag]
+patterns: [bulkhead, token-bucket, circuit-breaker, idempotency-key]
+prerequisites: [doing-it-later, when-load-is-not-even]
+sources: [ostep, sre-book, aws-builders-library, tail-at-scale, ddia, netflix-tech]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design the scheduler for a shared build and test fleet &mdash; fifty thousand jobs a day
+> from five thousand engineers onto two thousand machines.&rdquo;
+
+The job scheduler in this library answers one question: **is it due?** Time is the constraint, the
+work is small, and if more work becomes due than expected you add machines.
+
+This scheduler answers a different question: **what should run next?** Capacity is the constraint,
+it is fixed on the timescale that matters, and the queue is never empty during working hours. There
+is no correct answer to &ldquo;what next&rdquo; &mdash; only policies, each of which makes somebody
+wait.
+
+<Claim label="inference">
+A time-triggered scheduler has a right answer that it can be late to. A resource scheduler encodes a
+**policy about who waits**, which is an organisational decision wearing an algorithm's clothing. The
+most common failure in this system is not incorrectness; it is a policy nobody chose deliberately
+and nobody can explain.
+</Claim>
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| Is the fleet fixed or elastic? | If machines can be added in minutes, this is a cost problem. If the fleet is fixed, it is a queueing problem and much harder. |
+| How wide is the spread of job durations? | A fleet where every job takes three minutes needs almost no scheduler. Spread is what creates the difficulty. |
+| Are jobs interruptible? | Preemption is the strongest tool available and it is worthless without checkpoints or short jobs. |
+| Is a merge-blocking test different from a nightly batch? | If everything has the same priority, the urgent work waits behind the bulk work by construction. |
+| What is the fleet's target utilisation, and who set it? | The single most consequential number, and usually set by whoever pays rather than by whoever waits. |
+| Do jobs need particular hardware? | Heterogeneous requirements turn allocation into packing, with fragmentation as a new way to waste capacity. |
+
+## Requirements
+
+**Functional.** Accept job submissions with resource requirements and a priority. Place jobs on
+machines that satisfy them. Report queue position honestly. Cancel, retry and preempt. Isolate
+tenants.
+
+**Non-functional.** A short job submitted during peak should not wait behind hours of unrelated
+work. No team can be starved indefinitely. A machine failure must not lose a job silently. The
+scheduler itself must never be the bottleneck.
+
+**Out of scope.** Build caching and artefact storage, test selection, the container image supply
+chain, and the question of why the tests take ninety minutes.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+- **50,000 jobs a day** from 5,000 engineers, onto **2,000 executor machines**.
+- Job duration: **median 3 minutes, 99th percentile 90 minutes.** A thirtyfold spread.
+- **40% of the day's jobs** arrive in two two-hour windows, mid-morning and mid-afternoon.
+- Peak arrival is therefore about **10,000 jobs in two hours**, or 1.4 per second, against a
+  daily mean of 0.6.
+
+The spread matters more than the totals, and the utilisation number matters more than either.
+
+<Claim label="fact" source="ostep">
+In a queueing system with random arrivals, mean waiting time rises as utilisation approaches
+capacity, and does so hyperbolically rather than linearly: waiting time is proportional to
+&rho; / (1 &minus; &rho;) for utilisation &rho;. The consequence is that the final few percent of
+utilisation cost more delay than all the preceding utilisation combined.
+</Claim>
+
+Put numbers on that, because it settles an argument that otherwise runs on opinion:
+
+| Utilisation | Mean wait, in units of job duration | For a 3-minute job |
+|---|---|---|
+| 50% | 1&times; | 3 min |
+| 80% | 4&times; | 12 min |
+| 90% | 9&times; | 27 min |
+| 95% | 19&times; | 57 min |
+| 99% | 99&times; | 5 hours |
+
+<Claim label="inference">
+The fleet cannot be both highly utilised and responsive; the relationship is hyperbolic, so there is
+no engineering that removes the trade. Running at 95% rather than 80% saves roughly 16% of the
+machines and costs each three-minute job about 45 additional minutes of waiting. With 5,000
+engineers that is the most expensive cost saving available, and the scheduler's job is to make the
+exchange rate visible rather than to pretend it does not exist.
+</Claim>
+
+These are idealised figures &mdash; real arrivals are burstier than the model and durations are far
+from exponential, which makes the true curve worse rather than better. Use them as the shape of the
+argument, not as a prediction.
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Job | job id | Requirements, priority, tenant, submitted-at, estimated and observed duration |
+| Queue | (tenant, priority class) | Per-tenant so one team's backlog is not everyone's |
+| Machine | machine id | Capabilities, current allocation, lease and heartbeat |
+| Placement | (job id, machine id) | Leased, fenced, and the record of what is actually running |
+| Duration history | (tenant, job kind) | Observed durations. What makes estimation possible at all. |
+
+Two entries deserve comment. **Duration history** exists because declared estimates are unusable,
+for reasons Round 3 covers. And the queue is keyed by tenant rather than being global, because a
+single global queue makes fairness impossible to express &mdash; you can only reorder what you can
+distinguish.
+
+## Design v1
+
+<Arch
+  caption="Admission, per-tenant queues, one placement decision, leased execution. The scheduler decides; it never executes."
+  columns={[
+    { title: 'Submit', nodes: [{ id: 'api', label: 'Submission API', note: 'per-tenant quota' }] },
+    { title: 'Queue', nodes: [{ id: 'q', label: 'Per-tenant queues', note: 'by priority class', tone: 'accent' }] },
+    { title: 'Decide', nodes: [{ id: 'sched', label: 'Scheduler', note: 'single leader, replicated', tone: 'accent' }, { id: 'hist', label: 'Duration history', note: 'observed, not declared' }] },
+    { title: 'Place', nodes: [{ id: 'lease', label: 'Lease and fence' }] },
+    { title: 'Run', nodes: [{ id: 'exec', label: 'Executors', note: '2,000 machines' }, { id: 'dlq', label: 'Poison queue' }] },
+  ]}
+  edges={[
+    { from: 'api', to: 'q' },
+    { from: 'q', to: 'sched' },
+    { from: 'hist', to: 'sched', label: 'predicted duration' },
+    { from: 'sched', to: 'lease' },
+    { from: 'lease', to: 'exec' },
+    { from: 'exec', to: 'hist', label: 'observed duration' },
+    { from: 'exec', to: 'dlq', label: 'after N attempts' },
+  ]}
+  stages={[
+    {
+      label: 'One queue, first in first out',
+      show: ['api', 'q', 'exec'],
+      because:
+        'Obviously fair and unusable with a thirtyfold duration spread: one ninety-minute job at the head delays every three-minute job behind it. This is head-of-line blocking, and it is the default behaviour of the simplest design.',
+    },
+    {
+      label: 'Classes, and predicted duration',
+      show: ['api', 'q', 'sched', 'hist', 'exec'],
+      because:
+        'Separate queues by tenant and priority class, and size jobs from observed history rather than from what the submitter claimed. Short work can now overtake long work without any user having to be trusted.',
+    },
+    {
+      label: 'Leased, fenced, bounded',
+      show: ['api', 'q', 'sched', 'hist', 'lease', 'exec', 'dlq'],
+      because:
+        'A lease with a fencing token means a machine that pauses and returns cannot corrupt a job that was rescheduled. Admission quotas stop one tenant flooding the queue, and a poison queue stops one broken job consuming capacity forever.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;What is wrong with first in, first out?&rdquo;
+
+The duration spread. One ninety-minute job at the head of a queue delays every three-minute job
+behind it, and the fleet spends peak hours executing correctly and serving people badly.
+
+This is <C id="head-of-line-blocking">head-of-line blocking</C>, and recognising it here is worth
+saying explicitly, because it is the same phenomenon as a slow request stalling a connection or one
+slow partition stalling a consumer. The mechanism is identical: a shared, ordered resource where one
+occupant's duration is unbounded.
+
+FIFO is also not as fair as it looks. It is fair to *jobs* and indifferent to *people*, so an
+engineer who submits one job waits behind an automated system that submitted four hundred.
+
+### Round 2 &mdash; &ldquo;So run the shortest job first.&rdquo;
+
+Shortest-job-first minimises mean waiting time, which is a genuine result and not the end of the
+argument, because it has two problems that matter here.
+
+It **starves** long jobs: while short work keeps arriving, the ninety-minute job never runs, and
+during a working day short work always keeps arriving. The standard remedy is ageing &mdash; a job's
+effective priority rises with time waited &mdash; so nothing waits forever and the policy degrades
+toward FIFO for anything old.
+
+And it needs the duration in advance, which you do not have. Which is the next round.
+
+### Round 3 &mdash; &ldquo;Users declare their job durations.&rdquo;
+
+They do, and the declarations are worthless, for a reason that is structural rather than a matter of
+diligence: the scheduler rewards small declarations with earlier starts, so declaring
+&ldquo;small&rdquo; is the dominant strategy whether or not it is true. Any policy that trusts a
+self-reported estimate is a policy that will be gamed, quickly, and by well-meaning people.
+
+Predict from **observed history** instead, keyed by tenant and job kind. A repository's test suite
+takes about as long today as yesterday, and the median of recent runs is a far better estimate than
+anything a human types. Where there is no history, treat the job as medium and learn.
+
+<Claim label="inference">
+The general form is worth carrying away: **a scheduling input the user controls and benefits from
+biasing is not an input, it is an attack surface.** Prefer measurements over declarations. Where a
+declaration is unavoidable, make over-running it cost something, so honesty is the dominant
+strategy.
+</Claim>
+
+### Round 4 &mdash; &ldquo;One team's pipeline submits ten thousand jobs at nine in the morning.&rdquo;
+
+With a global queue everybody else's day is over. Fairness has to be expressed between **tenants**,
+not between jobs, which is exactly why the queue is keyed by tenant.
+
+Schedule round-robin across tenants with active work, weighted by an entitlement, so a tenant with
+10,000 queued jobs and a tenant with one alternate rather than the first monopolising the fleet. The
+large tenant's work still completes; it completes at its share of the fleet rather than at all of
+it.
+
+Add an admission quota on top, so a runaway automation cannot fill the queue with work it will later
+cancel: it is much cheaper to refuse at submission than to schedule and preempt.
+
+<Callout kind="info" title="Fair share is a claim about the denominator">
+&ldquo;Fair&rdquo; needs a unit before it means anything. Per job favours whoever submits most. Per
+engineer favours large teams. Per team favours small teams. Per paid entitlement favours whoever
+pays. All four are defensible; they are not the same; and the scheduler will implement one of them
+whether or not anybody chose it deliberately.
+</Callout>
+
+### Round 5 &mdash; &ldquo;We run at 95% utilisation and everyone complains about queue times.&rdquo;
+
+Show the table from the estimate. This is the round where the answer is arithmetic rather than
+architecture, and where a candidate can be genuinely useful to an organisation.
+
+The complaint and the utilisation target are the same fact seen from two sides. Someone chose 95%
+to reduce machine spend, and the resulting wait is the price, paid by 5,000 engineers in units of
+attention rather than in units of currency, which is precisely why it does not appear in the budget
+that motivated the choice.
+
+Three real options, and only the first two are engineering:
+
+**Lower target utilisation** and pay for machines. Honest, effective, and the conversation the
+organisation is avoiding.
+
+**Make the peak flatter.** 40% of the day's work in two windows means the fleet is idle at night, so
+move what can be moved &mdash; nightly suites, bulk regeneration &mdash; into the trough, and price
+or deprioritise batch work so it naturally drifts there.
+
+**Make jobs shorter.** Waiting time scales with service time, so halving the duration halves the
+wait at any utilisation. Test selection and caching attack the problem from a direction the
+scheduler cannot.
+
+### Round 6 &mdash; &ldquo;Jobs need GPUs, or 64 GB, or a particular architecture.&rdquo;
+
+Placement becomes packing, and packing brings fragmentation: a fleet with 30% of its memory free may
+have no single machine that can take a 64 GB job. Utilisation looks healthy and the job waits
+anyway, which is the most confusing failure mode in this system because every dashboard looks fine.
+
+Keep it tractable rather than optimal. A small number of **machine classes** rather than arbitrary
+requirement vectors, so the fleet is a handful of pools instead of a continuum. Reserve a little
+capacity for large-footprint jobs, or they never fit once the fleet is busy with small ones. Prefer
+best-fit placement to first-fit, which leaves large holes intact for longer.
+
+Measure fragmentation directly &mdash; free capacity that cannot accept the largest queued job
+&mdash; because aggregate utilisation actively hides it.
+
+### Round 7 &mdash; &ldquo;A machine dies forty minutes into a ninety-minute job.&rdquo;
+
+The lease expires and the job is rescheduled, which costs forty minutes of fleet time and forty
+minutes of somebody's afternoon. Two things must be right for that to be merely expensive rather
+than incorrect.
+
+The <C id="lease">lease</C> must carry a <C id="fencing-token">fencing token</C>. A machine that
+froze and resumes after its lease expired must not be able to publish results for a job that has
+been rescheduled and finished elsewhere; the artefact store rejects a stale token.
+
+And the job must be safe to run twice, because at-least-once execution is what a lease gives you.
+For a build this is usually free &mdash; it produces artefacts keyed by content &mdash; but a job
+with side effects needs an <C id="idempotency-key">idempotency key</C> like anything else.
+
+Cap the attempts and route repeat failures to a <C id="poison-message">poison queue</C>. A job that
+crashes its executor and is rescheduled forever will work steadily through the entire fleet.
+
+### Round 8 &mdash; &ldquo;A release is blocked and needs to jump the queue.&rdquo;
+
+Reserve a slice of the fleet for the highest class, so urgent work finds capacity without displacing
+anything. This wastes a little capacity continuously and is usually cheaper than the alternative.
+
+Preemption is the stronger tool and it is not free. Killing a job at eighty minutes of ninety
+discards eighty minutes of fleet time and restarts somebody's wait, so preempt the **youngest**
+victim rather than the largest, since it has the least to lose. Preemption without checkpointing is
+pure waste, so it is worth having only for jobs that are short, restartable, or checkpointed.
+
+Keep the highest class scarce and audited. A priority everyone can set is not a priority, and a
+class that becomes universal reproduces the original queue with extra steps.
+
+### Round 9 &mdash; &ldquo;At ten every morning the queue is six hours deep.&rdquo;
+
+Then the fleet is under-provisioned for the peak and the peak is structural: it is when people
+arrive and merge, and it will not smooth out on its own.
+
+Say what the honest options are, and be clear that the scheduler cannot conjure capacity. Provision
+for the peak and accept idleness at night. Burst into elastic capacity for the top of the peak,
+which is the strongest argument for a hybrid fleet even when steady-state cost favours owned
+machines. Shift what can be shifted out of the window. Or shorten the jobs.
+
+What must not happen is a queue that grows silently. Report **expected wait** at submission rather
+than queue position &mdash; position is meaningless when durations vary thirtyfold &mdash; and alert
+on queue depth and oldest-waiting age rather than on failures, because this system's characteristic
+failure is that everything succeeds, slowly, and nothing raises an error.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Short jobs stuck behind long ones',
+      symptom: 'A three-minute test waits an hour at peak while the fleet appears fully busy.',
+      cause: 'A single ordered queue with a wide duration spread, so one long job at the head blocks everything behind it.',
+      mitigation: 'Separate classes by predicted duration, predict from observed history, and age waiting jobs so nothing starves.',
+    },
+    {
+      what: 'One tenant consumes the fleet',
+      symptom: 'Every other team stops making progress after one pipeline submits thousands of jobs.',
+      cause: 'A global queue cannot express fairness between tenants, only between jobs.',
+      mitigation: 'Per-tenant queues, weighted round-robin across those with work, and admission quotas at submission.',
+    },
+    {
+      what: 'Duplicate results from a resurrected machine',
+      symptom: 'A job rescheduled after a machine froze has its results overwritten by the original when it wakes.',
+      cause: 'Leases expired without fencing, so a stale executor could still publish.',
+      mitigation: 'A fencing token issued with the lease and validated by every downstream store, so stale work is rejected rather than trusted.',
+    },
+    {
+      what: 'Capacity that exists but cannot be used',
+      symptom: 'Utilisation reads 70% and large jobs never start.',
+      cause: 'Fragmentation. Free capacity is scattered in pieces smaller than the largest queued job.',
+      mitigation: 'A few machine classes rather than arbitrary requirements, reserved capacity for large footprints, best-fit placement, and a fragmentation metric distinct from utilisation.',
+    },
+    {
+      what: 'A poison job walks the fleet',
+      symptom: 'Executors crash one after another over an afternoon, seemingly at random.',
+      cause: 'A job that kills its executor was rescheduled indefinitely, visiting a new machine each time.',
+      mitigation: 'Bounded attempts, a poison queue, and quarantine of a machine that fails repeatedly so a bad host does not masquerade as a bad job.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Predicted duration from history | Short work overtakes long work without trusting anyone | Cold start for unseen job kinds; occasional bad prediction | Durations were uniform, needing no prediction at all |
+| Per-tenant weighted queues | Fairness is expressible and tunable | More queues, and an entitlement policy to maintain and defend | The fleet served one team |
+| Ageing alongside shortest-first | Nothing starves | Mean wait is slightly worse than pure shortest-first | Starvation were acceptable, which it is not |
+| Target utilisation below the maximum | Queue times stay tolerable | Machines sit idle and the bill is visible | Waiting were free, which it is not - it is just unbilled |
+| A few machine classes | Packing stays tractable | Some jobs get more machine than they need | Requirements were uniform |
+| Reserved slice for urgent work | Urgent work never waits behind bulk | A little capacity permanently idle | Preemption with checkpointing were universal |
+| Lease plus fencing token | Machine failure costs time, not correctness | Every downstream store must validate the token | Executors never paused, which they do |
+| Expected wait, not queue position | The number shown means something | Harder to compute, and sometimes wrong | Durations were uniform |
+
+## Cost
+
+The fleet dominates, and its size is set almost entirely by **target utilisation and peak shape**
+rather than by total work. Two thousand machines at 80% do the same work as roughly 1,680 at 95%,
+and the 320 machines are the price of the wait in the table above. Framing the choice that way is
+the most useful thing this design does for the organisation, because otherwise the saving is
+measured in one currency and the cost in another.
+
+The scheduler itself is trivial in comparison: a placement decision for 50,000 jobs a day is a few
+per second, and one modest leader with a hot standby is ample. Resist making it clever. A scheduler
+that spends 200 ms finding a better placement has cost more machine time than the placement saves.
+
+The largest saving available is not in this system at all. Halving job duration halves waiting at
+any utilisation **and** halves fleet requirement, which no scheduling policy can match &mdash; which
+is why the honest recommendation from this exercise is often to go and work on the tests.
+
+## What we did NOT build
+
+**An optimal packer.** Placement is an NP-hard problem being solved thousands of times a day under a
+deadline. Best-fit over a few classes is close enough, and the gap is smaller than the variance in
+job duration.
+
+**Preemption with checkpointing.** Checkpointing a build is a per-workload engineering project. We
+reserve capacity instead, which is worse in theory and enormously cheaper.
+
+**Trusting declared durations.** Gameable inputs are not inputs.
+
+**A distributed scheduler.** Scheduling is a decision that benefits from seeing everything at once,
+and the rate does not require sharding. One leader with a standby is simpler and makes better
+decisions than several coordinating ones.
+
+## Evidence
+
+<Claim label="fact" source="ostep">
+Shortest-job-first minimises average turnaround time when durations are known, and starves long jobs
+when short arrivals continue. Ageing - raising a waiting job's priority over time - is the
+conventional remedy, and it trades a little of the optimality for a bound on the worst case.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Little's law relates the number of items in a queueing system to arrival rate and time spent, which
+makes queue length and waiting time two views of the same measurement. It is the reason queue depth
+is a leading indicator of latency rather than an independent metric.
+</Claim>
+
+<Claim label="fact" source="tail-at-scale">
+Shared resources produce variability that is not visible in mean measurements, and a request's
+experience is dominated by the worst component it touches. In a scheduling context this is why mean
+queue time understates what users perceive.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+Admitting work that cannot be served converts overload into unbounded latency rather than removing
+it, so refusing at admission is preferable to queueing without limit.
+</Claim>
+
+<Claim label="fact" source="sre-book">
+Alerting should follow symptoms users experience rather than internal errors. For a scheduler the
+symptom is waiting time and the age of the oldest queued job, neither of which produces an error at
+any point.
+</Claim>
+
+<Claim label="fact" source="netflix-tech">
+Operators of large shared compute fleets report that utilisation targets are set deliberately below
+capacity to protect latency, and that fragmentation from heterogeneous requirements is a distinct
+source of unusable capacity that aggregate utilisation does not reveal.
+</Claim>
+
+<Claim label="speculation">
+Fleet size, job counts and the thirtyfold duration spread are illustrative. The spread is the figure
+worth measuring first in any real fleet, because it alone determines whether a scheduler is needed
+or whether first-in-first-out would have been fine.
+</Claim>
+
+<Claim label="inference">
+The wait-time multipliers in the estimate come from an idealised model with random arrivals and
+exponential service times. Real build fleets have burstier arrivals and heavier-tailed durations,
+which makes waiting worse than the table suggests, not better. Use the shape of the curve for the
+argument and measure your own fleet for the numbers.
+</Claim>

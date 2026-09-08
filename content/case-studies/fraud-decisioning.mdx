@@ -1,0 +1,433 @@
+---
+id: fraud-decisioning
+title: Fraud Decisioning
+ask: Design the service that decides, inside a card authorisation, whether a transaction is fraudulent, at fifty thousand transactions per second.
+difficulty: advanced
+minutes: 55
+signatures: [stream-join, hot-key]
+concepts: [stream-join, stream-processing, windowing, watermark, latency-budget, tail-latency, hedged-request, timeout, circuit-breaker, graceful-degradation, failover, cascading-failure, load-shedding, backpressure, partition-key, partitioning, hot-partition, key-splitting, partition-ordering, clock-skew, at-least-once, effectively-once, idempotency, replay, backfill, compaction, retention, local-cache, cache-generic, staleness, eventual-consistency, consistency-generic, audit-log, immutability, feature-flag, expand-contract, versioning, blast-radius, tenant-isolation, capacity-headroom, availability, throughput, cost]
+patterns: [circuit-breaker, bulkhead, key-splitting, expand-contract]
+prerequisites: [delivery-and-duplicates, computing-on-a-stream]
+sources: [kafka-docs, ddia, database-internals, tail-at-scale, stripe-eng, aws-builders-library, sre-book]
+status: reviewed
+---
+
+## The ask
+
+> &ldquo;Design the service that decides, inside a card authorisation, whether a transaction is
+> fraudulent, at fifty thousand transactions per second.&rdquo;
+
+This looks like the attribution problem &mdash; join a stream of events against other events and
+produce a verdict &mdash; and one clause changes everything about it: **inside the authorisation**.
+
+Attribution can take minutes, can be replayed when it turns out to be wrong, and is reconciled
+against a ledger before anybody is paid. None of that is available here. The answer must be
+produced while a cardholder stands at a terminal, it is sent to the card network and cannot be
+recalled, and being late is identical to being wrong.
+
+The design consequence is severe and it is the thing to say first: **a join you must finish in a
+hundred milliseconds is not a join you can perform when the question arrives.**
+
+## Clarify
+
+| Question | Why it changes the design |
+|---|---|
+| What is the latency budget, and at which percentile? | A hundred milliseconds at the median and at the 99.9th are different systems by an order of magnitude in cost. |
+| If we cannot answer in time, is the transaction approved or declined? | This is the single most consequential requirement in the problem, and it is a business decision, not a technical default. |
+| Are we scoring, or deciding? | A score handed to someone else's policy engine is a much smaller obligation than owning the decline. |
+| How soon do we learn we were wrong? | Chargebacks arrive weeks later, which decides how the system is evaluated and retrained. |
+| Which signals may we use? | Data residency and regulatory limits on profiling constrain the features before any engineering does. |
+| Is the adversary adaptive? | Unlike almost every other workload in this library, the input distribution changes in response to the system. |
+
+## Requirements
+
+**Functional.** Score every authorisation. Apply a policy to produce approve, decline, or
+challenge. Record the decision and the evidence behind it. Support rules that can be changed
+without a deploy.
+
+**Non-functional.** Answer within the budget at the 99.9th percentile. Degrade to a defined
+behaviour rather than hanging. Never let a downstream failure block the payment path. Reproduce any
+past decision exactly, for a dispute or a regulator.
+
+**Out of scope.** Model training and selection, chargeback operations, identity verification flows,
+and the manual review queue that sits behind a challenge.
+
+## Estimate
+
+<Estimator preset="traffic" />
+
+- **50,000 authorisations per second** at peak.
+- Total authorisation budget end to end is a second or two; the fraud decision is allocated
+  **100 ms at the 99.9th percentile**.
+- **500,000,000 active cards.** Rolling aggregates per card at ~200 bytes is about **100 GB** &mdash;
+  large for memory on one machine, unremarkable across a cluster.
+- Chargeback feedback arrives **30 to 90 days** after the transaction.
+
+The percentile is not decoration, and it is the number most candidates skip past.
+
+<Claim label="inference">
+At 50,000 per second, the 99th percentile is **500 transactions every second** falling outside the
+budget. The 99.9th is still fifty a second, or four million a day. A latency target expressed at
+the median describes a system that fails continuously and invisibly, so the tail is the
+requirement, and designs that are fast on average but occasionally slow are disqualified rather
+than merely suboptimal.
+</Claim>
+
+Now the arithmetic that removes the obvious design. Answering &ldquo;how many transactions has this
+card made in the last hour, in how many countries, at how many merchants&rdquo; by querying
+transaction history costs several indexed reads, each with its own tail. Even at five milliseconds
+each at the median, the 99.9th percentile of a handful of dependent reads lands far outside a
+hundred milliseconds &mdash; because tails compound, and the slowest of several calls dominates.
+
+<Claim label="inference">
+The join therefore cannot happen on the request path. The only shape that fits is a **single keyed
+lookup of state that was already computed** before the transaction arrived. The stream job's
+purpose is not to answer questions; it is to make sure the answers already exist.
+</Claim>
+
+## Data model
+
+| Entity | Key | Notes |
+|---|---|---|
+| Card profile | card id | Rolling counts and sums over 1 min, 1 h, 24 h, 30 d. The join state. |
+| Merchant profile | merchant id | Same shape, wildly skewed. Some merchants are millions of times busier than others. |
+| Device / IP profile | device id | Shorter windows, higher churn |
+| Decision record | authorisation id | The verdict, the policy version, and **the feature values as they were at decision time** |
+| Rule set | version | Deterministic policy, changeable without deploying code |
+
+The decision record is the entry that is easy to under-specify and expensive to get wrong. It
+stores the feature *values*, not a reference to the profile they came from, because the profile
+will have moved on by the time anyone asks. Round 6 is about why that matters more than it looks.
+
+## Design v1
+
+<Arch
+  caption="The stream keeps the profiles current. The request path reads one key and decides. The two never share a failure."
+  columns={[
+    { title: 'Authorise', nodes: [{ id: 'auth', label: 'Authorisation', note: '100 ms budget' }] },
+    { title: 'Decide', nodes: [{ id: 'svc', label: 'Decision service', note: 'one lookup, then policy', tone: 'accent' }, { id: 'rules', label: 'Rule set', note: 'versioned, hot-reloaded' }] },
+    { title: 'State', nodes: [{ id: 'prof', label: 'Profile store', note: 'pre-joined aggregates', tone: 'accent' }] },
+    { title: 'Maintain', nodes: [{ id: 'log', label: 'Transaction log', note: 'partitioned by card' }, { id: 'agg', label: 'Windowed aggregation' }] },
+    { title: 'Learn', nodes: [{ id: 'dec', label: 'Decision log', note: 'features as recorded' }, { id: 'cb', label: 'Chargebacks', note: '30-90 days later' }] },
+  ]}
+  edges={[
+    { from: 'auth', to: 'svc' },
+    { from: 'svc', to: 'prof', label: 'one keyed read' },
+    { from: 'rules', to: 'svc' },
+    { from: 'svc', to: 'log', label: 'async, after answering' },
+    { from: 'log', to: 'agg' },
+    { from: 'agg', to: 'prof', label: 'updates state' },
+    { from: 'svc', to: 'dec' },
+    { from: 'cb', to: 'dec', label: 'labels, much later' },
+  ]}
+  stages={[
+    {
+      label: 'Query the history',
+      show: ['auth', 'svc', 'log'],
+      because:
+        'Ask the transaction store what this card has been doing. Correct, simple, and impossible inside the budget once the tail of several dependent reads is accounted for.',
+    },
+    {
+      label: 'Pre-join into profiles',
+      show: ['auth', 'svc', 'prof', 'log', 'agg'],
+      because:
+        'A stream job maintains windowed aggregates keyed by card and merchant. The request path becomes one lookup and some arithmetic, which fits the budget with room for the policy.',
+    },
+    {
+      label: 'Degrade deliberately, and record what you saw',
+      show: ['auth', 'svc', 'rules', 'prof', 'log', 'agg', 'dec', 'cb'],
+      because:
+        'A defined fallback when the profile store is slow, a versioned rule set that changes without a deploy, and a decision log that stores the feature values used - because the profile will have moved by the time a chargeback arrives to judge the decision.',
+    },
+  ]}
+/>
+
+## Pressure rounds
+
+### Round 1 &mdash; &ldquo;Why not just query the card's recent transactions?&rdquo;
+
+Because tails compound. A design that makes four dependent lookups, each with a five-millisecond
+median and a forty-millisecond 99th percentile, does not have a forty-millisecond tail &mdash; it
+has one considerably worse, because the slowest of the four decides the answer and the probability
+that at least one is slow grows with every call added.
+
+<Claim label="fact" source="tail-at-scale">
+When a request depends on several parallel or sequential sub-requests, its latency is governed by
+the slowest of them, so tail latency at the component level is amplified rather than averaged at
+the request level. Systems with modest per-component tails routinely exhibit unacceptable
+end-to-end tails for this reason.
+</Claim>
+
+The fix is structural, not incremental: reduce the number of things that can be slow. One lookup
+against one store, with a hard timeout and a defined fallback, is a shape whose tail you can
+actually reason about.
+
+### Round 2 &mdash; &ldquo;So what exactly is precomputed?&rdquo;
+
+Windowed aggregates, keyed by the entities a rule can name: counts and sums per card, per merchant,
+per device, over a minute, an hour, a day, and thirty days. Distinct counts &mdash; how many
+countries, how many merchants &mdash; kept approximately, because an exact distinct count over
+thirty days per card is far more state than the answer is worth.
+
+That collection **is** the join. &ldquo;This transaction against this card's recent behaviour&rdquo;
+has been computed continuously by the stream job, so the request path performs a lookup rather than
+a join.
+
+Size it out loud: 500 million cards at roughly 200 bytes is about 100 GB, which is a moderate
+cluster holding everything in memory. Merchants and devices add less. The state is affordable
+precisely because it is aggregates rather than history, and the discipline that keeps it affordable
+is refusing to keep anything per transaction.
+
+### Round 3 &mdash; &ldquo;The profile store is slow. Approve or decline?&rdquo;
+
+The most important question in the problem, and the correct answer is that **it is not yours to
+choose**. Bring the arithmetic and let the business decide.
+
+Failing **closed** &mdash; declining when unsure &mdash; costs the margin on every legitimate
+transaction declined, plus customer trust, which is the expensive part and the part that does not
+appear on the incident report. Failing **open** costs the fraud that slips through, at roughly the
+full transaction value.
+
+With a fraud rate of a fraction of a per cent and a decline affecting whatever share of traffic the
+outage touches, failing open is usually cheaper by a wide margin &mdash; which is why most
+authorisation paths fail open, and why the fraud service is built so it can never block the
+payment.
+
+<Callout kind="warn" title="Fail open is a decision, not a default">
+Fail open is normally right and it is not automatically right. It is exactly the state an attacker
+would like to induce, so pair it with a much more conservative static rule set for the degraded
+path, cap the exposure while degraded, and alarm loudly. A fallback nobody tested is a fallback
+that will be exercised for the first time during an incident.
+</Callout>
+
+### Round 4 &mdash; &ldquo;One merchant is five per cent of all transactions.&rdquo;
+
+A national retailer, and the merchant profile for it is a single key taking 2,500 updates per
+second while most merchants take one an hour. Partitioning by merchant id puts all of that on one
+partition, and that partition is now the system's throughput ceiling.
+
+Split the key: maintain the hot merchant's aggregate across *n* sub-keys and sum them on read. The
+read cost rises from one lookup to *n*, which is affordable when *n* is small and applied only to
+the handful of keys that need it, and detecting which keys need it is a matter of watching update
+rates rather than of guessing in advance.
+
+Note that the card profile has no such problem: cards are numerous and individually slow, so
+partitioning by card id is naturally even. Two keys in the same system, two entirely different
+distributions &mdash; and a single partitioning strategy applied to both would be wrong for one of
+them.
+
+### Round 5 &mdash; &ldquo;A card is used in London and Singapore four minutes apart.&rdquo;
+
+The signal everyone reaches for, and it is a clock problem wearing a fraud costume.
+
+The two authorisations arrive from different acquirers, over different paths, with different
+delays, carrying timestamps set by terminals whose clocks are not synchronised with each other or
+with you. Processing order tells you nothing, and terminal time cannot be trusted absolutely.
+
+Partition the stream by **card id** so one card's events are ordered relative to each other, use the
+acquirer's timestamp for reasoning and your receipt time for bounding, and treat the aggregate as
+provisional within a short window. If a late event changes the picture, the profile corrects itself
+for the *next* decision; the one already sent cannot be recalled, which is the permanent asymmetry
+of this system and worth stating plainly rather than designing around.
+
+### Round 6 &mdash; &ldquo;You learn it was fraud six weeks later.&rdquo;
+
+The label arrives long after the decision, and this creates a subtle failure that ruins evaluation
+work quietly.
+
+If you recompute the features later to analyse the decision, you get **different values**, because
+the profile has absorbed six weeks of subsequent activity. The analysis then measures a decision
+nobody made.
+
+So log the feature values **as used**, in the decision record, at decision time. It is more storage
+and it is the only way to answer &ldquo;why did we decline this?&rdquo; correctly &mdash; which is
+also a question a regulator or a court may ask, and &ldquo;we can no longer reconstruct it&rdquo; is
+not an answer.
+
+<Claim label="inference">
+This generalises past fraud. Any system whose decisions are judged later must record the inputs to
+the decision, not merely the output, because the inputs are derived from state that keeps moving.
+Recomputation feels equivalent and is not.
+</Claim>
+
+### Round 7 &mdash; &ldquo;We need a new feature: transactions per hour on the shipping address.&rdquo;
+
+Adding an aggregate to a running stream job is not a deploy. The new key has no history, so the
+feature is empty for every entity until enough traffic has accumulated &mdash; and the window
+determines how long that takes. A thirty-day aggregate is genuinely empty for thirty days.
+
+Two options, and both are worth knowing. **Backfill** by replaying retained history through the
+job, which requires that the retention actually covers the window and that the job is
+deterministic. Or **run it forward in shadow**, deciding nothing on it until the state is mature.
+
+Version the state schema and run old and new side by side through the transition, in the usual
+<C id="expand-contract">expand and contract</C> shape. State migrations on a live stream job are
+one of the genuinely hard parts of operating this, and a candidate who mentions it unprompted is
+telling you they have done it.
+
+### Round 8 &mdash; &ldquo;An attacker probes with tiny transactions until something works.&rdquo;
+
+This system has a property almost nothing else in the library has: **the input distribution changes
+in response to the system's own behaviour.** Every rule you deploy is published to the adversary
+by its effects, and a threshold at fifty pounds teaches them to try forty-nine.
+
+Consequences worth naming. Prefer relative and adaptive thresholds over fixed ones, because a fixed
+number is a target. Do not leak the reason for a decline into a response the attacker can read.
+Rate-limit probing behaviour itself &mdash; many small declines from one entity is a signal
+independent of any individual transaction. And accept that model decay here is adversarial rather
+than incidental, so retraining cadence is a security control and not merely hygiene.
+
+### Round 9 &mdash; &ldquo;The model says approve, the rules say decline.&rdquo;
+
+Keep both, deliberately, and make the precedence explicit rather than emergent.
+
+Deterministic rules exist for the things that must be certain: sanctions lists, hard limits, and
+whatever a regulator requires be enforceable and explainable. They win, always, because their
+purpose is to be a guarantee rather than an estimate.
+
+The model handles the large space where a rule would be arbitrary. Deploy changes to it in shadow
+first &mdash; scoring live traffic and recording what it *would* have done without acting &mdash;
+and compare against the current decision on the same traffic. Because feedback takes six weeks,
+shadow mode is often the only honest evaluation available before a change goes live.
+
+Keep the rule set behind a versioned, hot-reloadable configuration, and record the version on every
+decision. When someone asks in a year why a transaction was declined, the version is what makes the
+answer possible.
+
+## What breaks
+
+<WhatBreaks
+  items={[
+    {
+      what: 'Fraud service takes down the payment path',
+      symptom: 'Authorisation latency rises across the board and approvals fail. Revenue stops.',
+      cause: 'The decision call had no hard timeout or no defined fallback, so a slow dependency became a blocking one.',
+      mitigation: 'A hard timeout well inside the budget, a circuit breaker, and a degraded rule set that answers without the profile store. The fraud service must never be able to hold up a payment.',
+    },
+    {
+      what: 'Tail misses that nobody notices',
+      symptom: 'Median latency looks excellent. A steady trickle of transactions is decided by the fallback rather than the model.',
+      cause: 'The budget was measured at the median or the 99th percentile, so tens of thousands of daily requests fell outside it silently.',
+      mitigation: 'Measure and alert at the percentile in the requirement, and count fallback invocations as a first-class metric rather than an error.',
+    },
+    {
+      what: 'Hot key stalls the aggregation',
+      symptom: 'Profiles for a large merchant go stale during peak, and decisions quietly use hours-old state.',
+      cause: 'One partition carried a disproportionate share of updates and fell behind, with no signal because nothing errored.',
+      mitigation: 'Split hot keys across sub-keys and sum on read. Alert on per-partition lag, never on aggregate lag, which hides exactly this.',
+    },
+    {
+      what: 'Decisions that cannot be explained',
+      symptom: 'A dispute or an audit asks why a transaction was declined, and the honest answer is that it can no longer be determined.',
+      cause: 'Only the verdict was stored. The features were recomputed from profiles that have since absorbed weeks of activity.',
+      mitigation: 'Record feature values and rule-set version with every decision, immutably, for the retention the regulation requires.',
+    },
+    {
+      what: 'A rule change with no way back',
+      symptom: 'Decline rate jumps after a policy change, and reverting takes a deploy.',
+      cause: 'Policy lived in code rather than in versioned configuration, and had not been evaluated in shadow first.',
+      mitigation: 'Hot-reloadable versioned rules, shadow evaluation before activation, and decline rate as a monitored service level.',
+    },
+  ]}
+/>
+
+## Trade-off ledger
+
+| Decision | Chosen | Gave up | Would change if |
+|---|---|---|---|
+| Pre-joined profiles, not query-time joins | One lookup fits the budget with a reasonable tail | State must be maintained continuously and can go stale | The budget were seconds rather than milliseconds |
+| Aggregates rather than history | 100 GB instead of petabytes | Only questions anticipated in advance can be answered | Storage and latency were both free |
+| Approximate distinct counts | Bounded state per card | Small counting error on some features | Exactness affected the decision, which it does not |
+| Fail open on the degraded path | A dependency cannot stop payments | Fraud exposure during degradation | Fraud loss exceeded the cost of declining, as for very high value transactions |
+| Partition by card, split hot merchants | Even distribution for both key types | Two strategies to operate and understand | Both distributions were similar, which they are not |
+| Feature values logged at decision time | Decisions remain explainable and evaluable | Considerable extra storage | Nobody ever audited a decision |
+| Rules ahead of the model, always | Hard requirements are guaranteed, not estimated | Rules are blunt and get gamed | Nothing required a hard guarantee |
+| Shadow evaluation before activation | Changes are measured before they cost money | Slower to ship a change | Feedback were fast, which at 30-90 days it is not |
+
+## Cost
+
+The dominant cost is **keeping 100 GB of state hot and current**: memory across the profile
+cluster, plus the stream job maintaining it, plus enough headroom that the tail stays inside budget
+at peak. Provisioning to a tail rather than to a mean is inherently expensive, and that is the
+honest characterisation of this bill.
+
+The decision log is the fastest-growing thing here, because storing features per authorisation is
+far larger than storing verdicts. It is also the least negotiable, since its retention is usually
+set by regulation rather than by engineering, so treat it as a fixed obligation and put it on cheap
+storage from the start.
+
+Set against the fraud it prevents, all of this is small &mdash; which is the useful framing when
+asked to justify the spend. The comparison that matters is not infrastructure against budget but
+basis points of fraud loss against basis points of false declines, and the second number is
+routinely the larger of the two.
+
+## What we did NOT build
+
+**A real-time join over transaction history.** The budget forbids it. Everything joinable is joined
+in advance.
+
+**Exactly-once decisioning.** A retried authorisation should reach the same verdict, which is
+idempotence of the decision rather than exactly-once processing of the stream. The aggregates
+tolerate at-least-once updates because small double counting does not change a threshold outcome.
+
+**Synchronous model training.** Labels arrive weeks later; nothing about training belongs on this
+path.
+
+**A manual review queue.** A challenge verdict hands off to one. Building it is a separate product
+with its own staffing model and its own latency expectations, measured in hours.
+
+## Evidence
+
+<Claim label="fact" source="tail-at-scale">
+In services composed of many components, the latency of a request is determined by its slowest
+dependency, so component-level tail latency is amplified at the request level. Techniques such as
+hedged requests and bounded fan-out exist specifically to contain this effect.
+</Claim>
+
+<Claim label="fact" source="kafka-docs">
+Records are ordered within a partition and not across partitions, and consumer position is tracked
+by offset against a retained log. Partitioning by card id is what provides per-card ordering, and
+retention is what makes the Round 7 backfill possible at all.
+</Claim>
+
+<Claim label="fact" source="ddia">
+Stream-table joins are implemented by maintaining the table side as local state updated from a
+changelog, so the join is a local lookup rather than a remote query. This is the mechanism the
+profile store implements.
+</Claim>
+
+<Claim label="fact" source="database-internals">
+Approximate distinct-count structures answer cardinality queries in space that grows far more
+slowly than the number of distinct values, at a bounded relative error - the trade this design
+makes for the distinct-country and distinct-merchant features.
+</Claim>
+
+<Claim label="fact" source="aws-builders-library">
+A caller that cannot distinguish a slow dependency from a failed one must impose its own deadline,
+because a dependency's latency becomes the caller's availability once the timeout is longer than
+the caller's budget.
+</Claim>
+
+<Claim label="fact" source="stripe-eng">
+Payment operations are made safe to retry through caller-supplied idempotency keys identifying the
+logical operation, which is what allows a retried authorisation to reach the same recorded outcome.
+</Claim>
+
+<Claim label="fact" source="sre-book">
+Service levels should be expressed at the percentile that reflects user experience, and error
+budgets make the cost of missing them explicit. At this volume the difference between the 99th and
+99.9th percentile is four million requests a day.
+</Claim>
+
+<Claim label="speculation">
+The transaction rate, card count, profile size and 100 ms budget are illustrative and vary by
+processor and by card scheme. The structural conclusion - that the budget forbids a query-time join
+and forces pre-computation - holds across the plausible range, which is the reason to derive it
+from arithmetic rather than assert it.
+</Claim>
+
+<Claim label="convention">
+Fraud rates and false-decline rates are commercially sensitive and rarely published in comparable
+form. The widely repeated observation that false declines cost merchants more than fraud itself is
+directionally well supported and should be treated as a prompt to measure both, not as a constant.
+</Claim>

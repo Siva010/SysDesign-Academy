@@ -319,6 +319,10 @@ for (const c of caseStudies) {
 }
 for (const [sig, n] of signatureCount) {
   if (n === 0) err(`primitive signature "${sig}" has no case study`);
+  /* One example teaches the instance; two teach the pattern. Transfer is the claim the case-study
+     taxonomy makes, and a single worked example does not support it. A warning rather than an
+     error, so a newly introduced signature can be authored before its second study exists. */
+  else if (n === 1) warn(`primitive signature "${sig}" has only one case study; transfer needs two`);
 }
 
 /* The bibliography page states that where a detail is publicly documented it is cited. A source

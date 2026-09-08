@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "validate:content": "tsx scripts/validate-content.ts",
     "icons": "node scripts/icons.mjs",
+    "coverage": "tsx scripts/coverage.ts",
     "untaught": "tsx scripts/untaught.ts"
   },
   "dependencies": {
