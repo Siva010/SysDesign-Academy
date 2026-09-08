@@ -32,3 +32,26 @@
 # The root, which the pattern above does not reach.
 /
   Cache-Control: public, max-age=0, must-revalidate
+
+# Icons and the manifest. Listed one path at a time rather than as /*.png, because * spans path
+# separators here: a glob would also match the hashed build assets above and land those files
+# with two Cache-Control headers, which is the mistake this file exists to avoid. Next appends a
+# content hash to the icon URLs it links, so a day costs nothing; /favicon.ico is requested bare
+# and is the reason the window is a day rather than a year.
+/favicon.ico
+  Cache-Control: public, max-age=86400
+
+/icon.svg
+  Cache-Control: public, max-age=86400
+
+/apple-icon.png
+  Cache-Control: public, max-age=86400
+
+/icon-192.png
+  Cache-Control: public, max-age=86400
+
+/icon-512.png
+  Cache-Control: public, max-age=86400
+
+/site.webmanifest
+  Cache-Control: public, max-age=86400

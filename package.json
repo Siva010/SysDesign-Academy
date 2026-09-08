@@ -10,6 +10,7 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "validate:content": "tsx scripts/validate-content.ts",
+    "icons": "node scripts/icons.mjs",
     "untaught": "tsx scripts/untaught.ts"
   },
   "dependencies": {

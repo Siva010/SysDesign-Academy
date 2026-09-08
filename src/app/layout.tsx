@@ -12,6 +12,9 @@ export const metadata: Metadata = {
   },
   description:
     'A production-grade system design curriculum: mental models, trade-offs, failure modes and interview judgment, built from primary sources.',
+  /* The icon and apple-icon files next to this one are picked up automatically. This is only
+     the manifest, which has no file convention that survives a static export. */
+  manifest: '/site.webmanifest',
 };
 
 export const viewport: Viewport = {
