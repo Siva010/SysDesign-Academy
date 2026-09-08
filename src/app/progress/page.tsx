@@ -1,31 +1,30 @@
 import type { Metadata } from 'next';
 import { ProgressDashboard } from '@/components/ProgressDashboard';
 import { LEVELS } from '@/content/curriculum';
-import { LEVEL_CONCEPTS } from '@/content/level-concepts';
+import { lessonIndex, loadAllCaseStudies } from '@/lib/content-node';
 
 export const metadata: Metadata = {
   title: 'Your progress',
-  description: 'How mastery is measured here, and where you currently stand.',
+  description: 'What you have read, how many times, and what is due to come back round.',
 };
 
 export default function ProgressPage() {
-  const levels = LEVELS.map((l) => ({
-    index: l.index,
-    name: l.name,
-    concepts: LEVEL_CONCEPTS[l.index] ?? [],
-  }));
+  const levels = LEVELS.map((l) => ({ index: l.index, name: l.name }));
+  const caseStudies = loadAllCaseStudies().map((c) => ({ id: c.id, title: c.title }));
 
   return (
     <div className="content-wide">
       <p className="eyebrow">About</p>
       <h1 className="page-title">Your progress</h1>
       <p className="page-lede">
-        Clicking &ldquo;complete&rdquo; is not evidence of anything. Mastery here is inferred
-        from what you have actually done, it decays if you never use it, and it is stored only in
-        this browser.
+        This records one thing: what you have marked as read, and when. It does not score you, and
+        it does not infer what you understand — it has no way to know that, and pretending
+        otherwise was the previous version&rsquo;s mistake. What it does is bring things back round
+        at expanding intervals, because a curriculum this dense is not finished by reaching the end
+        of it once.
       </p>
 
-      <ProgressDashboard levels={levels} />
+      <ProgressDashboard levels={levels} index={lessonIndex()} caseStudies={caseStudies} />
     </div>
   );
 }

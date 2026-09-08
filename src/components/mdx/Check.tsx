@@ -1,7 +1,6 @@
 'use client';
 
 import { useState } from 'react';
-import { useProgress } from '@/lib/progress';
 import type { ChoiceOption } from '@/lib/types';
 
 /**
@@ -28,7 +27,6 @@ export function Check({
   concepts?: string[];
   context?: 'lesson' | 'exercise' | 'case-study';
 }) {
-  const { recordAnswer } = useProgress();
   const [chosen, setChosen] = useState<string | null>(null);
 
   const selected = options.find((o) => o.id === chosen) ?? null;
@@ -36,7 +34,6 @@ export function Check({
   const choose = (opt: ChoiceOption) => {
     if (chosen) return;
     setChosen(opt.id);
-    recordAnswer(concepts, opt.credit, context === 'lesson' ? 'exercise' : context);
   };
 
   return (
@@ -105,7 +102,6 @@ export function OpenCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [answer, setAnswer] = useState('');
   const [revealed, setRevealed] = useState(false);
   const [selfScore, setSelfScore] = useState<Set<number>>(new Set());
@@ -129,7 +125,6 @@ export function OpenCheck({
 
   const finish = () => {
     const credit = ratio >= 0.75 ? 'full' : ratio >= 0.4 ? 'partial' : 'none';
-    recordAnswer(concepts, credit, 'exercise');
   };
 
   return (
@@ -221,7 +216,6 @@ export function EstimateCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [value, setValue] = useState('');
   const [submitted, setSubmitted] = useState(false);
 
@@ -234,7 +228,6 @@ export function EstimateCheck({
   const submit = () => {
     if (!valid) return;
     setSubmitted(true);
-    recordAnswer(concepts, within ? 'full' : orderOfMagnitude ? 'partial' : 'none', 'exercise');
   };
 
   return (

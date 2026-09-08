@@ -15,7 +15,7 @@ Content is **structured data**, not a pile of pages (§40). Entities and their s
 | Interview scenario | `src/content/interviews/*.ts` | Behaviour, not prose |
 | Source | `src/content/sources.ts` | Registry, referenced by id |
 | Symptom | `src/content/symptoms.ts` | Powers conceptual search |
-| Progress / Mastery | `localStorage` via `src/lib/progress` | Per-learner, client only |
+| Progress (reading passes) | `localStorage` via `src/lib/progress` | Per-learner, client only |
 
 ## Invariants (enforced by `scripts/validate-content.ts`)
 

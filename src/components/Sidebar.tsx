@@ -4,8 +4,9 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { LEVELS } from '@/content/curriculum';
-import { useProgress, summarise } from '@/lib/progress';
-import { LEVEL_CONCEPTS } from '@/content/level-concepts';
+import { useProgress } from '@/lib/progress';
+import { lessonsByLevel, levelStanding } from '@/lib/lesson-index';
+import type { LessonIndexEntry } from '@/lib/types';
 
 interface NavItem {
   href: string;
@@ -30,9 +31,9 @@ const PRACTICE: NavItem[] = [
   { href: '/next', label: 'What to learn next' },
 ];
 
-export function Sidebar() {
+export function Sidebar({ index }: { index: LessonIndexEntry[] }) {
   const pathname = usePathname();
-  const { state, ready } = useProgress();
+  const { recordsOf, ready } = useProgress();
   const [open, setOpen] = useState(false);
 
   /* On narrow screens the nav is collapsed so the content is the first thing on screen.
@@ -40,6 +41,9 @@ export function Sidebar() {
   useEffect(() => {
     setOpen(false);
   }, [pathname]);
+
+  const records = recordsOf('lesson');
+  const byLevel = lessonsByLevel(index);
 
   const isCurrent = (href: string) =>
     pathname === href || (href !== '/' && pathname.startsWith(href + '/'));
@@ -64,8 +68,9 @@ export function Sidebar() {
       <div className="nav-section">
         <div className="nav-heading">Curriculum</div>
         {LEVELS.map((level) => {
-          const concepts = LEVEL_CONCEPTS[level.index] ?? [];
-          const s = ready ? summarise(state, concepts) : null;
+          /* Read count rather than a percentage. "4/7" says what it is; a percentage of an
+             inferred understanding said something the application could not actually know. */
+          const s = ready ? levelStanding(byLevel.get(level.index) ?? [], records) : null;
           return (
             <Link
               key={level.id}
@@ -75,9 +80,14 @@ export function Sidebar() {
             >
               <span className="nav-num">{level.index}</span>
               <span style={{ flex: 1, minWidth: 0 }}>{level.name}</span>
-              {s && s.percent > 0 && (
-                <span className="tiny faint tnum" aria-label={`${s.percent} percent`}>
-                  {s.percent}%
+              {s && s.due > 0 && (
+                <span className="chip chip-warn tiny" aria-label={`${s.due} due for another pass`}>
+                  {s.due}
+                </span>
+              )}
+              {s && s.read > 0 && (
+                <span className="tiny faint tnum" aria-label={`${s.read} of ${s.total} read`}>
+                  {s.read}/{s.total}
                 </span>
               )}
             </Link>

@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { ConceptMastery } from '@/components/ConceptMastery';
+import { ConceptStanding } from '@/components/ConceptStanding';
 import { ConceptNeighbourhood } from '@/components/ConceptNeighbourhood';
 import {
   CLUSTER_LABELS,
@@ -19,6 +19,7 @@ import {
   loadAllFailures,
   loadAllPatterns,
   lessonsTeaching,
+  lessonIndex,
 } from '@/lib/content-node';
 
 export function generateStaticParams() {
@@ -98,7 +99,7 @@ export default async function ConceptPage({ params }: { params: Promise<{ id: st
           )}
         </header>
 
-        <ConceptMastery conceptId={concept.id} />
+        <ConceptStanding conceptId={concept.id} index={lessonIndex()} />
 
         {concept.myth && concept.mythCorrection && (
           <div className="callout callout-danger">

@@ -1,54 +1,29 @@
 'use client';
 
-import Link from 'next/link';
-import { useProgress } from '@/lib/progress';
+import { PassControl } from './PassControl';
 
 /**
- * Completing a case study is the evidence that moves concepts to mastery 3 (applied).
- * It is a deliberate click rather than a scroll trigger: the claim being made is
- * "I worked through this", and that should require asserting it.
+ * The end of a case study.
+ *
+ * Case studies rotate like lessons, and they benefit from it more: a pressure round you have
+ * already seen the answer to is a different exercise the second time, and the useful version is
+ * to answer it before reading on. The preface says so, because the honest failure mode here is
+ * reading the derivation and feeling like you produced it.
  */
-export function CaseStudyFooter({
-  id,
-  concepts,
-  title,
-}: {
-  id: string;
-  concepts: string[];
-  title: string;
-}) {
-  const { state, completeCaseStudy, ready } = useProgress();
-  const done = Boolean(state.caseStudiesCompleted[id]);
-
+export function CaseStudyFooter({ id }: { id: string }) {
   return (
-    <div className="callout callout-info" style={{ marginTop: '3rem' }}>
-      <div className="callout-title">{done ? 'Marked as worked through' : 'Did you derive it?'}</div>
-      <p>
+    <>
+      <p className="small muted" style={{ marginTop: '3rem', marginBottom: 0 }}>
         The value of a case study is in deriving it, not in reading it. If you read the pressure
-        rounds without pausing to answer them first, the honest thing is to leave this unmarked
-        and come back.
+        rounds without pausing to answer them first, the honest thing is to leave this unmarked and
+        come back to it.
       </p>
-      <div className="row" style={{ marginTop: '0.75rem' }}>
-        <button
-          type="button"
-          className="btn btn-sm btn-primary"
-          disabled={!ready || done}
-          onClick={() => completeCaseStudy(id, concepts)}
-        >
-          {done
-            ? 'Recorded'
-            : `I worked through this myself (${concepts.length} concepts to applied)`}
-        </button>
-        <Link href="/interview" className="btn btn-sm">
-          Try it under interview pressure
-        </Link>
-      </div>
-      {done && (
-        <p className="small muted" style={{ margin: '0.75rem 0 0' }}>
-          {title} recorded. To reach the top mastery level, use these ideas in a system you have
-          not seen before — that is what the interview simulator is for.
-        </p>
-      )}
-    </div>
+      <PassControl
+        kind="case-study"
+        id={id}
+        nextHref="/interview/"
+        nextLabel="Try it under interview pressure"
+      />
+    </>
   );
 }

@@ -7,7 +7,14 @@ import { PrerequisiteCheck } from '@/components/PrerequisiteCheck';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { LEVEL_BY_INDEX, MODULES, MODULE_BY_ID } from '@/content/curriculum';
 import { getSource } from '@/content/sources';
-import { getFailure, getLesson, getPattern, loadAllLessons, orderedLessons } from '@/lib/content-node';
+import {
+  getFailure,
+  getLesson,
+  getPattern,
+  lessonIndex,
+  loadAllLessons,
+  orderedLessons,
+} from '@/lib/content-node';
 import { Mdx } from '@/lib/mdx';
 
 const MODULE_ORDER: Record<string, number> = Object.fromEntries(
@@ -94,6 +101,7 @@ export default async function LessonPage({ params }: { params: Promise<{ id: str
         <PrerequisiteCheck
           prerequisites={lesson.prerequisites}
           note={lesson.prereqOverride}
+          index={lessonIndex()}
         />
 
         <div className="prose">

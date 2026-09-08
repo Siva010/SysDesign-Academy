@@ -1,7 +1,6 @@
 'use client';
 
 import { useState } from 'react';
-import { useProgress } from '@/lib/progress';
 import type { ChoiceOption } from '@/lib/types';
 
 /**
@@ -97,7 +96,6 @@ export function BottleneckCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [chosen, setChosen] = useState<string | null>(null);
   const selected = options.find((o) => o.id === chosen) ?? null;
 
@@ -137,7 +135,6 @@ export function BottleneckCheck({
         onChoose={(o) => {
           if (chosen) return;
           setChosen(o.id);
-          recordAnswer(concepts, o.credit, 'exercise');
         }}
       />
 
@@ -167,7 +164,6 @@ export function DebugCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [revealed, setRevealed] = useState(0);
   const [chosen, setChosen] = useState<string | null>(null);
   const selected = options.find((o) => o.id === chosen) ?? null;
@@ -203,7 +199,6 @@ export function DebugCheck({
         onChoose={(o) => {
           if (chosen) return;
           setChosen(o.id);
-          recordAnswer(concepts, o.credit, 'exercise');
         }}
       />
 
@@ -245,7 +240,6 @@ export function CompleteCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [chosen, setChosen] = useState<string | null>(null);
   const selected = options.find((o) => o.id === chosen) ?? null;
 
@@ -276,7 +270,6 @@ export function CompleteCheck({
         onChoose={(o) => {
           if (chosen) return;
           setChosen(o.id);
-          recordAnswer(concepts, o.credit, 'exercise');
         }}
       />
 
@@ -306,7 +299,6 @@ export function TransferCheck({
   stronger: string;
   concepts?: string[];
 }) {
-  const { recordAnswer } = useProgress();
   const [chosen, setChosen] = useState<string | null>(null);
   const selected = options.find((o) => o.id === chosen) ?? null;
 
@@ -322,7 +314,6 @@ export function TransferCheck({
         onChoose={(o) => {
           if (chosen) return;
           setChosen(o.id);
-          recordAnswer(concepts, o.credit, 'case-study');
         }}
       />
 

@@ -1,54 +1,93 @@
 'use client';
 
 /**
- * Learner progress and the mastery model (docs/07-assessment-taxonomy.md).
+ * Learner progress, stored as reading passes.
  *
- * Stored in localStorage: this is a single-learner client-side app, and progress is not
- * worth an account. Everything degrades gracefully if storage is unavailable (private
- * windows, blocked site data), which is why every access is wrapped.
+ * The model is deliberately small: the application records what you tell it you did, and
+ * derives everything else. There is no inferred skill level, because a number the software
+ * assigns you from rules you cannot see is not information about you - it is the software's
+ * opinion, and it was wrong often enough to be worth deleting.
+ *
+ * Scheduling lives in ./passes, which is pure. This file is storage and React.
+ *
+ * Kept in localStorage: single learner, client-side, not worth an account. Every access is
+ * wrapped because storage genuinely fails - private windows, blocked site data, quota - and
+ * progress is a convenience rather than a requirement.
  */
-import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react';
-import type { ConceptProgress, InterviewResult, MasteryLevel, ProgressState } from './types';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import type { InterviewResult, ProgressState } from './types';
+import { type Pace, type PassRecord, recordPass, undoPass } from './passes';
 
-const KEY = 'sda.progress.v1';
-const DAY = 86_400_000;
-
-/** Mastery 2 (understood) decays after this long without reinforcement. */
-export const DECAY_DAYS = 60;
+const KEY = 'sda.progress.v2';
+const LEGACY_KEY = 'sda.progress.v1';
 
 const EMPTY: ProgressState = {
-  version: 1,
-  lessonsRead: {},
-  concepts: {},
-  caseStudiesCompleted: {},
+  version: 2,
+  lessons: {},
+  caseStudies: {},
   interviews: [],
 };
+
+/** Shape of the model this replaced, kept only so existing progress survives the change. */
+interface LegacyState {
+  version: 1;
+  lessonsRead?: Record<string, number>;
+  caseStudiesCompleted?: Record<string, number>;
+  interviews?: InterviewResult[];
+  goal?: string;
+}
+
+/**
+ * A timestamp under the old model meant "read once, then". That maps exactly onto one pass,
+ * which is the whole migration. The old per-concept mastery is discarded rather than converted:
+ * it was derived from check answers, there is no honest reading of it as a number of passes,
+ * and inventing one would reintroduce the guessing this change exists to remove.
+ */
+function migrate(legacy: LegacyState): ProgressState {
+  const asPasses = (src: Record<string, number> = {}): Record<string, PassRecord> => {
+    const out: Record<string, PassRecord> = {};
+    for (const [id, at] of Object.entries(src)) {
+      if (typeof at === 'number' && at > 0) out[id] = { reads: 1, lastRead: at, firstRead: at };
+    }
+    return out;
+  };
+  return {
+    version: 2,
+    lessons: asPasses(legacy.lessonsRead),
+    caseStudies: asPasses(legacy.caseStudiesCompleted),
+    interviews: legacy.interviews ?? [],
+    ...(legacy.goal ? { goal: legacy.goal } : {}),
+  };
+}
 
 function read(): ProgressState {
   if (typeof window === 'undefined') return EMPTY;
   try {
     const raw = window.localStorage.getItem(KEY);
-    if (!raw) return EMPTY;
-    const parsed = JSON.parse(raw) as Partial<ProgressState>;
-    if (parsed.version !== 1) return EMPTY;
-    return {
-      ...EMPTY,
-      ...parsed,
-      lessonsRead: parsed.lessonsRead ?? {},
-      concepts: parsed.concepts ?? {},
-      caseStudiesCompleted: parsed.caseStudiesCompleted ?? {},
-      interviews: parsed.interviews ?? [],
-    };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ProgressState>;
+      if (parsed.version !== 2) return EMPTY;
+      return {
+        ...EMPTY,
+        ...parsed,
+        lessons: parsed.lessons ?? {},
+        caseStudies: parsed.caseStudies ?? {},
+        interviews: parsed.interviews ?? [],
+      };
+    }
+    const old = window.localStorage.getItem(LEGACY_KEY);
+    if (old) {
+      const parsed = JSON.parse(old) as LegacyState;
+      if (parsed.version === 1) {
+        const migrated = migrate(parsed);
+        write(migrated);
+        return migrated;
+      }
+    }
   } catch {
-    return EMPTY;
+    /* unreadable or blocked: start empty rather than failing to render */
   }
+  return EMPTY;
 }
 
 function write(state: ProgressState) {
@@ -60,25 +99,18 @@ function write(state: ProgressState) {
   }
 }
 
-/**
- * Effective mastery, after decay.
- * Level 3+ (applied, transferred) does not decay: doing something is stickier than reading it.
- */
-export function effectiveMastery(p: ConceptProgress | undefined): MasteryLevel {
-  if (!p) return 0;
-  if (p.mastery >= 3) return p.mastery;
-  const age = Date.now() - p.lastReinforced;
-  if (p.mastery === 2 && age > DECAY_DAYS * DAY) return 1;
-  return p.mastery;
-}
+export type PassKind = 'lesson' | 'case-study';
 
 interface ProgressApi {
   state: ProgressState;
   ready: boolean;
-  mastery: (conceptId: string) => MasteryLevel;
-  markLessonRead: (lessonId: string, concepts: string[]) => void;
-  recordAnswer: (concepts: string[], credit: 'full' | 'partial' | 'none', context: 'lesson' | 'exercise' | 'case-study' | 'interview') => void;
-  completeCaseStudy: (id: string, concepts: string[]) => void;
+  /** The record for one item, or undefined when it has never been read. */
+  recordFor: (kind: PassKind, id: string) => PassRecord | undefined;
+  /** Every record of a kind, for the derived views. */
+  recordsOf: (kind: PassKind) => Record<string, PassRecord>;
+  markRead: (kind: PassKind, id: string, pace?: Pace) => void;
+  undoRead: (kind: PassKind, id: string) => void;
+  setPace: (kind: PassKind, id: string, pace: Pace | undefined) => void;
   recordInterview: (result: InterviewResult) => void;
   setGoal: (goal: string | undefined) => void;
   reset: () => void;
@@ -88,13 +120,8 @@ interface ProgressApi {
 
 const Ctx = createContext<ProgressApi | null>(null);
 
-/** Mastery a piece of evidence can justify on its own. */
-const CEILING: Record<'lesson' | 'exercise' | 'case-study' | 'interview', MasteryLevel> = {
-  lesson: 1,
-  exercise: 2,
-  'case-study': 3,
-  interview: 4,
-};
+type Bucket = 'lessons' | 'caseStudies';
+const bucket = (kind: PassKind): Bucket => (kind === 'lesson' ? 'lessons' : 'caseStudies');
 
 export function ProgressProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<ProgressState>(EMPTY);
@@ -113,64 +140,42 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const bump = useCallback(
-    (s: ProgressState, conceptId: string, target: MasteryLevel, correct: boolean): ProgressState => {
-      const cur: ConceptProgress = s.concepts[conceptId] ?? {
-        mastery: 0,
-        lastReinforced: 0,
-        attempts: 0,
-        correct: 0,
-      };
-      const nextMastery = (correct ? Math.max(cur.mastery, target) : cur.mastery) as MasteryLevel;
-      return {
-        ...s,
-        concepts: {
-          ...s.concepts,
-          [conceptId]: {
-            mastery: nextMastery,
-            lastReinforced: Date.now(),
-            attempts: cur.attempts + 1,
-            correct: cur.correct + (correct ? 1 : 0),
-          },
-        },
-      };
-    },
-    [],
-  );
-
   const api = useMemo<ProgressApi>(
     () => ({
       state,
       ready,
-      mastery: (id) => effectiveMastery(state.concepts[id]),
 
-      markLessonRead: (lessonId, concepts) =>
+      recordFor: (kind, id) => state[bucket(kind)][id],
+      recordsOf: (kind) => state[bucket(kind)],
+
+      markRead: (kind, id, pace) =>
         update((s) => {
-          let next: ProgressState = {
+          const key = bucket(kind);
+          return {
             ...s,
-            lessonsRead: { ...s.lessonsRead, [lessonId]: Date.now() },
+            [key]: { ...s[key], [id]: recordPass(s[key][id], Date.now(), pace) },
           };
-          for (const c of concepts) next = bump(next, c, CEILING.lesson, true);
-          return next;
         }),
 
-      recordAnswer: (concepts, credit, context) =>
+      undoRead: (kind, id) =>
         update((s) => {
-          let next = s;
-          const correct = credit !== 'none';
-          const target = credit === 'full' ? CEILING[context] : (Math.max(1, CEILING[context] - 1) as MasteryLevel);
-          for (const c of concepts) next = bump(next, c, target, correct);
-          return next;
+          const key = bucket(kind);
+          const next = { ...s[key] };
+          const undone = undoPass(next[id]);
+          if (undone) next[id] = undone;
+          else delete next[id];
+          return { ...s, [key]: next };
         }),
 
-      completeCaseStudy: (id, concepts) =>
+      setPace: (kind, id, pace) =>
         update((s) => {
-          let next: ProgressState = {
-            ...s,
-            caseStudiesCompleted: { ...s.caseStudiesCompleted, [id]: Date.now() },
-          };
-          for (const c of concepts) next = bump(next, c, CEILING['case-study'], true);
-          return next;
+          const key = bucket(kind);
+          const cur = s[key][id];
+          if (!cur) return s;
+          const next = { ...cur };
+          if (pace) next.pace = pace;
+          else delete next.pace;
+          return { ...s, [key]: { ...s[key], [id]: next } };
         }),
 
       recordInterview: (result) =>
@@ -178,25 +183,28 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
 
       setGoal: (goal) => update((s) => ({ ...s, goal })),
 
-      reset: () =>
-        update(() => {
-          return { ...EMPTY };
-        }),
+      reset: () => update(() => ({ ...EMPTY })),
 
       exportState: () => JSON.stringify(state, null, 2),
 
       importState: (json) => {
         try {
-          const parsed = JSON.parse(json) as ProgressState;
-          if (parsed.version !== 1) return false;
-          update(() => parsed);
-          return true;
+          const parsed = JSON.parse(json) as ProgressState | LegacyState;
+          if (parsed.version === 1) {
+            update(() => migrate(parsed as LegacyState));
+            return true;
+          }
+          if (parsed.version === 2) {
+            update(() => ({ ...EMPTY, ...(parsed as ProgressState) }));
+            return true;
+          }
+          return false;
         } catch {
           return false;
         }
       },
     }),
-    [state, ready, update, bump],
+    [state, ready, update],
   );
 
   return <Ctx.Provider value={api}>{children}</Ctx.Provider>;
@@ -206,31 +214,4 @@ export function useProgress(): ProgressApi {
   const ctx = useContext(Ctx);
   if (!ctx) throw new Error('useProgress must be used inside <ProgressProvider>');
   return ctx;
-}
-
-/**
- * Mastery summary for a set of concepts. Used by level cards and the dashboard.
- * "Solid" counts only levels 3-4, which is the gate described in the assessment taxonomy.
- */
-export function summarise(
-  state: ProgressState,
-  conceptIds: string[],
-): { seen: number; understood: number; solid: number; total: number; percent: number } {
-  let seen = 0;
-  let understood = 0;
-  let solid = 0;
-  for (const id of conceptIds) {
-    const m = effectiveMastery(state.concepts[id]);
-    if (m >= 1) seen++;
-    if (m >= 2) understood++;
-    if (m >= 3) solid++;
-  }
-  const total = conceptIds.length || 1;
-  return {
-    seen,
-    understood,
-    solid,
-    total: conceptIds.length,
-    percent: Math.round(((understood + solid) / (2 * total)) * 100),
-  };
 }

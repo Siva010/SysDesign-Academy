@@ -866,20 +866,100 @@ details > summary:hover {
   background: var(--accent);
 }
 
-.mastery-dots {
+/* Reading passes. A pip per completed pass, so the count is legible without being read as a
+   score out of something - there is no maximum, and the fifth pass is not "done". */
+.pass-pips {
   display: inline-flex;
-  gap: 2px;
+  align-items: center;
+  gap: 3px;
 }
 
-.mastery-dot {
-  width: 6px;
-  height: 6px;
+.pass-pip {
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: var(--line-strong);
+  background: var(--accent);
 }
 
-.mastery-dot.on {
-  background: var(--accent);
+.pass-pip.empty {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+}
+
+.pass-more {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted);
+  margin-left: 2px;
+}
+
+/* The mark-as-read panel at the end of a lesson or case study. */
+.pass-panel {
+  margin-top: var(--s7);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: var(--s4);
+}
+
+.pass-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s3);
+  flex-wrap: wrap;
+}
+
+.pass-job {
+  margin: var(--s3) 0 var(--s4);
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.pass-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+}
+
+/* Secondary controls sit quietly: they adjust a schedule, they do not compete with the button. */
+.pass-tweak {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.pass-tweak:hover {
+  color: var(--text);
+}
+
+.pass-tweak[aria-pressed='true'] {
+  color: var(--accent-text);
+  font-weight: 500;
+}
+
+.pass-status {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+}
+
+.pass-status.due {
+  color: var(--warn);
+}
+
+.pass-status.overdue {
+  color: var(--danger);
+}
+
+.pass-status.resting {
+  color: var(--faint);
 }
 
 /* ------------------------------------------------------------------ responsive */

@@ -2,245 +2,247 @@
 
 import { useRef, useState } from 'react';
 import Link from 'next/link';
-import { CONCEPT_BY_ID } from '@/content/concepts';
-import { DECAY_DAYS, effectiveMastery, summarise, useProgress } from '@/lib/progress';
+import { useProgress } from '@/lib/progress';
+import { lessonsByLevel, levelStanding } from '@/lib/lesson-index';
+import type { LessonIndexEntry } from '@/lib/types';
+import {
+  INTERVAL_DAYS,
+  PASSES,
+  type PassRecord,
+  dueAt,
+  passLabel,
+  relativeDays,
+  statusOf,
+  urgency,
+} from '@/lib/passes';
 
-const LEVEL_MEANING = [
-  { level: 1, name: 'Encountered', evidence: 'You read a lesson that teaches it.' },
-  { level: 2, name: 'Understood', evidence: 'You answered a reasoning check about it correctly.' },
-  {
-    level: 3,
-    name: 'Applied',
-    evidence: 'You used it in an exercise or case study where it was not the subject.',
-  },
-  {
-    level: 4,
-    name: 'Transferred',
-    evidence: 'You used it correctly in a system you had not seen before.',
-  },
-];
+export interface LevelLite {
+  index: number;
+  name: string;
+}
 
+export interface ItemLite {
+  id: string;
+  title: string;
+}
+
+/**
+ * Where the learner stands, in the only terms the application can honestly use.
+ *
+ * The previous dashboard reported inferred mastery across 297 concepts, which looked
+ * authoritative and was mostly an artefact of how many multiple-choice checks someone had
+ * clicked. This reports what was recorded: what has been read, how many times, and what is due.
+ *
+ * The rotation histogram is the view worth having. A curriculum this long is not finished by
+ * reaching the end of it once, and the shape of that histogram - a wall at one pass, or a spread
+ * across four - says more about where somebody is than any single percentage could.
+ */
 export function ProgressDashboard({
   levels,
+  index,
+  caseStudies,
 }: {
-  levels: { index: number; name: string; concepts: string[] }[];
+  levels: LevelLite[];
+  index: LessonIndexEntry[];
+  caseStudies: ItemLite[];
 }) {
-  const { state, ready, reset, exportState, importState } = useProgress();
-  const [confirmReset, setConfirmReset] = useState(false);
-  const [importMessage, setImportMessage] = useState<string | null>(null);
+  const { recordsOf, state, ready, reset, exportState, importState } = useProgress();
+  const [importError, setImportError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  if (!ready) return <p className="muted">Reading your progress…</p>;
+  if (!ready) return <div style={{ minHeight: '24rem' }} aria-hidden />;
 
-  const all = levels.flatMap((l) => l.concepts);
-  const overall = summarise(state, all);
-  const lessonsRead = Object.keys(state.lessonsRead).length;
-  const caseStudies = Object.keys(state.caseStudiesCompleted).length;
+  const lessonRecords = recordsOf('lesson');
+  const studyRecords = recordsOf('case-study');
+  const byLevel = lessonsByLevel(index);
 
-  const decayed = Object.entries(state.concepts).filter(
-    ([, p]) => p.mastery === 2 && effectiveMastery(p) < 2,
-  );
+  const all: { id: string; title: string; record: PassRecord; href: string }[] = [
+    ...index
+      .filter((l) => lessonRecords[l.id])
+      .map((l) => ({ id: l.id, title: l.title, record: lessonRecords[l.id]!, href: `/lessons/${l.id}/` })),
+    ...caseStudies
+      .filter((c) => studyRecords[c.id])
+      .map((c) => ({ id: c.id, title: c.title, record: studyRecords[c.id]!, href: `/case-studies/${c.id}/` })),
+  ];
+
+  const totalPasses = all.reduce((n, x) => n + x.record.reads, 0);
+  const due = all
+    .filter((x) => {
+      const s = statusOf(x.record);
+      return s === 'due' || s === 'overdue';
+    })
+    .sort((a, b) => urgency(b.record) - urgency(a.record));
+
+  /* Buckets 1..4 exactly, then 5-and-up, matching the named passes. */
+  const histogram = [1, 2, 3, 4, 5].map((n) => ({
+    passes: n,
+    label: PASSES[Math.min(n - 1, PASSES.length - 1)]!.name,
+    count: all.filter((x) => (n === 5 ? x.record.reads >= 5 : x.record.reads === n)).length,
+  }));
+  const tallest = Math.max(1, ...histogram.map((h) => h.count));
 
   const download = () => {
     const blob = new Blob([exportState()], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'system-design-academy-progress.json';
+    a.download = 'sysdesign-progress.json';
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const onFile = async (file: File) => {
-    const text = await file.text();
-    setImportMessage(
-      importState(text) ? 'Progress imported.' : 'That file was not a valid progress export.',
-    );
-  };
-
   return (
-    <div className="stack" style={{ gap: '2.5rem' }}>
+    <div className="stack">
       <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          Where you stand
-        </h2>
-        <div className="card-grid">
-          <div className="card">
-            <div className="eyebrow">Concepts applied</div>
-            <strong style={{ fontSize: 'var(--text-2xl)' }} className="tnum">
-              {overall.solid}
-            </strong>
-            <p className="small muted" style={{ margin: '0.25rem 0 0' }}>
-              Used somewhere they were not being taught. This is the number that matters.
-            </p>
-          </div>
-          <div className="card">
-            <div className="eyebrow">Concepts understood</div>
-            <strong style={{ fontSize: 'var(--text-2xl)' }} className="tnum">
-              {overall.understood}
-            </strong>
-            <p className="small muted" style={{ margin: '0.25rem 0 0' }}>
-              Reasoned about correctly at least once, out of {overall.total} in the graph.
-            </p>
-          </div>
-          <div className="card">
-            <div className="eyebrow">Lessons read</div>
-            <strong style={{ fontSize: 'var(--text-2xl)' }} className="tnum">
-              {lessonsRead}
-            </strong>
-            <p className="small muted" style={{ margin: '0.25rem 0 0' }}>
-              Worth the least of the three. Reading is exposure, not skill.
-            </p>
-          </div>
-          <div className="card">
-            <div className="eyebrow">Case studies worked</div>
-            <strong style={{ fontSize: 'var(--text-2xl)' }} className="tnum">
-              {caseStudies}
-            </strong>
-            <p className="small muted" style={{ margin: '0.25rem 0 0' }}>
-              Derivations you completed yourself.
-            </p>
-          </div>
+        <div className="stat-row">
+          <Stat value={all.length} label="things read" />
+          <Stat value={totalPasses} label="passes made" />
+          <Stat value={due.length} label="due now" tone={due.length > 0 ? 'warn' : undefined} />
+          <Stat value={state.interviews.length} label="interviews run" />
         </div>
+        {all.length === 0 && (
+          <p className="muted" style={{ marginTop: '1rem' }}>
+            Nothing recorded yet. Mark a lesson as read at the bottom of its page and it will
+            appear here, then come back round on its own.
+          </p>
+        )}
       </section>
 
-      <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          By level
-        </h2>
-        <div className="stack" style={{ gap: '0.5rem' }}>
-          {levels.map((l) => {
-            const s = summarise(state, l.concepts);
-            return (
-              <Link key={l.index} href={`/levels/${l.index}`} className="card level-card">
-                <div className="row" style={{ justifyContent: 'space-between' }}>
-                  <span>
-                    <span className="faint tnum">{l.index}</span> {l.name}
-                  </span>
+      {all.length > 0 && (
+        <section>
+          <h2 className="section-title">The rotation</h2>
+          <p className="muted">
+            How many things sit at each pass. A wall on the left means you have covered ground once;
+            a spread to the right means it is starting to stick.
+          </p>
+          <div className="rotation">
+            {histogram.map((h) => (
+              <div key={h.passes} className="rotation-row">
+                <span className="rotation-label">
+                  {h.passes === 5 ? '5+' : h.passes} <span className="faint">{h.label}</span>
+                </span>
+                <div className="rotation-track">
+                  <div
+                    className="rotation-bar"
+                    style={{ width: `${(h.count / tallest) * 100}%` }}
+                    aria-hidden
+                  />
+                </div>
+                <span className="tnum tiny faint">{h.count}</span>
+              </div>
+            ))}
+          </div>
+          <p className="tiny faint" style={{ marginTop: '0.75rem' }}>
+            Intervals expand with each pass: {INTERVAL_DAYS.join(', ')} days, then every{' '}
+            {INTERVAL_DAYS[INTERVAL_DAYS.length - 1]}.
+          </p>
+        </section>
+      )}
+
+      {due.length > 0 && (
+        <section>
+          <h2 className="section-title">Due for another pass</h2>
+          <div className="stack">
+            {due.slice(0, 10).map((x) => (
+              <Link key={x.id} href={x.href} className="list-row">
+                <div className="list-row-head">
+                  <span>{x.title}</span>
                   <span className="tiny faint tnum">
-                    {s.solid} / {s.understood} / {s.total}
+                    {passLabel(x.record.reads)} · due {relativeDays(dueAt(x.record))}
                   </span>
                 </div>
-                <div className="progress-track" style={{ marginTop: '0.5rem' }}>
-                  <div className="progress-fill" style={{ width: `${s.percent}%` }} />
+              </Link>
+            ))}
+          </div>
+          {due.length > 10 && (
+            <p className="tiny faint">and {due.length - 10} more.</p>
+          )}
+        </section>
+      )}
+
+      <section>
+        <h2 className="section-title">By level</h2>
+        <div className="stack">
+          {levels.map((level) => {
+            const lessons = byLevel.get(level.index) ?? [];
+            const s = levelStanding(lessons, lessonRecords);
+            return (
+              <Link key={level.index} href={`/levels/${level.index}/`} className="list-row">
+                <div className="list-row-head">
+                  <span>
+                    <span className="nav-num">{level.index}</span> {level.name}
+                  </span>
+                  <span className="tiny faint tnum">
+                    {s.read}/{s.total} read
+                    {s.revisited > 0 && ` · ${s.revisited} revisited`}
+                    {s.due > 0 && ` · ${s.due} due`}
+                  </span>
+                </div>
+                <div className="progress-track" style={{ marginTop: '0.4rem' }}>
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${s.total ? (s.read / s.total) * 100 : 0}%` }}
+                  />
                 </div>
               </Link>
             );
           })}
         </div>
-        <p className="tiny faint" style={{ marginTop: '0.75rem' }}>
-          Read as applied / understood / total.
-        </p>
       </section>
 
       <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          What the levels mean
-        </h2>
-        <div className="table-scroll">
-          <table className="block-table">
-            <thead>
-              <tr>
-                <th style={{ width: '3rem' }}>Level</th>
-                <th style={{ width: '9rem' }}>Name</th>
-                <th>Evidence required</th>
-              </tr>
-            </thead>
-            <tbody>
-              {LEVEL_MEANING.map((m) => (
-                <tr key={m.level}>
-                  <td className="mono tnum">{m.level}</td>
-                  <td>{m.name}</td>
-                  <td className="muted">{m.evidence}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="small muted" style={{ marginTop: '0.75rem' }}>
-          Understanding decays: a concept at level 2 drops back to level 1 after {DECAY_DAYS} days
-          without reinforcement. Levels 3 and 4 do not decay, because doing something is stickier
-          than reading about it.
+        <h2 className="section-title">Your data</h2>
+        <p className="muted">
+          Everything above lives in this browser and nowhere else. It is not sent anywhere, and
+          clearing site data deletes it — so export it if you care about it.
         </p>
-      </section>
-
-      {decayed.length > 0 && (
-        <section>
-          <h2 className="section-title" style={{ marginTop: 0 }}>
-            Decayed since you last used them
-          </h2>
-          <div className="chip-row">
-            {decayed.map(([id]) => {
-              const c = CONCEPT_BY_ID[id];
-              if (!c) return null;
-              return (
-                <Link key={id} href={`/concepts/${id}`} className="chip chip-warn">
-                  {c.name}
-                </Link>
-              );
-            })}
-          </div>
-          <p className="small muted" style={{ marginTop: '0.75rem' }}>
-            <Link href="/next">The recommender</Link> surfaces these first.
-          </p>
-        </section>
-      )}
-
-      <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          Your data
-        </h2>
-        <p className="small muted" style={{ maxWidth: '42rem' }}>
-          Progress is stored in this browser only. There is no account and nothing is sent
-          anywhere. That also means it is lost if you clear site data or switch device, so export
-          it if you care about it.
-        </p>
-        <div className="row" style={{ marginTop: '1rem' }}>
+        <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap' }}>
           <button type="button" className="btn btn-sm" onClick={download}>
             Export
           </button>
           <button type="button" className="btn btn-sm" onClick={() => fileRef.current?.click()}>
             Import
           </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-danger"
+            onClick={() => {
+              if (window.confirm('Delete every recorded pass? This cannot be undone.')) reset();
+            }}
+          >
+            Reset
+          </button>
           <input
             ref={fileRef}
             type="file"
             accept="application/json"
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void onFile(f);
+            hidden
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const ok = importState(await file.text());
+              setImportError(ok ? null : 'That file was not recognised as saved progress.');
+              e.target.value = '';
             }}
           />
-          {!confirmReset ? (
-            <button type="button" className="btn btn-sm" onClick={() => setConfirmReset(true)}>
-              Reset everything
-            </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => {
-                  reset();
-                  setConfirmReset(false);
-                }}
-                style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
-              >
-                Yes, erase it
-              </button>
-              <button type="button" className="btn btn-sm" onClick={() => setConfirmReset(false)}>
-                Cancel
-              </button>
-            </>
-          )}
         </div>
-        {importMessage && (
-          <p className="small" style={{ marginTop: '0.75rem' }}>
-            {importMessage}
+        {importError && (
+          <p className="small" style={{ color: 'var(--danger)' }}>
+            {importError}
           </p>
         )}
       </section>
+    </div>
+  );
+}
+
+function Stat({ value, label, tone }: { value: number; label: string; tone?: 'warn' }) {
+  return (
+    <div className="stat">
+      <div className="stat-value tnum" style={tone ? { color: 'var(--warn)' } : undefined}>
+        {value}
+      </div>
+      <div className="stat-label">{label}</div>
     </div>
   );
 }

@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { z } from 'zod';
-import type { CaseStudy, Failure, Lesson, Pattern } from './types';
+import type { CaseStudy, Failure, Lesson, LessonIndexEntry, Pattern } from './types';
 
 const CONTENT_ROOT = path.join(process.cwd(), 'content');
 
@@ -201,6 +201,24 @@ export function getCaseStudy(id: string): CaseStudy | undefined {
 
 export function getFailure(id: string): Failure | undefined {
   return loadAllFailures().find((f) => f.id === id);
+}
+
+/**
+ * Compact, client-safe lesson metadata for components that need the whole curriculum -
+ * the sidebar, the dashboard, the revision list. Bodies are excluded: they are the large part
+ * and nothing on the client renders them.
+ */
+export function lessonIndex(): LessonIndexEntry[] {
+  return loadAllLessons()
+    .map((l) => ({
+      id: l.id,
+      title: l.title,
+      level: l.level,
+      module: l.module,
+      minutes: l.minutes,
+      concepts: l.concepts,
+    }))
+    .sort((a, b) => a.level - b.level || a.title.localeCompare(b.title));
 }
 
 export function lessonsForModule(moduleId: string): Lesson[] {

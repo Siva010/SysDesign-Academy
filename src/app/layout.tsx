@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import './components.css';
 import { Sidebar } from '@/components/Sidebar';
+import { lessonIndex } from '@/lib/content-node';
 import { TopBar } from '@/components/TopBar';
 import { ProgressProvider } from '@/lib/progress';
 
@@ -53,7 +54,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             Skip to content
           </a>
           <div className="shell">
-            <Sidebar />
+            <Sidebar index={lessonIndex()} />
             <div className="shell-main">
               <TopBar />
               <main id="main" className="content">

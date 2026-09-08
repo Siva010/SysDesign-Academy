@@ -5,7 +5,7 @@ import { LevelProgress } from '@/components/LevelProgress';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { LEVELS, LEVEL_BY_INDEX, modulesForLevel } from '@/content/curriculum';
 import { LEVEL_CONCEPTS } from '@/content/level-concepts';
-import { lessonsForModule, loadAllCaseStudies } from '@/lib/content-node';
+import { lessonIndex, lessonsForModule, loadAllCaseStudies } from '@/lib/content-node';
 
 export function generateStaticParams() {
   return LEVELS.map((l) => ({ level: String(l.index) }));
@@ -47,7 +47,7 @@ export default async function LevelPage({ params }: { params: Promise<{ level: s
           <dd className="muted">{level.breaksBecause}</dd>
         </dl>
 
-        <LevelProgress concepts={concepts} />
+        <LevelProgress lessons={lessonIndex().filter((l) => l.level === level.index)} />
       </div>
 
       <section>

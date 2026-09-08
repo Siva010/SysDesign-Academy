@@ -1,37 +1,44 @@
 'use client';
 
-import { summarise, useProgress } from '@/lib/progress';
+import type { LessonIndexEntry } from '@/lib/types';
+import { useProgress } from '@/lib/progress';
+import { levelStanding } from '@/lib/lesson-index';
 
 /**
- * Progress for a set of concepts.
+ * How far through a level the learner is, in lessons rather than in inferred understanding.
  *
- * Shows three numbers rather than one, because a single percentage hides the distinction
- * that matters: having read about something is not the same as having used it.
+ * The bar fills on lessons read at least once. Revisits are reported as a separate number
+ * instead of pushing the bar past full, because "read all of them once" and "been round them
+ * twice" are different states and averaging them into one percentage hides which one you are in.
  */
-export function LevelProgress({ concepts }: { concepts: string[] }) {
-  const { state, ready } = useProgress();
+export function LevelProgress({ lessons }: { lessons: LessonIndexEntry[] }) {
+  const { recordsOf, ready } = useProgress();
 
-  if (!ready || concepts.length === 0) {
+  if (!ready || lessons.length === 0) {
     return <div style={{ minWidth: '9rem' }} aria-hidden />;
   }
 
-  const s = summarise(state, concepts);
+  const s = levelStanding(lessons, recordsOf('lesson'));
 
-  if (s.seen === 0) {
+  if (s.read === 0) {
     return (
       <div style={{ minWidth: '9rem', textAlign: 'right' }}>
-        <span className="tiny faint">{concepts.length} concepts</span>
+        <span className="tiny faint">{s.total} lessons</span>
       </div>
     );
   }
 
+  const percent = Math.round((s.read / s.total) * 100);
+
   return (
     <div style={{ minWidth: '9rem', textAlign: 'right' }}>
       <div className="progress-track" style={{ marginBottom: 4 }}>
-        <div className="progress-fill" style={{ width: `${s.percent}%` }} />
+        <div className="progress-fill" style={{ width: `${percent}%` }} />
       </div>
       <span className="tiny faint tnum">
-        {s.solid} applied · {s.understood} understood · {s.total} total
+        {s.read} of {s.total} read
+        {s.revisited > 0 && ` · ${s.revisited} revisited`}
+        {s.due > 0 && ` · ${s.due} due`}
       </span>
     </div>
   );

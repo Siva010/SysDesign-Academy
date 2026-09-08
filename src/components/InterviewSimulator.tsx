@@ -27,7 +27,7 @@ interface Turn {
  * makes practising against this useful rather than merely a quiz.
  */
 export function InterviewSimulator() {
-  const { recordAnswer, recordInterview } = useProgress();
+  const { recordInterview } = useProgress();
   const [scenario, setScenario] = useState<Scenario | null>(null);
   const [phaseId, setPhaseId] = useState<string | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -84,11 +84,6 @@ export function InterviewSimulator() {
     setScores(nextScores);
 
     if (choice.concepts && choice.concepts.length > 0) {
-      recordAnswer(
-        choice.concepts,
-        choice.quality === 'strong' ? 'full' : choice.quality === 'adequate' ? 'partial' : 'none',
-        'interview',
-      );
     }
 
     /* adaptive routing */

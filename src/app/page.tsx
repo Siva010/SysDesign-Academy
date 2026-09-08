@@ -4,14 +4,17 @@ import { CONCEPTS } from '@/content/concepts';
 import { DECISIONS } from '@/content/decisions';
 import { LEVEL_CONCEPTS } from '@/content/level-concepts';
 import {
+  lessonIndex,
   loadAllCaseStudies,
   loadAllFailures,
   loadAllLessons,
   loadAllPatterns,
 } from '@/lib/content-node';
+import { lessonsByLevel } from '@/lib/lesson-index';
 import { LevelProgress } from '@/components/LevelProgress';
 
 export default function HomePage() {
+  const byLevel = lessonsByLevel(lessonIndex());
   const lessons = loadAllLessons();
   const patterns = loadAllPatterns();
   const caseStudies = loadAllCaseStudies();
@@ -67,7 +70,7 @@ export default function HomePage() {
                     {level.constraint}
                   </p>
                 </div>
-                <LevelProgress concepts={LEVEL_CONCEPTS[level.index] ?? []} />
+                <LevelProgress lessons={byLevel.get(level.index) ?? []} />
               </div>
             </Link>
           ))}

@@ -21,7 +21,7 @@ functional:
 | Interview method | Complete reference page |
 | Interview simulator | 4 scenarios, branching, with a scored debrief |
 | Assessment types | 7 of the 9 in the taxonomy, 14 worked instances across 9 levels |
-| Progress and mastery | Evidence-based, decaying, per-concept |
+| Progress | Manual reading passes on an expanding revision interval |
 | Recommender | Explains every recommendation |
 | Sources and evidence page | 60+ sources with tiers and scope |
 | Glossary, myths | Derived from the concept graph |

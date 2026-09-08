@@ -67,7 +67,7 @@ export default async function CaseStudyPage({ params }: { params: Promise<{ id: 
           <Mdx source={study.body} />
         </div>
 
-        <CaseStudyFooter id={study.id} concepts={study.concepts} title={study.title} />
+        <CaseStudyFooter id={study.id} />
       </article>
 
       <aside className="rail">

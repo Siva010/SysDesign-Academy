@@ -2,9 +2,9 @@
 
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
-import { CONCEPT_BY_ID, transitivePrerequisites } from '@/content/concepts';
-import { CONCEPT_LEVEL } from '@/content/level-concepts';
-import { DECAY_DAYS, useProgress } from '@/lib/progress';
+import { CONCEPT_BY_ID } from '@/content/concepts';
+import { useProgress } from '@/lib/progress';
+import { type PassRecord, dueAt, passLabel, relativeDays, statusOf, urgency } from '@/lib/passes';
 
 export interface LessonLite {
   id: string;
@@ -14,6 +14,7 @@ export interface LessonLite {
   minutes: number;
   concepts: string[];
   prerequisites: string[];
+  /** Position in curriculum order. */
   sequence: number;
 }
 
@@ -24,228 +25,211 @@ export interface Goal {
   targets: string[];
 }
 
-interface Recommendation {
-  kind: 'unblock' | 'refresh' | 'goal' | 'sequence';
-  lesson?: LessonLite;
-  conceptId?: string;
-  /** Always shown. The brief requires the recommendation to explain itself. */
+interface Suggestion {
+  lesson: LessonLite;
   reason: string;
+  record?: PassRecord;
 }
 
-const KIND_LABEL: Record<Recommendation['kind'], string> = {
-  unblock: 'Missing prerequisite',
-  refresh: 'Needs reinforcement',
-  goal: 'On the path to your goal',
-  sequence: 'Next in order',
-};
-
+/**
+ * What to read next.
+ *
+ * Three lists, in the order a learner actually needs them: what has come back round, what comes
+ * next, and what a stated goal pulls forward. Every entry says why it is there, because a
+ * recommender that cannot explain itself is a shuffled table of contents.
+ *
+ * The revision list is first deliberately. Under the previous model, revisiting was something
+ * the software decided had happened to you when a number decayed. Here it is the main event, and
+ * it only contains things you told it you had read.
+ */
 export function NextSteps({ lessons, goals }: { lessons: LessonLite[]; goals: Goal[] }) {
-  const { state, mastery, setGoal, ready } = useProgress();
-  const [showAll, setShowAll] = useState(false);
+  const { recordsOf, ready } = useProgress();
+  const [goalId, setGoalId] = useState<string | null>(null);
+  const records = recordsOf('lesson');
 
-  const recommendations = useMemo<Recommendation[]>(() => {
+  /** Concept id to the lessons teaching it, for the prerequisite note. */
+  const teaches = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const l of lessons) {
+      for (const c of l.concepts) {
+        const list = m.get(c);
+        if (list) list.push(l.id);
+        else m.set(c, [l.id]);
+      }
+    }
+    return m;
+  }, [lessons]);
+
+  const due: Suggestion[] = useMemo(() => {
     if (!ready) return [];
+    return lessons
+      .flatMap((lesson) => {
+        const record = records[lesson.id];
+        if (!record) return [];
+        const status = statusOf(record);
+        if (status !== 'due' && status !== 'overdue') return [];
+        return [
+          {
+            lesson,
+            record,
+            reason: `${passLabel(record.reads)}, due ${relativeDays(dueAt(record))}.`,
+          },
+        ];
+      })
+      .sort((a, b) => urgency(b.record!) - urgency(a.record!))
+      .slice(0, 5);
+  }, [lessons, records, ready]);
 
-    const out: Recommendation[] = [];
-    const seenLessons = new Set<string>();
+  const unread = useMemo(
+    () => (ready ? lessons.filter((l) => !records[l.id]) : []),
+    [lessons, records, ready],
+  );
 
-    const push = (r: Recommendation) => {
-      if (r.lesson) {
-        if (seenLessons.has(r.lesson.id)) return;
-        seenLessons.add(r.lesson.id);
-      }
-      out.push(r);
-    };
+  /** Prerequisite concepts with no read lesson behind them. A note, not a gate. */
+  const missingFor = (lesson: LessonLite) =>
+    lesson.prerequisites.filter((p) => {
+      const t = teaches.get(p) ?? [];
+      return t.length > 0 && !t.some((id) => records[id]);
+    });
 
-    const attempted = new Set(
-      Object.entries(state.concepts)
-        .filter(([, p]) => p.attempts > 0)
-        .map(([id]) => id),
-    );
-
-    /* 1. prerequisites blocking something already attempted */
-    for (const conceptId of attempted) {
-      if (mastery(conceptId) >= 3) continue;
-      for (const req of transitivePrerequisites(conceptId)) {
-        if (mastery(req) >= 2) continue;
-        const lesson = lessons.find((l) => l.concepts.includes(req));
-        const blocked = CONCEPT_BY_ID[conceptId];
-        const missing = CONCEPT_BY_ID[req];
-        if (!blocked || !missing) continue;
-        push({
-          kind: 'unblock',
-          lesson,
-          conceptId: req,
-          reason: `You have worked on ${blocked.name} but not ${missing.name}, which it depends on. This is usually why an explanation feels arbitrary rather than inevitable.`,
-        });
-      }
-    }
-
-    /* 2. understood but decayed */
-    for (const [conceptId, p] of Object.entries(state.concepts)) {
-      if (p.mastery !== 2) continue;
-      if (mastery(conceptId) >= 2) continue;
-      const c = CONCEPT_BY_ID[conceptId];
-      if (!c) continue;
-      const lesson = lessons.find((l) => l.concepts.includes(conceptId));
-      push({
-        kind: 'refresh',
+  const upNext: Suggestion[] = useMemo(() => {
+    return unread.slice(0, 3).map((lesson) => {
+      const missing = missingFor(lesson);
+      return {
         lesson,
-        conceptId,
-        reason: `You understood ${c.name} more than ${DECAY_DAYS} days ago and have not used it since. Reinforcing it now costs less than relearning it later.`,
-      });
-    }
-
-    /* 3. shortest path to the stated goal */
-    const goal = goals.find((g) => g.id === state.goal);
-    if (goal) {
-      for (const target of goal.targets) {
-        if (mastery(target) >= 2) continue;
-        const chain = [...transitivePrerequisites(target), target].filter((c) => mastery(c) < 2);
-        const first = chain[0];
-        if (!first) continue;
-        const c = CONCEPT_BY_ID[first];
-        const t = CONCEPT_BY_ID[target];
-        if (!c || !t) continue;
-        const lesson = lessons.find((l) => l.concepts.includes(first));
-        push({
-          kind: 'goal',
-          lesson,
-          conceptId: first,
-          reason:
-            first === target
-              ? `You chose the goal "${goal.label}", and ${t.name} is directly on that path.`
-              : `You chose the goal "${goal.label}", which needs ${t.name}. ${c.name} is the first thing missing on the way there.`,
-        });
-      }
-    }
-
-    /* 4. simply the next unread lesson in curriculum order */
-    const nextUnread = lessons
-      .slice()
-      .sort((a, b) => a.sequence - b.sequence)
-      .find((l) => !state.lessonsRead[l.id]);
-    if (nextUnread) {
-      push({
-        kind: 'sequence',
-        lesson: nextUnread,
         reason:
-          'The next lesson in curriculum order. Each level is built so the previous one has already made its limits obvious.',
-      });
-    }
+          missing.length === 0
+            ? 'Next in the curriculum, and you have read what it builds on.'
+            : `Next in the curriculum. It leans on ${missing
+                .slice(0, 2)
+                .map((m) => CONCEPT_BY_ID[m]?.name ?? m)
+                .join(' and ')}, which you have not read about yet.`,
+      };
+    });
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [unread, records]);
 
-    return out;
-  }, [ready, state, mastery, lessons, goals]);
+  const goal = goals.find((g) => g.id === goalId);
 
-  const visible = showAll ? recommendations : recommendations.slice(0, 6);
+  const forGoal: Suggestion[] = useMemo(() => {
+    if (!goal) return [];
+    const wanted = new Set(goal.targets);
+    return unread
+      .map((lesson) => ({
+        lesson,
+        hits: lesson.concepts.filter((c) => wanted.has(c)).length,
+      }))
+      .filter((x) => x.hits > 0)
+      .sort((a, b) => b.hits - a.hits || a.lesson.sequence - b.lesson.sequence)
+      .slice(0, 4)
+      .map(({ lesson, hits }) => ({
+        lesson,
+        reason: `Teaches ${hits} of the ${goal.targets.length} ideas this goal is about.`,
+      }));
+  }, [goal, unread]);
 
-  if (!ready) {
-    return <p className="muted">Reading your progress…</p>;
-  }
+  if (!ready) return <div style={{ minHeight: '20rem' }} aria-hidden />;
 
-  const hasProgress = Object.keys(state.concepts).length > 0;
+  const nothingRead = Object.keys(records).length === 0;
 
   return (
-    <div className="stack" style={{ gap: '2rem' }}>
+    <div className="stack">
+      {nothingRead ? (
+        <section>
+          <h2 className="section-title">Start here</h2>
+          <p className="muted">
+            Nothing is recorded yet. Read a lesson, then mark it at the bottom of the page — that
+            is the only thing this application knows about you, and it is the thing that brings a
+            lesson back round later.
+          </p>
+          {lessons[0] && <SuggestionCard s={{ lesson: lessons[0], reason: 'The first lesson.' }} />}
+        </section>
+      ) : (
+        <section>
+          <h2 className="section-title">Due for another pass</h2>
+          {due.length === 0 ? (
+            <p className="muted">
+              Nothing is due. Everything you have read is still resting — the intervals are 3, 10,
+              30, 90 and 180 days, expanding with each pass.
+            </p>
+          ) : (
+            <div className="stack">
+              {due.map((s) => (
+                <SuggestionCard key={s.lesson.id} s={s} />
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Suppressed on a fresh start, where "Start here" is already showing the same lesson. */}
+      {!nothingRead && upNext.length > 0 && (
+        <section>
+          <h2 className="section-title">Carry on</h2>
+          <div className="stack">
+            {upNext.map((s) => (
+              <SuggestionCard key={s.lesson.id} s={s} />
+            ))}
+          </div>
+        </section>
+      )}
+
       <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          What are you preparing for?
-        </h2>
-        <p className="muted small">
-          This changes the ordering, not the content. Everything stays available.
+        <h2 className="section-title">Reorder for a goal</h2>
+        <p className="muted">
+          A goal changes the order and hides nothing. Each one names the ideas someone with that
+          goal is most often missing.
         </p>
-        <div className="card-grid">
+        <div className="row" style={{ flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
           {goals.map((g) => (
             <button
               key={g.id}
               type="button"
-              className={`card level-card${state.goal === g.id ? ' option-active' : ''}`}
-              style={{ textAlign: 'left', font: 'inherit', cursor: 'pointer' }}
-              onClick={() => setGoal(state.goal === g.id ? undefined : g.id)}
-              aria-pressed={state.goal === g.id}
+              className={`btn btn-sm${goalId === g.id ? ' btn-primary' : ''}`}
+              aria-pressed={goalId === g.id}
+              onClick={() => setGoalId(goalId === g.id ? null : g.id)}
             >
-              <strong>{g.label}</strong>
-              <p className="small muted" style={{ margin: '0.35rem 0 0' }}>
-                {g.description}
-              </p>
+              {g.label}
             </button>
           ))}
         </div>
-      </section>
-
-      <section>
-        <h2 className="section-title" style={{ marginTop: 0 }}>
-          Recommended next
-        </h2>
-
-        {!hasProgress && (
-          <div className="callout callout-info">
-            <p style={{ marginBottom: 0 }}>
-              You have not read anything yet, so there is nothing to reason from. Start at Level 0
-              and this page becomes useful once it has evidence to work with — recommendations
-              based on nothing are just a table of contents.
-            </p>
-          </div>
-        )}
-
-        <div className="stack">
-          {visible.map((r, i) => {
-            const concept = r.conceptId ? CONCEPT_BY_ID[r.conceptId] : undefined;
-            return (
-              <div key={`${r.kind}-${r.lesson?.id ?? r.conceptId}-${i}`} className="card">
-                <div className="row" style={{ justifyContent: 'space-between' }}>
-                  <span className="chip chip-accent">{KIND_LABEL[r.kind]}</span>
-                  {r.lesson && (
-                    <span className="tiny faint">
-                      Level {r.lesson.level} · {r.lesson.minutes} min
-                    </span>
-                  )}
-                </div>
-                <h3 style={{ margin: '0.5rem 0 0.25rem', fontSize: 'var(--text-md)' }}>
-                  {r.lesson ? (
-                    <Link href={`/lessons/${r.lesson.id}`}>{r.lesson.title}</Link>
-                  ) : concept ? (
-                    <Link href={`/concepts/${concept.id}`}>{concept.name}</Link>
-                  ) : (
-                    'Unknown'
-                  )}
-                </h3>
-                {r.lesson && (
-                  <p className="small muted" style={{ margin: '0 0 0.5rem' }}>
-                    {r.lesson.summary}
-                  </p>
-                )}
-                {!r.lesson && concept && (
-                  <p className="small muted" style={{ margin: '0 0 0.5rem' }}>
-                    {concept.oneLiner}{' '}
-                    <span className="faint">
-                      No lesson covers this yet
-                      {typeof CONCEPT_LEVEL[concept.id] === 'number'
-                        ? ` (it belongs to Level ${CONCEPT_LEVEL[concept.id]})`
-                        : ''}
-                      ; the concept page has the graph and the trade-offs.
-                    </span>
-                  </p>
-                )}
-                <p className="small" style={{ margin: 0 }}>
-                  <strong>Why:</strong> {r.reason}
-                </p>
+        {goal && (
+          <>
+            <p className="small muted">{goal.description}</p>
+            {forGoal.length === 0 ? (
+              <p className="muted">
+                You have read every lesson that teaches these. The revision list above is the
+                useful thing now.
+              </p>
+            ) : (
+              <div className="stack">
+                {forGoal.map((s) => (
+                  <SuggestionCard key={s.lesson.id} s={s} />
+                ))}
               </div>
-            );
-          })}
-        </div>
-
-        {recommendations.length > 6 && (
-          <button
-            type="button"
-            className="btn btn-sm"
-            style={{ marginTop: '1rem' }}
-            onClick={() => setShowAll(!showAll)}
-          >
-            {showAll ? 'Show fewer' : `Show all ${recommendations.length}`}
-          </button>
+            )}
+          </>
         )}
       </section>
     </div>
+  );
+}
+
+function SuggestionCard({ s }: { s: Suggestion }) {
+  const { lesson, reason, record } = s;
+  return (
+    <Link href={`/lessons/${lesson.id}/`} className="list-row">
+      <div className="list-row-head">
+        <span>{lesson.title}</span>
+        <span className="tiny faint tnum">
+          Level {lesson.level} · {lesson.minutes} min
+          {record ? ` · ${passLabel(record.reads).toLowerCase()}` : ''}
+        </span>
+      </div>
+      <div className="list-row-summary">{lesson.summary}</div>
+      <div className="tiny faint" style={{ marginTop: '0.35rem' }}>
+        {reason}
+      </div>
+    </Link>
   );
 }

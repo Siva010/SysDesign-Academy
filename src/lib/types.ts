@@ -7,6 +7,8 @@
 
 /* ------------------------------------------------------------------ evidence */
 
+import type { PassRecord } from './passes';
+
 export type SourceTier = 1 | 2 | 3 | 4;
 
 export interface Source {
@@ -130,6 +132,22 @@ export interface LessonMeta {
   status: 'stub' | 'draft' | 'reviewed';
   /** Set when a lesson deliberately exceeds the prerequisite budget. */
   prereqOverride?: string;
+}
+
+/**
+ * What a client component needs to reason about the whole curriculum.
+ *
+ * Lessons live in MDX and are loaded with the filesystem, so a browser bundle cannot read them.
+ * Rather than generating a committed index that can drift, server components pass this down -
+ * it is a few kilobytes and it cannot be stale by construction.
+ */
+export interface LessonIndexEntry {
+  id: string;
+  title: string;
+  level: number;
+  module: string;
+  minutes: number;
+  concepts: string[];
 }
 
 export interface Lesson extends LessonMeta {
@@ -319,14 +337,6 @@ export interface Symptom {
 
 /* ------------------------------------------------------------------ progress */
 
-export type MasteryLevel = 0 | 1 | 2 | 3 | 4;
-
-export interface ConceptProgress {
-  mastery: MasteryLevel;
-  lastReinforced: number;
-  attempts: number;
-  correct: number;
-}
 
 export interface InterviewResult {
   scenarioId: string;
@@ -335,11 +345,14 @@ export interface InterviewResult {
   turns: number;
 }
 
+/**
+ * Everything the application knows about a learner: which things they have read, how many
+ * times, and when. Skill is not stored because it is not observed - see lib/passes.
+ */
 export interface ProgressState {
-  version: 1;
-  lessonsRead: Record<string, number>;
-  concepts: Record<string, ConceptProgress>;
-  caseStudiesCompleted: Record<string, number>;
+  version: 2;
+  lessons: Record<string, PassRecord>;
+  caseStudies: Record<string, PassRecord>;
   interviews: InterviewResult[];
   goal?: string;
 }

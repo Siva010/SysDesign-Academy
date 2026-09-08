@@ -1,7 +1,13 @@
-# Assessment and Mastery Taxonomy
+# Assessment Taxonomy
 
-Clicking "complete" is not evidence of anything (§35). Mastery is inferred from what the
-learner can *do*.
+Checks exist to make the learner commit to an answer before reading one. They are self-tests:
+nothing they record leaves the page, and no score is derived from them.
+
+That is a change. An earlier version inferred a per-concept mastery level from check answers and
+displayed it as progress. It was deleted because the number was the software's opinion, formed
+by rules the learner could not see, and a multiple-choice answer is thin evidence for a claim as
+large as "you understand this". What the application records now is what it can actually observe:
+that you said you read something. See `docs/10-progress-model.md`.
 
 ## Question types
 
@@ -37,28 +43,24 @@ Never "correct / incorrect". Every response returns three parts:
 2. **Why it works or fails** - mechanism, not verdict.
 3. **What a stronger candidate would add** - the next level of the same answer.
 
-## Mastery model
+## What checks do not do
 
-Per concept, mastery is a 0-4 level that decays over time:
+Checks do not feed progress, unlock anything, or gate a lesson. A wrong answer costs nothing but
+the information it gives you, which is the point: an assessment that changes a score is one people
+answer strategically, and this curriculum is read by the person being assessed.
 
-| Level | Meaning | Evidence required |
-|---|---|---|
-| 0 | Unseen | none |
-| 1 | Encountered | Lesson read |
-| 2 | Understood | Reasoning checks passed |
-| 3 | Applied | Correct use inside an unfamiliar exercise |
-| 4 | Transferred | Correct use in a case study or interview sim not tied to the lesson |
+The one place a check should change behaviour is the schedule, and that is left to the learner.
+If a check goes badly, the control at the end of the lesson brings the next pass **sooner**. That
+decision is theirs to make and reverse, rather than something inferred on their behalf.
 
-Only levels 3-4 count toward the level completion gate. Level 2 decays after 60 days without
-reinforcement, which drives spaced re-surfacing in "what to learn next".
+## Progress
 
-## Recommendation engine (§34)
+Progress is a count of reading passes with an expanding revision interval, described in
+`docs/10-progress-model.md`. The recommender at `/next` ranks:
 
-Next-step ranking, in order:
+1. What is due for another pass, most overdue first, measured in intervals rather than days.
+2. The next unread lesson in curriculum order, noting any prerequisite you have not read.
+3. Lessons matching a stated goal, which reorders and hides nothing.
 
-1. Concepts with an unmet prerequisite blocking something the learner has attempted.
-2. Concepts at mastery 2 that have decayed.
-3. Concepts on the shortest path to the learner's stated goal, chosen at onboarding.
-4. The next lesson in curriculum order.
-
-Every recommendation states its reason: "because you understand X but are missing Y".
+Every recommendation states its reason, because a recommender that cannot explain itself is a
+shuffled table of contents.

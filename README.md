@@ -192,8 +192,11 @@ which is worth stating as data rather than as prose.
 page says so. It escalates when answers are strong and returns to fundamentals when they are
 weak, then produces a per-dimension report.
 
-**Mastery is evidence-based.** Reading a lesson reaches level 1. Levels 3 and 4 require using a
-concept where it was not being taught. Level 2 decays after 60 days without reinforcement.
+**Progress is a count of reading passes, marked by hand.** There is no inferred skill level: the
+application records that you said you read something, and brings it back at expanding intervals
+(3, 10, 30, 90, 180 days). Each pass names what it is for — the first is a straight read, the
+second goes to the trade-offs you skimmed, the third asks you to reconstruct the argument from the
+headings before reading it. See `docs/10-progress-model.md`.
 
 **Estimators are presets, not prose.** `<Estimator preset="traffic" />` renders adjustable
 assumptions and derived values, with the decisive rows highlighted and an interpretation section
