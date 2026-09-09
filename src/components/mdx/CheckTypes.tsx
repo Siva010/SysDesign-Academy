@@ -281,9 +281,10 @@ export function CompleteCheck({
 /**
  * Transfer: a system the learner has never seen.
  *
- * This is the only assessment that can justify mastery level 4, so it is recorded with the
- * case-study context rather than the exercise context. The question is never "how would you
- * build this" — it is "which problem that you already know is this one wearing new nouns".
+ * The hardest of the check types, and the closest thing here to evidence that an idea has
+ * actually generalised. It records nothing - no check does - because what a learner concludes
+ * from getting it wrong is better information than a number. The question is never "how would
+ * you build this" — it is "which problem that you already know is this one wearing new nouns".
  */
 export function TransferCheck({
   system,

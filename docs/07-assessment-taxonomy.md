@@ -29,9 +29,9 @@ it, or an unfamiliar system. The material is the exercise; the options only capt
 
 Two details are deliberate. `DebugCheck` reveals observations on request and reports how many were
 used, because choosing which evidence to ask for is part of diagnosis and an incident charges you
-minutes for each one. `TransferCheck` records against the case-study context rather than the
-exercise context, because generalising to an unseen system is the only evidence that justifies
-mastery level 4.
+minutes for each one. `TransferCheck` asks the learner to recognise a
+familiar problem in an unfamiliar system, which is the only one of these that tests whether an
+idea has generalised rather than whether it was remembered.
 
 Recall and definition questions are not used. If a fact matters, it lives in the glossary.
 

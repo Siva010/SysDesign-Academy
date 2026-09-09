@@ -145,12 +145,12 @@ export default function HomePage() {
             </p>
           </div>
           <div className="card">
-            <strong>Mastery is not a completion checkbox</strong>
+            <strong>Progress is what you did, not what we guessed</strong>
             <p className="small muted" style={{ margin: '0.4rem 0 0' }}>
-              Reading a lesson counts as &ldquo;encountered&rdquo;. Reaching
-              &ldquo;applied&rdquo; requires using the idea somewhere it was not taught, and
-              understanding decays if you never reinforce it.{' '}
-              <Link href="/progress">See how your progress is measured</Link>.
+              You mark a lesson read; nothing infers a skill level from how you answered a
+              question. Each pass has a different job, and things come back on an expanding
+              interval so a second read lands when it is worth something.{' '}
+              <Link href="/progress">See how progress works</Link>.
             </p>
           </div>
         </div>
