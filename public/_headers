@@ -55,3 +55,14 @@
 
 /site.webmanifest
   Cache-Control: public, max-age=86400
+
+/social-card.png
+  Cache-Control: public, max-age=86400
+
+# Rebuilt every deploy and read by crawlers rather than browsers, so a short life with
+# revalidation matches how they are actually fetched.
+/sitemap.xml
+  Cache-Control: public, max-age=3600, must-revalidate
+
+/robots.txt
+  Cache-Control: public, max-age=3600, must-revalidate

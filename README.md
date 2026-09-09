@@ -19,8 +19,11 @@ Other commands:
 npm run build             # static export to out/
 npm run preview           # serve out/ exactly as a static host will
 npm run typecheck         # tsc --noEmit
+npm test                  # unit tests for the pass schedule and stored progress
 npm run validate:content  # content invariants; fails the build on a broken reference
+npm run coverage          # where the curriculum is thin: signatures, levels, sources
 npm run untaught          # concepts with no lesson yet, grouped by level
+npm run icons             # regenerate favicons and the social card from src/app/icon.svg
 ```
 
 ## Deploying

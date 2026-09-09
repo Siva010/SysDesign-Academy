@@ -1,5 +1,5 @@
 /**
- * Rasterises the site mark into the formats browsers still ask for.
+ * Rasterises the site mark into the formats browsers and link previews ask for.
  *
  * The single source of truth is src/app/icon.svg — the vector Next.js links directly. Everything
  * else here is derived from it, so the mark is edited in exactly one place. Two derivations:
@@ -9,6 +9,11 @@
  *   - a full-bleed square for iOS and Android, which apply their own mask. Handing them a
  *     rounded rectangle gets it rounded twice, so the corners are squared off and the mark is
  *     pulled in slightly to survive the mask.
+ *
+ *   - a 1200x630 social card, because a link pasted into a chat with no preview is a link
+ *     people scroll past. Its text is rendered by the SVG rasteriser using system fonts, so it
+ *     wants Georgia and Helvetica present - which is why the output is committed rather than
+ *     generated during a build that might run anywhere.
  *
  * Not part of `npm run build`: the outputs are committed. Rerun it only when the mark changes.
  * Needs sharp, which arrives with Next.js.
@@ -91,6 +96,32 @@ const render = (svg, size) =>
     .png({ compressionLevel: 9 })
     .toBuffer();
 
+
+/**
+ * The social card. Deliberately typographic rather than a screenshot: a screenshot of a text-heavy
+ * site reduced to a thumbnail is illegible, and reads as clutter next to a title people can
+ * already see.
+ */
+function socialCard(markSvg) {
+  /* Reuse the mark itself, scaled and positioned, so the card cannot drift from the favicon. */
+  const inner = markSvg
+    .replace(/^[\s\S]*?<rect[^>]*\/>/, '')
+    .replace('</svg>', '')
+    .replace(/<title>.*?<\/title>/, '');
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#17181a"/>
+  <!-- The mark carries the right half at a size where its edges are actually visible, and
+       balances a text block that is otherwise all in the left third. -->
+  <g transform="translate(830 196) scale(7.4)" opacity="0.9">${inner}</g>
+  <text x="88" y="286" font-family="Georgia, 'Times New Roman', serif" font-size="74" fill="#e7e8ea">System Design</text>
+  <text x="88" y="368" font-family="Georgia, 'Times New Roman', serif" font-size="74" fill="#e7e8ea">Academy</text>
+  <rect x="90" y="412" width="120" height="2" fill="#86aee8"/>
+  <text x="88" y="470" font-family="Helvetica, Arial, sans-serif" font-size="27" fill="#a2a8b0">Mental models, trade-offs, failure modes,</text>
+  <text x="88" y="506" font-family="Helvetica, Arial, sans-serif" font-size="27" fill="#a2a8b0">and the judgment to choose between them.</text>
+</svg>`;
+}
+
 async function main() {
   const svg = await readFile(SOURCE, 'utf8');
   const square = fullBleed(svg);
@@ -105,6 +136,13 @@ async function main() {
     await writeFile(path, await render(square, size));
     console.log(`${path}  ${size}px`);
   }
+
+  const card = socialCard(svg);
+  await writeFile(
+    'public/social-card.png',
+    await sharp(Buffer.from(card), { density: 96 }).png({ compressionLevel: 9 }).toBuffer(),
+  );
+  console.log('public/social-card.png  1200x630');
 }
 
 main().catch((err) => {

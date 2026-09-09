@@ -17,83 +17,32 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { InterviewResult, ProgressState } from './types';
 import { type Pace, type PassRecord, recordPass, undoPass } from './passes';
+import {
+  EMPTY,
+  LEGACY_STORAGE_KEY,
+  STORAGE_KEY,
+  parseImported,
+  parseStored,
+} from './progress-migrate';
 
-const KEY = 'sda.progress.v2';
-const LEGACY_KEY = 'sda.progress.v1';
-
-const EMPTY: ProgressState = {
-  version: 2,
-  lessons: {},
-  caseStudies: {},
-  interviews: [],
-};
-
-/** Shape of the model this replaced, kept only so existing progress survives the change. */
-interface LegacyState {
-  version: 1;
-  lessonsRead?: Record<string, number>;
-  caseStudiesCompleted?: Record<string, number>;
-  interviews?: InterviewResult[];
-  goal?: string;
-}
-
-/**
- * A timestamp under the old model meant "read once, then". That maps exactly onto one pass,
- * which is the whole migration. The old per-concept mastery is discarded rather than converted:
- * it was derived from check answers, there is no honest reading of it as a number of passes,
- * and inventing one would reintroduce the guessing this change exists to remove.
- */
-function migrate(legacy: LegacyState): ProgressState {
-  const asPasses = (src: Record<string, number> = {}): Record<string, PassRecord> => {
-    const out: Record<string, PassRecord> = {};
-    for (const [id, at] of Object.entries(src)) {
-      if (typeof at === 'number' && at > 0) out[id] = { reads: 1, lastRead: at, firstRead: at };
-    }
-    return out;
-  };
-  return {
-    version: 2,
-    lessons: asPasses(legacy.lessonsRead),
-    caseStudies: asPasses(legacy.caseStudiesCompleted),
-    interviews: legacy.interviews ?? [],
-    ...(legacy.goal ? { goal: legacy.goal } : {}),
-  };
-}
-
-function read(): ProgressState {
-  if (typeof window === 'undefined') return EMPTY;
+/** Reading is delegated so that the parsing and migration rules can be tested without React. */
+function read(): { state: ProgressState; migrated: boolean } {
+  if (typeof window === 'undefined') return { state: EMPTY, migrated: false };
   try {
-    const raw = window.localStorage.getItem(KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<ProgressState>;
-      if (parsed.version !== 2) return EMPTY;
-      return {
-        ...EMPTY,
-        ...parsed,
-        lessons: parsed.lessons ?? {},
-        caseStudies: parsed.caseStudies ?? {},
-        interviews: parsed.interviews ?? [],
-      };
-    }
-    const old = window.localStorage.getItem(LEGACY_KEY);
-    if (old) {
-      const parsed = JSON.parse(old) as LegacyState;
-      if (parsed.version === 1) {
-        const migrated = migrate(parsed);
-        write(migrated);
-        return migrated;
-      }
-    }
+    return parseStored(
+      window.localStorage.getItem(STORAGE_KEY),
+      window.localStorage.getItem(LEGACY_STORAGE_KEY),
+    );
   } catch {
-    /* unreadable or blocked: start empty rather than failing to render */
+    /* storage access itself can throw when site data is blocked */
+    return { state: EMPTY, migrated: false };
   }
-  return EMPTY;
 }
 
 function write(state: ProgressState) {
   if (typeof window === 'undefined') return;
   try {
-    window.localStorage.setItem(KEY, JSON.stringify(state));
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch {
     /* storage blocked or full: progress is a convenience, not a requirement */
   }
@@ -128,7 +77,9 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    setState(read());
+    const { state: stored, migrated } = read();
+    setState(stored);
+    if (migrated) write(stored);
     setReady(true);
   }, []);
 
@@ -188,20 +139,10 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
       exportState: () => JSON.stringify(state, null, 2),
 
       importState: (json) => {
-        try {
-          const parsed = JSON.parse(json) as ProgressState | LegacyState;
-          if (parsed.version === 1) {
-            update(() => migrate(parsed as LegacyState));
-            return true;
-          }
-          if (parsed.version === 2) {
-            update(() => ({ ...EMPTY, ...(parsed as ProgressState) }));
-            return true;
-          }
-          return false;
-        } catch {
-          return false;
-        }
+        const parsed = parseImported(json);
+        if (!parsed) return false;
+        update(() => parsed);
+        return true;
       },
     }),
     [state, ready, update],
