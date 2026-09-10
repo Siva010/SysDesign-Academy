@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { extractHeadings } from '@/components/mdx';
+import { ReadingAids } from '@/components/ReadingAids';
+import { ReadingContents } from '@/components/ReadingContents';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { getSource } from '@/content/sources';
 import { getFailure, loadAllFailures } from '@/lib/content-node';
@@ -40,6 +42,8 @@ export default async function FailurePage({ params }: { params: Promise<{ id: st
           </p>
         </header>
 
+        <ReadingAids kind="failure" id={failure.id} headings={headings} />
+        <ReadingContents headings={headings} />
         <div className="prose">
           <Mdx source={failure.body} />
         </div>

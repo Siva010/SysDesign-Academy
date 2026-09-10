@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { extractHeadings } from '@/components/mdx';
+import { ReadingAids } from '@/components/ReadingAids';
+import { ReadingContents } from '@/components/ReadingContents';
 import { LessonFooter } from '@/components/LessonFooter';
 import { PrerequisiteCheck } from '@/components/PrerequisiteCheck';
 import { CONCEPT_BY_ID } from '@/content/concepts';
@@ -104,6 +106,8 @@ export default async function LessonPage({ params }: { params: Promise<{ id: str
           index={lessonIndex()}
         />
 
+        <ReadingAids kind="lesson" id={lesson.id} headings={headings} />
+        <ReadingContents headings={headings} />
         <div className="prose">
           <Mdx source={lesson.body} />
         </div>

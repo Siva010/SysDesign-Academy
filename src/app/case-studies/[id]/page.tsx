@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { extractHeadings } from '@/components/mdx';
+import { ReadingAids } from '@/components/ReadingAids';
+import { ReadingContents } from '@/components/ReadingContents';
 import { CaseStudyFooter } from '@/components/CaseStudyFooter';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { SIGNATURE_LABEL } from '@/content/signatures';
@@ -63,6 +65,8 @@ export default async function CaseStudyPage({ params }: { params: Promise<{ id: 
           </p>
         </div>
 
+        <ReadingAids kind="case-study" id={study.id} headings={headings} />
+        <ReadingContents headings={headings} />
         <div className="prose">
           <Mdx source={study.body} />
         </div>

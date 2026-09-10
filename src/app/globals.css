@@ -12,7 +12,9 @@
   /* type */
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
     sans-serif;
-  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Charter, Georgia, Cambria,
+  /* Palatino Linotype was the Windows default here. At reading sizes its small x-height reads
+     worse than Georgia, which was drawn for screens. See docs/11-reading-design.md. */
+  --font-serif: 'Iowan Old Style', Charter, 'Bitstream Charter', Georgia, Cambria,
     'Times New Roman', serif;
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Mono', Menlo, Consolas,
     'Liberation Mono', monospace;
@@ -37,6 +39,13 @@
   --s8: 4rem;
 
   --measure: 68ch;
+  /* The reading column. 35.5rem is 68 characters per line at 19px Georgia, the middle of the
+     55-75 range readers find easiest. rem rather than ch so the header, body and footer share
+     one edge and the column scales with the reader's text size. Figures may be wider. */
+  --measure-reading: 35.5rem;
+  --measure-wide: 46rem;
+  --prose-size: 1.1875rem;
+  --prose-leading: 1.6;
   --radius: 4px;
   --sidebar-w: 17rem;
   --rail-w: 15rem;
@@ -45,9 +54,9 @@
   --bg: #fbfbf9;
   --surface: #ffffff;
   --surface-2: #f4f4f1;
-  --text: #17181a;
-  --muted: #575c63;
-  --faint: #868c94;
+  --text: #1f2124;
+  --muted: #52575e;
+  --faint: #6b7079;
   --line: #e2e2dd;
   --line-strong: #cfcfc9;
 
@@ -73,9 +82,9 @@
   --bg: #121316;
   --surface: #17191d;
   --surface-2: #1e2126;
-  --text: #e7e8ea;
-  --muted: #a2a8b0;
-  --faint: #767d87;
+  --text: #d6d8dc;
+  --muted: #a0a6ae;
+  --faint: #8a919b;
   --line: #292c32;
   --line-strong: #3a3e46;
 
@@ -95,16 +104,46 @@
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
 }
 
+/* Paper: a warm, lower-glare theme for long sessions. Every text colour stays above 4.5:1 on
+   every surface it is used on. */
+:root[data-theme='paper'] {
+  color-scheme: light;
+
+  --bg: #f4ecdb;
+  --surface: #f8f2e6;
+  --surface-2: #ece2cd;
+  --text: #352b20;
+  --muted: #5d5145;
+  --faint: #6f6255;
+  --line: #e0d4bb;
+  --line-strong: #cdbd9f;
+
+  --accent: #6e4118;
+  --accent-text: #6e4118;
+  --accent-bg: #efe2c8;
+
+  --ok: #3d6a2c;
+  --ok-bg: #e5e8cf;
+  --warn: #744e00;
+  --warn-bg: #f1e1bf;
+  --danger: #8e3a1f;
+  --danger-bg: #f2dccd;
+  --info: #6e4118;
+  --info-bg: #efe2c8;
+
+  --shadow: 0 1px 2px rgba(60, 40, 20, 0.08);
+}
+
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) {
+  :root:not([data-theme='light']):not([data-theme='paper']) {
     color-scheme: dark;
 
     --bg: #121316;
     --surface: #17191d;
     --surface-2: #1e2126;
-    --text: #e7e8ea;
-    --muted: #a2a8b0;
-    --faint: #767d87;
+    --text: #d6d8dc;
+    --muted: #a0a6ae;
+    --faint: #8a919b;
     --line: #292c32;
     --line-strong: #3a3e46;
 
@@ -268,11 +307,17 @@ table {
 /* with a right rail */
 .with-rail {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--rail-w);
+  grid-template-columns: minmax(0, var(--measure-wide)) var(--rail-w);
   gap: var(--s7);
-  max-width: 62rem;
+  max-width: calc(var(--measure-wide) + var(--rail-w) + var(--s7));
   margin: 0 auto;
   align-items: start;
+}
+
+/* On reading pages, everything in the article except the body keeps to the reading measure so
+   the title, body and footer share one left edge. */
+.with-rail:has(.prose) > article > :not(.prose) {
+  max-width: var(--measure-reading);
 }
 
 .rail {
@@ -366,9 +411,29 @@ table {
 
 .prose {
   font-family: var(--font-serif);
-  font-size: var(--text-lg);
-  line-height: 1.68;
+  font-size: var(--prose-size);
+  line-height: var(--prose-leading);
   color: var(--text);
+}
+
+/* Text blocks keep to the reading measure; figures, tables and code may use the wider one. */
+.prose > * {
+  max-width: var(--measure-reading);
+}
+
+.prose > :is(.diagram, .table-scroll, table, pre, figure, .tradeoff, .block-table) {
+  max-width: var(--measure-wide);
+}
+
+/* A gap clearly larger than the space between lines, so paragraphs read as separate units.
+   margin-block only, so the centring rules can own the inline margins. */
+.prose p {
+  margin-block: 0 1.15em;
+  text-wrap: pretty;
+}
+
+.prose li {
+  text-wrap: pretty;
 }
 
 .prose h2 {
@@ -962,20 +1027,187 @@ details > summary:hover {
   color: var(--faint);
 }
 
+/* ------------------------------------------------------------------ reading aids
+
+   Staying oriented, and out of the way, across a long read. docs/11-reading-design.md has the
+   measurements and evidence behind each of these. */
+
+.prose :is(h2, h3, h4),
+.page-title {
+  text-wrap: balance;
+}
+
+.reading-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.reading-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  opacity: 0.75;
+  transform-origin: 0 50%;
+  transform: scaleX(var(--p, 0));
+}
+
+/* The current section in the contents: the text darkens and a bar sits on the rail's rule. */
+.rail-list a[aria-current='location'] {
+  color: var(--text);
+  position: relative;
+}
+
+.rail-list a[aria-current='location']::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--s4) - 1px);
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  background: var(--accent);
+}
+
+/* Contents for when the rail is not shown: narrower screens, and focus mode. */
+.reading-contents {
+  display: none;
+  margin: 0 0 var(--s5);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+}
+
+.reading-contents summary {
+  cursor: pointer;
+  padding: var(--s2) var(--s4);
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.reading-contents ol {
+  margin: 0;
+  padding: 0 var(--s4) var(--s3) calc(var(--s4) + 1.2em);
+}
+
+.reading-contents li {
+  margin-bottom: 3px;
+}
+
+.reading-contents a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.reading-contents a:hover,
+.reading-contents a[aria-current='location'] {
+  color: var(--text);
+}
+
+.reading-contents a[aria-current='location'] {
+  font-weight: 600;
+}
+
+.resume {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--s5);
+  padding: var(--s2) var(--s3) var(--s2) var(--s4);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.resume strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* The top bar gives its height back while reading and returns on the first upward scroll. */
+.topbar {
+  transition: transform 0.2s ease;
+}
+
+html[data-topbar='hidden'] .topbar {
+  transform: translateY(-100%);
+}
+
+.reading-toggle[aria-pressed='true'] {
+  color: var(--accent-text);
+  background: var(--accent-bg);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Focus mode, scoped to pages that have a reading column so it cannot strand anyone on an
+   index page without navigation. */
+html[data-focus='on'] .shell:has(.prose) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+html[data-focus='on'] .shell:has(.prose) :is(.sidebar, .rail) {
+  display: none;
+}
+
+html[data-focus='on'] .with-rail:has(.prose) {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: var(--measure-wide);
+}
+
+html[data-focus='on'] .with-rail:has(.prose) > article > :not(.prose),
+html[data-focus='on'] .with-rail .prose > * {
+  margin-inline: auto;
+}
+
+html[data-focus='on'] .shell:has(.prose) .reading-contents {
+  display: block;
+}
+
+@media (max-width: 1180px) {
+  .reading-contents {
+    display: block;
+  }
+}
+
+@media print {
+  .reading-progress,
+  .resume,
+  .reading-contents {
+    display: none !important;
+  }
+}
+
 /* ------------------------------------------------------------------ responsive */
 
 @media (max-width: 1180px) {
   .with-rail {
     grid-template-columns: minmax(0, 1fr);
+    max-width: var(--measure-wide);
   }
   .rail {
     display: none;
+  }
+  /* With no rail beside it, centre the reading column; wide figures extend both ways. */
+  .with-rail:has(.prose) > article > :not(.prose),
+  .with-rail .prose > * {
+    margin-inline: auto;
   }
 }
 
 @media (max-width: 900px) {
   :root {
     --measure: 100%;
+    --prose-size: 1.0625rem;
   }
   .shell {
     grid-template-columns: minmax(0, 1fr);
@@ -987,10 +1219,7 @@ details > summary:hover {
     border-bottom: 1px solid var(--line);
   }
   .content {
-    padding: var(--s5) var(--s4) var(--s7);
-  }
-  .prose {
-    font-size: var(--text-md);
+    padding: var(--s5) 1.25rem var(--s7);
   }
   .page-title {
     font-size: var(--text-2xl);

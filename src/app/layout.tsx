@@ -53,15 +53,18 @@ export const viewport: Viewport = {
 };
 
 /**
- * Applied before paint so the theme never flashes. Kept deliberately tiny and
+ * Applied before paint so neither the theme nor focus mode flashes. Kept deliberately tiny and
  * defensive: any storage error falls through to the system preference.
  */
 const themeScript = `
 (function () {
   try {
     var t = localStorage.getItem('sda.theme');
-    if (t === 'light' || t === 'dark') {
+    if (t === 'light' || t === 'dark' || t === 'paper') {
       document.documentElement.setAttribute('data-theme', t);
+    }
+    if (localStorage.getItem('sda.focus') === 'on') {
+      document.documentElement.setAttribute('data-focus', 'on');
     }
   } catch (e) {}
 })();

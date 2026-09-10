@@ -2,6 +2,8 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { extractHeadings } from '@/components/mdx';
+import { ReadingAids } from '@/components/ReadingAids';
+import { ReadingContents } from '@/components/ReadingContents';
 import { CONCEPT_BY_ID } from '@/content/concepts';
 import { getSource } from '@/content/sources';
 import { getPattern, loadAllPatterns } from '@/lib/content-node';
@@ -53,6 +55,8 @@ export default async function PatternPage({ params }: { params: Promise<{ id: st
           )}
         </header>
 
+        <ReadingAids kind="pattern" id={pattern.id} headings={headings} />
+        <ReadingContents headings={headings} />
         <div className="prose">
           <Mdx source={pattern.body} />
         </div>
