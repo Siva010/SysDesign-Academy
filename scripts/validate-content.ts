@@ -12,6 +12,7 @@ import { SOURCES, SOURCE_BY_ID } from '../src/content/sources';
 import { LEVELS, MODULES } from '../src/content/curriculum';
 import { SYMPTOMS } from '../src/content/symptoms';
 import { DECISIONS } from '../src/content/decisions';
+import { SCENARIOS } from '../src/content/interviews';
 import { PRIMITIVE_SIGNATURES } from '../src/lib/types';
 import {
   loadAllCaseStudies,
@@ -276,6 +277,107 @@ for (const d of DECISIONS) {
   }
   for (const s of d.sources) {
     if (!SOURCE_BY_ID[s]) err(`decision "${d.id}" cites unknown source "${s}"`);
+  }
+}
+
+/* ---------------------------------------------------------------- interviews
+
+   A scenario is a small state machine written by hand, and the failure modes are the ones
+   every hand-written state machine has: a route to a phase that was renamed, a phase nothing
+   reaches, a dimension the report promises and never scores. None of them throw - the
+   simulator just stops, or shows an empty row - so they need checking here. */
+
+for (const scenario of SCENARIOS) {
+  const where = `scenario "${scenario.id}"`;
+  const phaseIds = new Set(scenario.phases.map((p) => p.id));
+
+  if (phaseIds.size !== scenario.phases.length) err(`${where} has duplicate phase ids`);
+  if (!phaseIds.has(scenario.startPhase)) {
+    err(`${where} starts at "${scenario.startPhase}", which is not one of its phases`);
+  }
+  if (scenario.caseStudyId && !caseStudies.some((c) => c.id === scenario.caseStudyId)) {
+    err(`${where} points at unknown case study "${scenario.caseStudyId}"`);
+  }
+
+  const route = (target: string | undefined, label: string) => {
+    if (target && !phaseIds.has(target)) err(`${where} ${label} routes to unknown phase "${target}"`);
+  };
+
+  /* Reachability, so a phase written and then orphaned by a rename is not silently dead. */
+  const reached = new Set<string>([scenario.startPhase]);
+  const queue = [scenario.startPhase];
+  const byId = new Map(scenario.phases.map((p) => [p.id, p]));
+  while (queue.length) {
+    const phase = byId.get(queue.shift()!);
+    if (!phase) continue;
+    const targets = [
+      phase.next,
+      phase.nextIfStrong,
+      phase.nextIfWeak,
+      ...phase.choices.map((c) => c.next),
+    ];
+    for (const t of targets) {
+      if (t && phaseIds.has(t) && !reached.has(t)) {
+        reached.add(t);
+        queue.push(t);
+      }
+    }
+  }
+
+  const remediation = new Set(
+    scenario.phases.map((p) => p.nextIfWeak).filter((x): x is string => Boolean(x)),
+  );
+
+  const scored = new Set<string>();
+  for (const phase of scenario.phases) {
+    const at = `${where} phase "${phase.id}"`;
+    route(phase.next, 'next');
+    route(phase.nextIfStrong, 'nextIfStrong');
+    route(phase.nextIfWeak, 'nextIfWeak');
+
+    if (!reached.has(phase.id)) err(`${at} is unreachable from the start`);
+    if (phase.choices.length === 0) err(`${at} has no choices, so the scenario stops there`);
+
+    const choiceIds = new Set(phase.choices.map((c) => c.id));
+    if (choiceIds.size !== phase.choices.length) err(`${at} has duplicate choice ids`);
+
+    /* A phase with no weak option teaches nothing: the coaching only lands when a candidate
+       can actually pick the answer an interviewer sees most often.
+
+       Remediation phases are exempt. They are reached by nextIfWeak, which means the candidate
+       is already struggling, and the phase exists to walk them back to fundamentals rather than
+       to offer another way to be wrong. */
+    const qualities = new Set(phase.choices.map((c) => c.quality));
+    if (phase.kind !== 'wrap' && !remediation.has(phase.id) && !qualities.has('weak')) {
+      warn(`${at} offers no weak choice, so there is nothing to get wrong`);
+    }
+    if (!qualities.has('strong')) warn(`${at} offers no strong choice`);
+
+    for (const choice of phase.choices) {
+      const cAt = `${at} choice "${choice.id}"`;
+      route(choice.next, `choice "${choice.id}" next`);
+      for (const c of choice.concepts ?? []) {
+        if (!conceptIds.has(c)) err(`${cAt} references unknown concept "${c}"`);
+      }
+      if (!choice.coaching) err(`${cAt} has no coaching, which is the point of the exercise`);
+      for (const [dim, delta] of Object.entries(choice.scores)) {
+        scored.add(dim);
+        if (typeof delta !== 'number' || delta < -2 || delta > 2) {
+          err(`${cAt} scores ${dim} at ${delta}; the range is -2 to 2`);
+        }
+      }
+    }
+  }
+
+  /* The report renders exactly the dimensions in `assesses`, so a mismatch either prints an
+     empty row or hides a dimension the candidate was actually judged on. */
+  for (const dim of scenario.assesses) {
+    if (!scored.has(dim)) err(`${where} claims to assess "${dim}" but no choice scores it`);
+  }
+  for (const dim of scored) {
+    if (!scenario.assesses.includes(dim as (typeof scenario.assesses)[number])) {
+      err(`${where} scores "${dim}" but does not list it in assesses, so it never reaches the report`);
+    }
   }
 }
 

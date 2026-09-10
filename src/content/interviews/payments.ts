@@ -15,10 +15,11 @@ export const PAYMENTS: Scenario = {
     'requirements',
     'architecture',
     'data-modelling',
+    'reliability',
     'consistency',
     'failure-handling',
-    'reliability',
     'trade-offs',
+    'communication',
     'adaptability',
   ],
   startPhase: 'open',
@@ -181,8 +182,8 @@ export const PAYMENTS: Scenario = {
         {
           id: 'crash-weak',
           text: 'We would rely on the provider webhook to tell us the payment succeeded.',
-          quality: 'adequate',
-          scores: { 'failure-handling': 0, reliability: 0 },
+          quality: 'weak',
+          scores: { 'failure-handling': -1, reliability: -1 },
           reaction:
             'Webhooks can be delayed, duplicated, or lost. Is a webhook you have not received evidence of anything?',
           coaching:

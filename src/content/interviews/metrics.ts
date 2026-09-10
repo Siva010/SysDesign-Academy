@@ -24,6 +24,7 @@ export const METRICS: Scenario = {
     'reliability',
     'failure-handling',
     'trade-offs',
+    'communication',
     'adaptability',
   ],
   startPhase: 'open',

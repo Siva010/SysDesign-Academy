@@ -17,9 +17,11 @@ export const URL_SHORTENER: Scenario = {
     'architecture',
     'data-modelling',
     'scalability',
+    'reliability',
     'consistency',
     'failure-handling',
     'trade-offs',
+    'communication',
     'adaptability',
   ],
   startPhase: 'open',
@@ -220,6 +222,17 @@ export const URL_SHORTENER: Scenario = {
           coaching:
             'Random generation avoids enumeration and needs no coordination, which is a real advantage. The costs to name: a read-check per write, a race between check and insert that requires a unique constraint to close, and a collision rate that rises as the key space fills.',
           concepts: ['optimistic-concurrency', 'lost-update'],
+        },
+        {
+          id: 'id-autoincrement',
+          text: 'Use the database auto-increment primary key and put it straight in the URL. It is guaranteed unique and costs nothing to generate.',
+          quality: 'weak',
+          scores: { 'data-modelling': -1, 'trade-offs': -1, scalability: -1 },
+          reaction:
+            'So the third link ever created is at /3, and the ten thousandth is at /2s. What can someone do with that, and what happens when you want a second database?',
+          coaching:
+            'Exposing the primary key hands out two things you did not mean to give away. Anyone can walk the whole corpus by counting, which makes every private link public, and the number of links you have created becomes a business metric a competitor can read twice and diff. It also welds the identifier to one database’s sequence, so sharding later means either a global allocator or a rewrite. Encoding the counter is fine; exposing it raw is not.',
+          concepts: ['sharding', 'partition-key', 'coordination-cost'],
         },
       ],
     },
