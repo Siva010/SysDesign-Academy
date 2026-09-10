@@ -669,6 +669,20 @@ ol.tight li {
   margin: 0;
 }
 
+/* Label beside value left a phone 30 characters for the value. Stack them instead. */
+@media (max-width: 700px) {
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+  .kv dt {
+    margin-top: var(--s3);
+  }
+  .kv dt:first-child {
+    margin-top: 0;
+  }
+}
+
 .list-rows {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -705,8 +719,11 @@ ol.tight li {
 
 .list-row-summary {
   color: var(--muted);
-  font-size: var(--text-sm);
-  margin-top: 2px;
+  /* 14px rather than 13: these are read, not only scanned, and small grey text is the part of a
+     long session that tires first. */
+  font-size: 0.875rem;
+  max-width: 60ch;
+  margin-top: 3px;
 }
 
 .status-stub {
@@ -907,7 +924,7 @@ ol.tight li {
 .glossary dd {
   margin: 0;
   color: var(--muted);
-  font-size: var(--text-sm);
+  font-size: 0.875rem;
 }
 
 @media (max-width: 700px) {

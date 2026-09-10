@@ -35,7 +35,7 @@ export default async function LevelPage({ params }: { params: Promise<{ level: s
 
   return (
     <div className="content-wide">
-      <div style={{ maxWidth: '48rem' }}>
+      <div>
         <p className="eyebrow">Level {level.index}</p>
         <h1 className="page-title">{level.name}</h1>
 
@@ -114,7 +114,7 @@ export default async function LevelPage({ params }: { params: Promise<{ level: s
 
       <section>
         <h2 className="section-title">Concepts this level owns</h2>
-        <p className="muted small" style={{ maxWidth: '42rem' }}>
+        <p className="muted small">
           Progress for this level is measured against these. Each concept belongs to exactly one
           level, so percentages across levels are comparable.
         </p>

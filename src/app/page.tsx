@@ -27,7 +27,7 @@ export default function HomePage() {
 
   return (
     <div className="content-wide">
-      <div style={{ maxWidth: '46rem' }}>
+      <div>
         <p className="eyebrow">A system design curriculum</p>
         <h1 className="page-title" style={{ fontSize: '2.6rem', lineHeight: 1.15 }}>
           Learn to derive designs, not to memorise them.
@@ -55,7 +55,7 @@ export default function HomePage() {
 
       <section>
         <h2 className="section-title">The ladder</h2>
-        <p className="muted" style={{ maxWidth: '46rem' }}>
+        <p className="muted">
           Nine levels, each defined by the constraint that dominates it. Each one ends with a
           system that works, and then breaks in the way that motivates the next.
         </p>
@@ -126,7 +126,7 @@ export default function HomePage() {
 
       <section>
         <h2 className="section-title">How this is built</h2>
-        <div style={{ maxWidth: '46rem' }} className="stack">
+        <div className="stack">
           <div className="card">
             <strong>Claims carry their evidence</strong>
             <p className="small muted" style={{ margin: '0.4rem 0 0' }}>

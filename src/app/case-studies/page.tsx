@@ -71,7 +71,7 @@ export default function CaseStudiesPage() {
 
       <section>
         <h2 className="section-title">By primitive problem</h2>
-        <p className="muted small" style={{ maxWidth: '44rem' }}>
+        <p className="muted small">
           When you meet an unfamiliar prompt, the useful question is not &ldquo;which company
           does this look like?&rdquo; but &ldquo;which of these problems am I actually
           solving?&rdquo;

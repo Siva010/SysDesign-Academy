@@ -173,7 +173,7 @@ export default function MethodPage() {
 
       <section>
         <h2 className="section-title">Hidden requirements</h2>
-        <p className="muted" style={{ maxWidth: '46rem' }}>
+        <p className="muted">
           Most prompts are underspecified on purpose. The gap between the words and the real
           problem is what is being tested. Some categories are almost always hiding something:
         </p>
@@ -233,7 +233,7 @@ export default function MethodPage() {
 
       <section>
         <h2 className="section-title">Handling pressure</h2>
-        <p className="muted" style={{ maxWidth: '46rem' }}>
+        <p className="muted">
           Escalation is not an attack. It is how the interviewer finds the edge of your
           understanding, which is the entire purpose of the exercise. The correct instinct is
           always to <strong>evolve the design, not restart it</strong>.

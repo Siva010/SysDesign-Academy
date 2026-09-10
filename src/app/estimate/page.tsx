@@ -11,7 +11,7 @@ export const metadata: Metadata = {
 
 export default function EstimatePage() {
   return (
-    <div className="content-wide">
+    <div className="content-wide is-tool">
       <p className="eyebrow">Library</p>
       <h1 className="page-title">Estimation toolkit</h1>
       <p className="page-lede">
@@ -38,7 +38,7 @@ export default function EstimatePage() {
 
       <section>
         <h2 className="section-title">The four estimates that matter most</h2>
-        <p className="muted small" style={{ maxWidth: '44rem' }}>
+        <p className="muted small">
           Almost every design conversation needs some combination of these: how much traffic,
           how much data, how available, and how much of the load a cache actually absorbs.
         </p>
@@ -54,7 +54,7 @@ export default function EstimatePage() {
 
       <section>
         <h2 className="section-title">Numbers worth carrying in your head</h2>
-        <p className="muted small" style={{ maxWidth: '44rem' }}>
+        <p className="muted small">
           Not benchmarks. These are orders of magnitude and unit conversions, useful because they
           let you sanity-check a result without a calculator. Anything more precise than this is
           a measurement you should take, not a number you should memorise.

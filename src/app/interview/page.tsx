@@ -9,7 +9,7 @@ export const metadata: Metadata = {
 
 export default function InterviewPage() {
   return (
-    <div className="content-wide">
+    <div className="content-wide is-tool">
       <p className="eyebrow">Practice</p>
       <h1 className="page-title">Interview simulator</h1>
       <p className="page-lede">

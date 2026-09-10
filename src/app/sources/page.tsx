@@ -76,7 +76,7 @@ export default function SourcesPage() {
 
       <section>
         <h2 className="section-title">How claims are labelled</h2>
-        <p className="muted small" style={{ maxWidth: '44rem' }}>
+        <p className="muted small">
           Every non-obvious statement in a lesson carries one of six labels. The point is that you
           can always see how much weight a sentence is able to bear.
         </p>
@@ -153,7 +153,7 @@ export default function SourcesPage() {
         return (
           <section key={tier}>
             <h2 className="section-title">{TIER_TITLE[tier]}</h2>
-            <p className="muted small" style={{ maxWidth: '46rem' }}>
+            <p className="muted small">
               {TIER_DESC[tier]}
             </p>
             <div className="list-rows" style={{ marginTop: '1rem' }}>

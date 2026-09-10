@@ -168,6 +168,35 @@ hides once reading starts and focus mode removes the brand bar, but the lesson h
 summary and details — was kept, because it is the one thing a reader needs on arrival. Tightening
 it further is a judgement about that header rather than about spacing, and it has not been made.
 
+## Browsing pages
+
+The first pass covered the four page types where you read. The index, level, concept and library
+pages were measured separately afterwards, at the same two viewports, and had the same problem at
+a larger scale: they used a 74rem frame, so anything that was running text ran across all of it.
+
+| Property | Before | After |
+|---|---|---|
+| List summaries | **178–187** characters a line, 13px | **73**, 14px |
+| Glossary definitions | 142 | **72** |
+| Level page module questions | 150 | **74** |
+| Concept page paragraphs / lists | 128 / 101 | **76 / 73** |
+| Page ledes | 84 | **67**, the same as a lesson |
+| Title position against a lesson's | different frame, different edge | **identical** (337px at 1440 wide) |
+| Level page details on a phone | 30 characters, label beside value | **58**, label above value |
+
+- **One frame for every page.** Browsing pages put their content in the same 46rem column, at the
+  same left edge, as the reading pages, and centre it below 1180px as they do. Moving between a
+  level page and a lesson no longer moves the title or changes the width being tracked. The
+  estimator and the interview simulator have multi-column layouts and opt out with `.is-tool`.
+- **Running text capped at 60ch.** A `ch` cap follows the text's own size, so one rule serves 14px
+  summaries and 18px ledes alike. The first attempt used 68ch, expecting 75–80 characters, and
+  measured 83: `ch` is the width of a zero, which is wider than the average letter. 60ch measures
+  at 73.
+- **Summaries and glossary definitions from 13px to 14px.** They are read, not only scanned, and
+  small grey text is the part of a long session that tires first.
+- **Eleven hard-coded widths removed** from page components; the frame now does that job once.
+- **Card grids** show two columns instead of three, at the same 360px card width.
+
 ## Deliberately not done
 
 - **Justified text or automatic hyphenation**, for the reasons above.

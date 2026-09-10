@@ -301,9 +301,25 @@ table {
   margin: 0 auto;
 }
 
+/* Every page shares one frame. Browsing pages put their content in the same 46rem column, at
+   the same left edge, as the reading pages, so moving between a level page and a lesson does
+   not move the title or change the width the eye is tracking. The two tools with multi-column
+   layouts - the estimator and the interview simulator - opt out with .is-tool. */
 .content-wide {
-  max-width: 74rem;
+  max-width: calc(var(--measure-wide) + var(--rail-w) + var(--s7));
   margin: 0 auto;
+}
+
+.content-wide > * {
+  max-width: var(--measure-wide);
+}
+
+.content-wide.is-tool {
+  max-width: 74rem;
+}
+
+.content-wide.is-tool > * {
+  max-width: none;
 }
 
 /* with a right rail */
@@ -657,7 +673,7 @@ table {
   font-family: var(--font-serif);
   font-size: var(--text-lg);
   color: var(--muted);
-  max-width: var(--measure);
+  max-width: var(--measure-reading);
   margin: 0 0 var(--s6);
 }
 
@@ -1029,6 +1045,25 @@ details > summary:hover {
   color: var(--faint);
 }
 
+/* ------------------------------------------------------------------ browsing pages
+
+   Index, level, concept and library pages. They are scanned more than read, but whatever on them
+   is running text still has to sit at a readable length: list summaries used to run to 187
+   characters a line. See docs/11-reading-design.md, "Browsing pages". */
+
+/* Capped in ch so the cap follows the text's own size. Measured, 60ch is about 73 characters of
+   ordinary prose at 14-18px - the ch unit is the width of a zero, which is wider than the
+   average letter, so 68ch came out at 83. Page ledes are excluded: they keep the reading
+   measure, so a lede on an index page is the same width as the lede on a lesson. */
+.content-wide :is(p, li, dd):not(.page-lede),
+.with-rail:not(:has(.prose)) > article :is(p, li, dd):not(.page-lede) {
+  max-width: 60ch;
+}
+
+.section-title {
+  text-wrap: balance;
+}
+
 /* ------------------------------------------------------------------ reading aids
 
    Staying oriented, and out of the way, across a long read. docs/11-reading-design.md has the
@@ -1194,6 +1229,9 @@ html[data-focus='on'] .shell:has(.prose) .reading-contents {
 @media (max-width: 1180px) {
   .with-rail {
     grid-template-columns: minmax(0, 1fr);
+    max-width: var(--measure-wide);
+  }
+  .content-wide:not(.is-tool) {
     max-width: var(--measure-wide);
   }
   .rail {
