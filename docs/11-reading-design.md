@@ -68,7 +68,7 @@ pattern is to preserve or offer to restore it
 ### 1. A reading column, with figures allowed to be wider
 
 Text blocks — paragraphs, lists, headings, callouts, claims — are capped at
-`--measure-reading: 35.5rem`, which is 68 characters per line at 19px Georgia. Diagrams, tables,
+`--measure-reading: 35.5rem`, which is about 67 characters per line at 18px Literata. Diagrams, tables,
 code, the estimator and the what-breaks tables are allowed out to `--measure-wide: 46rem`, so a
 table does not have to squeeze into the text measure and a diagram gets the room it needs.
 
@@ -83,14 +83,26 @@ figures extend equally on both sides.
 
 | | Desktop | Mobile |
 |---|---|---|
-| Body size | 19px | 17px |
+| Body size | 18px | 17px |
 | Line height | 1.6 | 1.6 |
 | Paragraph gap | 1.15em (about 22px) | 1.15em |
-| Serif stack | Iowan Old Style → Charter → Georgia → Cambria | same |
+| Typeface | Literata, self-hosted; Georgia only while it loads | same |
 
-Palatino Linotype is removed from the stack. It was the Windows default, and at reading sizes its
-small x-height and calligraphic detail do more to slow reading than Georgia, which was designed
-for screens and has the larger x-height of the two (0.48 against 0.46, measured).
+The typeface is **Literata**, designed for Google Play Books specifically for long reading on
+screens ([TypeTogether](https://www.type-together.com/literata-3)). Before it, the face depended on
+the reader's operating system: Palatino Linotype on Windows, whose small x-height and calligraphic
+detail slow reading at body sizes, and Iowan Old Style on a Mac. Now every reader gets the same one.
+
+It is self-hosted from `src/app/fonts/` under the SIL Open Font License, so no reader's browser
+contacts a third party and no build depends on one being reachable. Only what the text uses is
+shipped: Latin, regular and italic, weights 400-700, 79 KB in all. Italic is included so emphasis is
+real italic rather than a slanted copy of the upright. While it loads, a fallback whose metrics are
+matched to it holds the layout still, so nothing jumps when it arrives.
+
+The body is **18px rather than 19px** because typefaces are compared by x-height, not by pixel
+size. Literata's x-height is 0.51 of its size against Georgia's 0.48, so 18px Literata shows the
+same lowercase height as the 19px Georgia it replaced (9.2px against 9.1px), and keeps the same
+column at about 67 characters.
 
 Headings use `text-wrap: balance` and paragraphs `text-wrap: pretty`, which prevent one-word last
 lines where the browser supports them and do nothing where it does not. Text is ragged-right, never
@@ -136,9 +148,9 @@ Measured in the browser after the change, on the same lesson and viewports.
 
 | Property | Before | After |
 |---|---|---|
-| Characters per line, desktop | 88 | **68** |
-| Rendered serif, Windows | Palatino Linotype | **Georgia** |
-| Body size / line height | 18px / 1.68 | **19px / 1.6** desktop, 17px / 1.6 mobile |
+| Characters per line, desktop | 88 | **67** |
+| Typeface | Palatino Linotype on Windows, Iowan on a Mac | **Literata on every system** |
+| Body size / line height | 18px / 1.68 | **18px / 1.6** desktop (x-height matched), 17px / 1.6 mobile |
 | Paragraph gap | 16px | **21.9px** |
 | `--faint` contrast, light / dark | 3.27 / 4.47 | **4.80 / 5.84** |
 | Body text contrast, dark | 15.2:1 | **13.0:1**, reducing halation |
@@ -156,8 +168,6 @@ hides once reading starts and focus mode removes the brand bar, but the lesson h
 summary and details — was kept, because it is the one thing a reader needs on arrival. Tightening
 it further is a judgement about that header rather than about spacing, and it has not been made.
 
-**The typeface.** Literata, below, remains a proposal pending a font download.
-
 ## Deliberately not done
 
 - **Justified text or automatic hyphenation**, for the reasons above.
@@ -166,6 +176,3 @@ it further is a judgement about that header rather than about spacing, and it ha
 - **Motion.** The top bar and progress line do not animate for readers who prefer reduced motion.
 - **A single-key focus shortcut.** Character-key shortcuts conflict with assistive technology
   unless they can be turned off (SC 2.1.4); a button is enough.
-- **A downloaded reading typeface.** Literata was designed for long reading on screens
-  ([TypeTogether](https://www.type-together.com/literata-3)) and would give every OS the same
-  face. It needs a font download, so it is proposed separately rather than done here.

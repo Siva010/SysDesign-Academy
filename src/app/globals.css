@@ -12,10 +12,11 @@
   /* type */
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
     sans-serif;
-  /* Palatino Linotype was the Windows default here. At reading sizes its small x-height reads
-     worse than Georgia, which was drawn for screens. See docs/11-reading-design.md. */
-  --font-serif: 'Iowan Old Style', Charter, 'Bitstream Charter', Georgia, Cambria,
-    'Times New Roman', serif;
+  /* Literata, self-hosted and drawn for long reading on screens, so every reader gets the same
+     face rather than whichever serif their OS ships. The rest of the stack shows only while it
+     loads or if it fails. See docs/11-reading-design.md. */
+  --font-serif: var(--font-literata, 'Iowan Old Style'), 'Iowan Old Style', Charter,
+    'Bitstream Charter', Georgia, Cambria, 'Times New Roman', serif;
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Mono', Menlo, Consolas,
     'Liberation Mono', monospace;
 
@@ -39,12 +40,13 @@
   --s8: 4rem;
 
   --measure: 68ch;
-  /* The reading column. 35.5rem is 68 characters per line at 19px Georgia, the middle of the
-     55-75 range readers find easiest. rem rather than ch so the header, body and footer share
+  /* The reading column. 35.5rem is about 67 characters per line at 18px Literata, the middle of
+     the 55-75 range readers find easiest. 18px because Literata's x-height is larger than
+     Georgia's: it matches the apparent size of the 19px Georgia this replaced. rem rather than ch so the header, body and footer share
      one edge and the column scales with the reader's text size. Figures may be wider. */
   --measure-reading: 35.5rem;
   --measure-wide: 46rem;
-  --prose-size: 1.1875rem;
+  --prose-size: 1.125rem;
   --prose-leading: 1.6;
   --radius: 4px;
   --sidebar-w: 17rem;

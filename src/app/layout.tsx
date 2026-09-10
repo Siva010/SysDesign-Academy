@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import localFont from 'next/font/local';
 import './globals.css';
 import './components.css';
 import { Sidebar } from '@/components/Sidebar';
@@ -6,6 +7,24 @@ import { lessonIndex } from '@/lib/content-node';
 import { TopBar } from '@/components/TopBar';
 import { ProgressProvider } from '@/lib/progress';
 import { SITE_DESCRIPTION, SITE_NAME, SITE_URL } from '@/lib/site';
+
+/**
+ * Literata, the reading face. Drawn for long reading on screens, and self-hosted from files in
+ * ./fonts so no reader's browser contacts a third party and no build depends on one.
+ *
+ * Latin only, regular and italic, weights 400-700: exactly what the text uses. The adjusted
+ * fallback is a metric-matched Times New Roman, so text does not jump when Literata arrives.
+ * See docs/11-reading-design.md; the licence is ./fonts/OFL.txt.
+ */
+const literata = localFont({
+  src: [
+    { path: './fonts/literata-latin.woff2', weight: '400 700', style: 'normal' },
+    { path: './fonts/literata-latin-italic.woff2', weight: '400 700', style: 'italic' },
+  ],
+  variable: '--font-literata',
+  display: 'swap',
+  adjustFontFallback: 'Times New Roman',
+});
 
 export const metadata: Metadata = {
   /* Makes every relative URL below absolute, which is what a crawler fetching a link preview
@@ -72,7 +91,7 @@ const themeScript = `
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className={literata.variable} suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
