@@ -366,32 +366,32 @@ by reprocessing rather than repaired in place.
 ## Check yourself
 
 <Check
-  concepts={['poison-message', 'dead-letter-queue']}
-  prompt="One message in a partition fails every time it is processed. What happens, and what should the consumer do?"
+  concepts={['consumer-group', 'partition-ordering']}
+  prompt="A topic has 16 partitions and a consumer group of 16 members. Lag is growing, so you add 8 more consumers to the group. What happens?"
   options={[
     {
       id: 'a',
-      text: 'Everything behind it in that partition stops. Retry a bounded number of times, then dead-letter it, advance the offset, and alert.',
-      implies: 'You understand that ordering and progress are in tension.',
-      why: 'The consumer cannot commit an offset past a message it has not handled without deciding to skip it, so the partition stalls. The bounded-retry-then-dead-letter policy converts an indefinite stall into one skipped record and one alert. The alert matters as much as the skip: a dead-letter destination nobody watches is silent data loss.',
+      text: 'Nothing useful. Each partition is read by at most one member of a group, so 8 consumers sit idle and throughput is unchanged.',
+      implies: 'You know that partition count is the ceiling on a group’s parallelism.',
+      why: 'The group can use at most 16 members, one per partition. The extra 8 receive no assignments; worse, joining triggers a rebalance that pauses consumption while partitions are reassigned, so lag briefly gets worse. The fix has to be either faster processing per message or more partitions — and more partitions changes which keys land where.',
       credit: 'full',
     },
     {
       id: 'b',
-      text: 'The message is redelivered later and other messages continue to be processed',
-      implies: 'You are describing a classic queue.',
-      why: 'That is exactly the behaviour of a queue that tracks per-message state, and it is a genuine advantage of queues. A log has one position per partition, so there is no way to move past one message while leaving it outstanding.',
+      text: 'Throughput rises by half, since there are now 24 consumers sharing the work',
+      implies: 'You are treating the log like a shared queue.',
+      why: 'A shared queue would behave this way, because any worker can take any message. A log hands each partition to one member of the group so that order within the partition is preserved, and that same rule caps the useful group size at the partition count.',
       credit: 'none',
     },
     {
       id: 'c',
-      text: 'Skip it immediately and continue',
-      implies: 'You are prioritising progress over the message.',
-      why: 'It keeps the partition moving and discards data on the first transient error — a downstream timeout, a brief unavailability. Most failures are transient, which is why the retry bound exists: retry enough to survive a blip, then stop.',
+      text: 'It helps only if the new consumers are in a different consumer group',
+      implies: 'You know that groups read independently.',
+      why: 'True that a second group reads everything independently, and it would process every message again rather than share the load, which doubles the work instead of dividing it. Useful for a new kind of consumer, not for catching up.',
       credit: 'partial',
     },
   ]}
-  stronger="A stronger answer distinguishes retryable from non-retryable failures rather than counting attempts alone. A malformed payload will never succeed and should be dead-lettered immediately; a downstream timeout should be retried with backoff. It also notes that the dead-letter destination needs an owner, an alert and a documented way to re-inject a message once the underlying bug is fixed — otherwise the mechanism is a place where data goes to be forgotten."
+  stronger="A stronger answer finds the actual bottleneck before touching capacity: is per-message processing slow, is one partition far behind the others, or is a downstream store the limit? It also treats the partition count as a decision made when the topic is created, sized for the parallelism the topic will need later, because raising it afterwards moves keys between partitions and disturbs the ordering that anything keyed on history relied on."
 />
 
 <Check

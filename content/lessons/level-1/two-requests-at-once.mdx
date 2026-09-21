@@ -7,7 +7,7 @@ order: 1
 summary: Read, decide, write. Between the read and the write, the world changed. Almost every correctness bug in a web application is this one.
 difficulty: core
 minutes: 28
-prerequisites: [index, correctness]
+prerequisites: [index, finding-things-again]
 concepts: [acid, atomicity, lost-update, locking, optimistic-concurrency, isolation-levels]
 unlocks: [mvcc, snapshot-isolation, write-skew, idempotency]
 sources: [postgres-docs, ddia, mysql-docs]
@@ -425,7 +425,7 @@ one request at a time cannot find it.
       credit: 'none',
     },
   ]}
-  stronger="A stronger answer gives the fix and ranks the options. Best: make the write itself do the arithmetic — an atomic increment, so the database never has to be told the new value. Next: a conditional update on the version read, retried on conflict, which is optimistic concurrency and works when the new value cannot be expressed as a delta. Last resort: SELECT FOR UPDATE, which is correct and holds a lock for the duration of the transaction. It also notes that raising the isolation level to repeatable read would turn the silent corruption into a visible error, which is an improvement even if you change nothing else."
+  stronger="A stronger answer gives the fix and ranks the options. Best: make the write itself do the arithmetic — an atomic increment, so the database never has to be told the new value. Next: a conditional update on the version read, retried on conflict, which is optimistic concurrency and works when the new value cannot be expressed as a delta. Last resort: SELECT FOR UPDATE, which is correct and holds a lock for the duration of the transaction. It also notes an engine-specific shortcut: on PostgreSQL, raising the isolation level to repeatable read makes the second writer fail with a serialization error instead of overwriting, which turns silent corruption into a visible, retryable error. InnoDB's repeatable read does not do this, which is the default-isolation lesson again."
 />
 
 ## Going deeper
@@ -440,7 +440,7 @@ one request at a time cannot find it.
     },
     { label: 'InnoDB locking and transaction behaviour', sourceId: 'mysql-docs' },
     {
-      label: 'Next: the same race when the two writes are in different systems',
+      label: 'The same race when the two writes are in different systems',
       href: '/concepts/dual-write',
     },
   ]}

@@ -109,6 +109,29 @@ Three questions to answer first, because each rules out an entire family of desi
 notification), **large-object** (images), **search-index**, **scheduling** (snapshot and
 compaction jobs), and an access-control problem that behaves like an authorization primitive.
 
+### The numbers
+
+The rubric asked for three estimates. Here they are, with the assumptions stated so they can be
+argued with.
+
+**Connections.** 200,000 concurrent editing sessions is 200,000 long-lived connections at peak. That
+is a stateful connection tier sized in sockets rather than requests: a few dozen machines with room
+to spare, and sized a second time for the reconnect surge when one of them restarts.
+
+**Edits.** Assume a quarter of open sessions are typing at any moment, and that clients batch
+keystrokes into about two operation messages a second. That is 50,000 × 2 = 100,000 operations a
+second at peak, across every region. Each must be ordered against the others on the same document
+and almost never against anything else. That conclusion shapes the design: operations are ordered
+in memory by the node that owns the document, and appended to its log in batches. A database row
+per keystroke would put 100,000 synchronous writes a second in front of every typist, for data
+whose natural shape is an append-only sequence.
+
+**Storage.** Assume an edited document receives about 2,000 operations a day at about 100 bytes
+each: 200 KB per document per day. Five million documents a day is about a terabyte of raw
+operation log daily, several hundred terabytes a year before a single image. Keeping full history
+forever at that rate is not a retention setting. It needs snapshots, compaction of old operations
+and tiering to cheap storage as part of the design.
+
 ### The load-bearing decisions
 
 **One authoritative session per document.** Concurrent edits require a single ordering point.

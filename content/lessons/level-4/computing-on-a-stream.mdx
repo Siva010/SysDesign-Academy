@@ -72,17 +72,18 @@ Orders in the 13:00 hour, with the counter emitted at different times.
 minutes, stamped inside the hour. The published number was 1.3% low, permanently, and nothing
 records that.
 
-**Emit at 14:10, event time, ten-minute watermark.** 4,871. Nearly complete, and every hourly
-figure is ten minutes late. Someone will ask why the dashboard lags.
+**Emit at 14:10, event time, ten-minute watermark.** 4,867: 55 of the 63 stragglers made it in
+time. Nearly complete, and every hourly figure is ten minutes late. Someone will ask why the
+dashboard lags.
 
-**Emit at 14:00 and revise.** 4,812 at 14:00, corrected to 4,871 by 14:20. Fast and eventually
+**Emit at 14:00 and revise.** 4,812 at 14:00, corrected to 4,875 by 14:20. Fast and eventually
 right — provided the dashboard, the alert on it, and anything downstream can handle a number that
 goes up after it was published.
 
-**Emit by processing time.** 4,790, counting whatever arrived between 13:00 and 14:00 by your
-clock, including 41 events that happened in the 12:00 hour and excluding 122 that happened in this
-one. Instant, never revised, and not reproducible: run it again on the same data and you get a
-different number.
+**Emit by processing time.** 4,853, counting whatever arrived between 13:00 and 14:00 by your
+clock: the 4,812 orders from this hour that had arrived, plus 41 stragglers from the 12:00 hour,
+and none of the 63 that arrived late. Instant, never revised, and not reproducible: run it again on
+the same data and you get a different number.
 
 Only the fourth is wrong in a way you cannot describe to a user. The first three are three
 positions on one dial, and the job is to choose a position deliberately and write down which.
@@ -120,8 +121,8 @@ default.
 **Allowing revision is a pipeline-wide commitment.** Emitting early and correcting later requires
 every downstream consumer to treat results as replaceable — which means aggregates must be
 **derived from keyed records rather than incremented**. An incremented counter cannot be corrected,
-because it no longer knows what it counted. This is the same rule that appears in the attribution
-case study, and it is the highest-leverage structural decision in the whole area.
+because it no longer knows what it counted. The real-time attribution case study in Level 7 is
+built around this rule, and it is the highest-leverage structural decision in the whole area.
 
 A <C id="stream-join" /> correlates two streams. It requires holding one side's events in state
 until the other side's arrive, so:
@@ -363,10 +364,10 @@ cheaper than intuition suggests.
         'Measure how many events arrive past the watermark, per source. Then the setting becomes a decision with a stated cost, and the product owner can participate in it.',
     },
     {
-      mistake: 'Claiming exactly-once processing without qualification.',
-      why: 'Framework guarantees cover atomic offset and state commits inside the framework. They say nothing about an email, a payment or a third-party call, which is where the duplicates users notice actually occur.',
+      mistake: 'Joining two streams as they are partitioned today.',
+      why: 'Events that must meet have to reach the same processor, which means both streams partitioned by the join key. A stream keyed for some other reason cannot be joined without repartitioning it — a full reshuffle of the high-volume side, discovered after the join window was agreed.',
       instead:
-        'Say exactly which effects are covered. For anything outside the boundary, use an idempotency key or an output keyed so that writing it twice is indistinguishable from writing it once.',
+        'Check the partitioning of both inputs before agreeing to the join. Key them by the join key at the producer where you can, and where you cannot, budget the repartition as part of the design rather than as a surprise.',
     },
   ]}
 />
@@ -439,6 +440,6 @@ cheaper than intuition suggests.
     { label: 'Compacted topics as a changelog for operator state', sourceId: 'kafka-docs' },
     { label: 'Why re-executable batch tasks are easy to reason about', sourceId: 'mapreduce' },
     { label: 'Idempotence as the practical answer to unreliable delivery', sourceId: 'aws-builders-library' },
-    { label: 'Next: what you actually promise a reader', href: '/lessons/what-you-promise-a-reader' },
+    { label: 'Next: Level 5, keeping it up when things fail', href: '/levels/5' },
   ]}
 />

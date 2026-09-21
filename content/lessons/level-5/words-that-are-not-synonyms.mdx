@@ -3,11 +3,11 @@ id: words-that-are-not-synonyms
 title: Words That Are Not Synonyms
 level: 5
 module: l5-targets
-order: 2
+order: 1
 summary: Available, durable, reliable, fault-tolerant, scalable, correct. Six properties, six mechanisms, and some are bought by giving up others.
 difficulty: core
 minutes: 24
-prerequisites: [how-reliable-is-reliable-enough]
+prerequisites: [copies-and-what-they-cost, what-you-promise-a-reader]
 concepts: [availability, durability, reliability, fault-tolerance, scalability, correctness]
 unlocks: [sla, slo, error-budget, rpo, rto, blast-radius, cap]
 sources: [sre-book, sre-workbook, ddia, gilbert-lynch, aws-well-architected, release-it]
@@ -246,12 +246,6 @@ When someone asks for reliability, four questions convert it into something you 
       mitigation: 'State scalability as cost per unit of load, and check it at a tenth of peak as well as at ten times.',
     },
     {
-      what: 'Availability measured in the wrong place',
-      symptom: 'Internal availability reads 99.99% while users report frequent failures.',
-      cause: 'Measurement happens behind the layer that is failing — a load balancer, a DNS record, a mobile network path — so failed requests are never counted.',
-      mitigation: 'Measure as close to the user as possible, and treat a request that never reached you as a failure rather than as absent data.',
-    },
-    {
       what: 'Redundancy that is not independent',
       symptom: 'Two replicas fail simultaneously, far more often than the multiplied probabilities suggest.',
       cause: 'They shared a rack, a power supply, a network path, a certificate, or a deployment.',
@@ -347,7 +341,7 @@ against a specific fault rather than added because it is generally associated wi
     },
     {
       mistake: 'Claiming fault tolerance without listing the faults.',
-      why: 'Tolerance is always relative to something. Systems that survive machine failure routinely fail on a bad configuration applied to every machine at once, and that fault was never on anyone list.',
+      why: 'Tolerance is always relative to something. Systems that survive machine failure routinely fail on a bad configuration applied to every machine at once, and that fault was never on anyone’s list.',
       instead:
         'Write the list, include correlated faults such as deploys and configuration, and test the ones you claim. A fault you have not caused deliberately is a fault you do not know you tolerate.',
     },
@@ -428,6 +422,6 @@ against a specific fault rather than added because it is generally associated wi
     { label: 'Choosing indicators and measuring them near the user', sourceId: 'sre-workbook' },
     { label: 'Availability versus consistency under partition', sourceId: 'gilbert-lynch' },
     { label: 'Synchronous and asynchronous replication, stated as a durability decision', sourceId: 'ddia' },
-    { label: 'Next: how one slow dependency becomes an outage', href: '/lessons/how-failures-spread' },
+    { label: 'Next: how reliable is reliable enough, as a number', href: '/lessons/how-reliable-is-reliable-enough' },
   ]}
 />

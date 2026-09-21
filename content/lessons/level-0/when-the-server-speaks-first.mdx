@@ -54,11 +54,13 @@ should not use the same mechanism.
 
 Assume 200,000 connected users and, on average, one relevant event per user per five minutes.
 
-**Poll every 4 seconds.** 50,000 requests per second, of which about 99.7% return nothing. Each
-carries request headers, authentication and a connection. Worst-case staleness: 4 seconds.
+**Poll every 4 seconds.** 50,000 requests per second. Each user polls 75 times per event, so
+about 98.7% of those requests return nothing, and each still carries headers, authentication and
+a connection. Worst-case staleness: 4 seconds.
 
-**Poll every 60 seconds.** 3,300 requests per second — sixteen times cheaper, and now the product
-feels broken for anything conversational. This is the dial, and it only has these two ends.
+**Poll every 60 seconds.** 3,300 requests per second — fifteen times cheaper, and now the product
+feels broken for anything conversational. Polling has one dial, freshness against request
+volume, and these are its two ends.
 
 **Long polling.** The client asks and the server *holds the request open* until there is something
 to say or a timeout expires. Delivery is immediate, wasted requests disappear, and the cost moves:
@@ -394,6 +396,6 @@ reconnection, as a primary architectural concern rather than a tuning detail.
       sourceId: 'discord-eng',
       note: 'Read for the shape of the problem rather than for specific numbers.',
     },
-    { label: 'Next: what one machine can actually do', href: '/levels/1' },
+    { label: 'Next: how a name becomes a machine, and why that is slow to change', href: '/lessons/names-addresses-and-routes' },
   ]}
 />

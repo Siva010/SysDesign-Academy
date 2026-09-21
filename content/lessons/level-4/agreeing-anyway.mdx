@@ -166,8 +166,9 @@ rather than the protocol.
 because it is almost always left implicit. Raft and Paxos assume nodes fail by **crashing or being
 unreachable** — they stop, or their messages are delayed or lost. They do not assume a node
 sends different answers to different peers, forges a message, or lies about what it stored. That
-is a Byzantine failure, and tolerating it requires different protocols and a larger quorum: three
-faulty nodes out of four is survivable for crash faults and not for Byzantine ones.
+is a Byzantine failure, and tolerating it requires different protocols and more nodes for the same
+protection. To survive f faulty nodes, crash tolerance needs 2f + 1 of them and Byzantine tolerance
+needs 3f + 1, so five nodes survive two crashes but only one liar.
 
 The reason this curriculum does not pursue it is a judgment about threat model rather than about
 difficulty. Inside one organisation's infrastructure, with authenticated links and machines you

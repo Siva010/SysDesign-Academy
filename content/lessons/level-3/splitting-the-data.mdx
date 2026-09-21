@@ -97,9 +97,9 @@ ring positions per physical node — smooth the distribution further and make re
 incremental.
 
 <Callout kind="warn" title="Consistent hashing is not a hot-key solution">
-It distributes *distinct* keys evenly and limits redistribution cost. A single popular key
-still lands on a single node. That is a different problem with different answers: replicate it,
-cache it near the reader, or split it.
+Level 2 made this point for caches, and it holds for partitions too. Consistent hashing spreads
+*distinct* keys evenly and limits redistribution cost; a single popular key still lands on a
+single node, and still needs replicating toward readers or splitting.
 </Callout>
 
 Two things get harder immediately:
@@ -194,8 +194,8 @@ one key spread data while another keeps related rows together and ordered.
     {
       scale: '500 partitions',
       behaviour:
-        'Each partition is provisioned for 1/500 of the load, so a hot key is a much larger multiple of what its node expects.',
-      firstToBreak: 'The hottest partition, and the operational cost of managing that many units.',
+        'Five hundred units to monitor, rebalance and upgrade, each sized for a five-hundredth of the load, so the busiest of them sets the pace for the whole system.',
+      firstToBreak: 'The hottest partition, as Level 2 predicted, and the operational cost of managing that many units.',
     },
     {
       scale: 'Changing the key',
@@ -371,33 +371,19 @@ someone asks why the obvious query is slow.
   stronger="A stronger answer proposes a composite key — customer ID as the partition key, order date as the clustering column — so a customer's orders live together and are already in date order. It then notes what that costs: lookup by order ID alone now needs a secondary lookup, and a very large customer becomes a hot partition."
 />
 
-<Check
-  concepts={['sharding', 'resharding', 'hot-partition']}
-  prompt="You partition an events table by hour. Ingest is 200,000 events per second across 720 partitions covering the last 30 days. Why is throughput no better than a single machine?"
-  options={[
-    {
-      id: 'a',
-      text: 'The partitions are too small',
-      implies: 'You are looking at partition sizing.',
-      why: 'Size is not the issue. The problem is which partition is receiving traffic, and how many of them are receiving any at all.',
-      credit: 'none',
-    },
-    {
-      id: 'b',
-      text: 'Every write has the current hour, so all 200,000 per second land on one partition while 719 are idle',
-      implies: 'You spotted that a monotonic key concentrates writes regardless of partition count.',
-      why: 'Time-based partitioning under an append workload gives you exactly one active partition at any moment. The other 719 hold history and receive nothing, so your write throughput is single-machine throughput with extra operational complexity.',
-      credit: 'full',
-    },
-    {
-      id: 'c',
-      text: 'The router is not distributing requests properly',
-      implies: 'You suspect the routing layer.',
-      why: 'The router is doing precisely what it was told. It routes by hour, and every current write has the same hour. The defect is in the key, not the mechanism.',
-      credit: 'none',
-    },
+<EstimateCheck
+  concepts={['consistent-hashing', 'resharding', 'virtual-nodes']}
+  prompt="A cache cluster of 10 nodes places each key with hash(key) mod 10. You add an eleventh node and switch to mod 11. Roughly what percentage of keys now map to a different node?"
+  unit="%"
+  answer={91}
+  tolerance={0.1}
+  derivation={[
+    'A key stays where it was only if its hash mod 10 equals its hash mod 11. For well-spread hashes that is true of about 1 key in 11.',
+    'So about 10 in 11 keys move: roughly 91%, nearly all of them.',
+    'On a consistent-hashing ring the new node takes over only the ranges it now owns: about 1 key in 11, roughly 9%, and every one of them moves to the new node.',
+    'For a cache that is the difference between a 91% miss storm and a 9% one — the cold-cache problem from Level 2, set off by capacity you added to help.',
   ]}
-  stronger="A stronger answer gives the fix and its cost: compose the key from a hash bucket plus the time window, so writes spread across N buckets per hour while time-range queries remain answerable by reading N partitions per window. It also names the tension — more buckets means better write distribution and more work per range query — and observes that this is the same trade as key splitting for hot keys, one layer up."
+  stronger="A stronger answer adds the role of virtual nodes. With one ring position per node, the new node takes its 9% from a single neighbour, which is then suddenly lighter than the rest; with many small positions per node it takes a little from every node, and the cluster stays even after the change. It also notes what none of this fixes: a single popular key still lands on one node, however the ring is drawn."
 />
 
 <CompleteCheck
@@ -444,8 +430,8 @@ someone asks why the obvious query is slow.
     { label: 'Consistent hashing and virtual nodes', sourceId: 'dynamo' },
     { label: 'Range partitioning and row key design', sourceId: 'bigtable' },
     {
-      label: 'Next: coordination, because partitions must now agree with each other',
-      href: '/levels/4',
+      label: 'Next: what happens to a transaction once the data is split',
+      href: '/lessons/transactions-across-machines',
     },
   ]}
 />

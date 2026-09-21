@@ -61,6 +61,12 @@ The hardest case, because data cannot be routed the way requests can.
 the source of truth. Reads still come from the old store.
 *Risk: the new write fails. It must not fail the request — log and alert instead.*
 
+This is the dual write that Levels 2 to 4 warned against, used on purpose. It is acceptable here for
+two reasons: the old store stays authoritative, so a missed write to the new one is a gap to repair
+rather than lost data; and phase 3 exists to find those gaps. Where the old system's change log can
+be read, change data capture does the same job without the dual write at all, and is the better
+choice.
+
 **Phase 2 — backfill.** Copy historical data into the new store, batched and rate-limited, with
 resumable progress. Runs for as long as it takes.
 *Risk: overwhelming the source. Throttle, and monitor replication lag as you go.*
@@ -228,21 +234,22 @@ the number of rewrites attempted.
         'Run a shadow phase: read both, compare, log differences, return the old result. Continue until discrepancies are zero for a sustained period.',
     },
     {
-      what: 'Contract phase never happens',
+      what: 'Shadow traffic with real side effects',
       symptom:
-        'Years of dual writes, two stores, and code nobody dares remove.',
+        'During the comparison phase, customers receive two confirmation emails, or a partner is called twice for one order.',
       cause:
-        'The migration was declared done when the new path worked, and the cleanup had no owner or date.',
+        'The new system was run on real traffic to compare its outputs, and nothing stopped it performing the effects the old system was already performing.',
       mitigation:
-        'Schedule the removal as part of the original plan, with an owner and a date. Track dual-running as debt with an expiry.',
+        'In shadow mode the new path computes and records its answer and does nothing else: side effects are stubbed or suppressed until it becomes authoritative for that slice.',
     },
     {
-      what: 'Backfill overwhelms the source',
+      what: 'Comparison drowned in benign differences',
       symptom:
-        'Copying historical data degrades the live system it is copying from.',
-      cause: 'Unthrottled bulk reads and writes competing with production traffic.',
+        'The diff log shows thousands of discrepancies a day, the team stops reading it, and a real one goes unnoticed.',
+      cause:
+        'Differences that do not matter — timestamps to the microsecond, ordering within a set, whitespace — were compared as strictly as the ones that do.',
       mitigation:
-        'Batch, throttle, monitor lag, and define abort criteria before starting. Treat the backfill as a production change.',
+        'Normalise each known benign difference explicitly and in code, so the rule is reviewed, and alert on whatever remains. The target is a comparison that is silent when the systems agree.',
     },
     {
       what: 'Rollback becomes impossible mid-migration',
@@ -330,10 +337,10 @@ reasoning applies at the scale of a migration: small reversible steps with evide
         'Put a facade in front, migrate one capability at a time, and keep both running until the old one receives nothing. If a rewrite really is right — small system, one team, faster than it changes — say why those conditions hold.',
     },
     {
-      mistake: 'We will migrate the data during a maintenance window.',
-      why: 'It works until the dataset is large enough that the copy exceeds what the business will accept, and that threshold arrives sooner than teams expect. It is also all-or-nothing: a problem discovered mid-window has no good options.',
+      mistake: 'We verified the migration by comparing a sample of records after the backfill.',
+      why: 'A static comparison checks that data was copied, not that the new system behaves the same. The discrepancies that matter appear in behaviour under live traffic — a rounding rule, a timezone, a null handled differently — and only for the requests that happen to exercise them.',
       instead:
-        'Dual write, backfill, verify, switch reads, switch the source of truth, contract. Every phase reversible.',
+        'Compare outputs on real traffic for long enough to cover the system’s cycles, including monthly and annual ones where they exist, and treat zero unexplained differences as the exit criterion.',
     },
     {
       mistake: 'The migration is done, the new system is serving all traffic.',
@@ -412,8 +419,8 @@ reasoning applies at the scale of a migration: small reversible steps with evide
     { label: 'Extracting services from a monolith incrementally', sourceId: 'building-microservices' },
     { label: 'Change data capture and derived data', sourceId: 'ddia' },
     {
-      label: 'Next: why the organisation ends up in the system diagram',
-      href: '/lessons/people-shape-architecture',
+      label: 'Next: the part of the system that must keep working while everything else changes',
+      href: '/lessons/the-part-that-must-keep-working',
     },
   ]}
 />

@@ -94,7 +94,7 @@ export const LEVELS: Level[] = [
       'You can derive a full design under pressure, evolve it as constraints change, and defend every decision.',
     breaksBecause:
       'Real problems arrive without requirements, with a legacy system attached, and with an organisation around them.',
-    moduleIds: ['l7-method', 'l7-primitives', 'l7-library'],
+    moduleIds: ['l7-primitives', 'l7-method', 'l7-library'],
   },
   {
     id: 'l8',
@@ -331,14 +331,14 @@ export const MODULES: Module[] = [
   {
     id: 'l7-method',
     levelId: 'l7',
-    order: 1,
+    order: 2,
     name: 'The method',
     question: 'How do you attack a design question you have never seen?',
   },
   {
     id: 'l7-primitives',
     levelId: 'l7',
-    order: 2,
+    order: 1,
     name: 'The primitives underneath',
     question: 'Which handful of problems do all of these systems reduce to?',
   },

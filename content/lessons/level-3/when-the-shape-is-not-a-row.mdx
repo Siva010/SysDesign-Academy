@@ -83,6 +83,11 @@ to say so, because the interface takes a file, so it sends 40 MB. On a mobile co
 
 ### Where the bytes live
 
+Two lessons ago, uploads went to object storage so the bytes would never pass through the
+application. The slow backup is a second, separate reason: bytes in a row are carried by
+everything that touches the row, whether or not any query reads them. It is worth being precise
+about the two kinds of storage that could hold them instead.
+
 <C id="block-storage" /> is a virtual disk attached to one machine. It presents blocks, a
 filesystem sits on top, and you can modify any byte in place. Latency is low, semantics are
 familiar, and it inherits two properties from being a disk: it is **tied to one machine's failure
@@ -365,10 +370,10 @@ indistinguishable from writing it once.
         'Use a spatial index, or derive one ordered key from both coordinates. Then read the query plan to confirm it is being used, because adding the index is not the same as the planner choosing it.',
     },
     {
-      mistake: 'Keeping user uploads in a database column because it keeps the write atomic.',
-      why: 'Atomicity is real and it is bought by making every backup, every replica and the page cache carry bytes no query reads. The cost is paid continuously; the benefit applies to a window of a few seconds around the upload.',
+      mistake: "Storing uploads on the application server's attached volume.",
+      why: 'It works on the first day and ties every file to one machine: its failure domain, a disk size decided in advance, and its continued existence. A second instance cannot see the files, a replaced instance loses them, and more capacity means resizing a volume.',
       instead:
-        'Write the bytes first, then the metadata. An orphaned object is inert and collectable; metadata pointing at bytes that do not exist is data loss as far as the user is concerned.',
+        "Keep block storage for data that is modified in place and belongs to one machine, such as a database's own files. Put uploads in object storage with a key in the row, and write the bytes before the metadata, so a crash leaves an inert orphan rather than a row pointing at nothing.",
     },
     {
       mistake: 'Chunking at fixed offsets.',

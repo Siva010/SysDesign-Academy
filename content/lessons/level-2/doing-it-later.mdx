@@ -21,10 +21,10 @@ Signing up takes 4 seconds. The handler does seven things: create the user, hash
 write an audit record, send a welcome email, generate a thumbnail, notify the analytics
 pipeline, and sync to the CRM.
 
-Only the first two need to happen before you can tell the user they are signed up. The other
-five are the reason they are waiting — and each one is a third party whose outage becomes your
-outage, whose slowness becomes your latency, and whose failure loses a signup that had already
-effectively happened.
+Only three need to happen before you can tell the user they are signed up: create the user, hash
+the password, and write the audit record with them. The other four are the reason they are
+waiting — and each is a separate system whose outage becomes your outage, whose slowness becomes
+your latency, and whose failure loses a signup that had already effectively happened.
 
 ## Intuition
 

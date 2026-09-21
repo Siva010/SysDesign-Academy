@@ -342,7 +342,7 @@ been exercised is a hypothesis, and it will be tested for the first time during 
   options={[
     {
       id: 'a',
-      text: 'It roughly triples, since the load is spread over more machines',
+      text: 'It rises with the number of replicas, since the load is spread over more machines',
       implies: 'You are treating replicas as additional write capacity.',
       why: 'Replicas do not accept writes. Every write still goes to the leader, and each replica must apply all 4,000 per second just to keep up. Nothing about the write path got more capacity.',
       credit: 'none',
@@ -402,8 +402,8 @@ been exercised is a hypothesis, and it will be tested for the first time during 
     { label: 'Streaming replication and commit modes', sourceId: 'postgres-docs' },
     { label: 'Setting RPO and RTO deliberately', sourceId: 'sre-book' },
     {
-      label: 'Next: when one machine can no longer hold the data',
-      href: '/lessons/splitting-the-data',
+      label: 'Next: what changes when more than one machine accepts writes',
+      href: '/lessons/when-there-is-no-single-leader',
     },
   ]}
 />

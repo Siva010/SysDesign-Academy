@@ -425,7 +425,7 @@ recomputing aggregates over a large event history practical rather than prohibit
       id: 'c',
       text: 'Neither is risky, because a product name rarely changes',
       implies: 'You are judging by change frequency.',
-      why: 'Low change frequency reduces how often drift occurs and makes it far harder to notice, because the copy is right for months and wrong quietly afterwards. In this specific case there is also a subtlety worth separating out.',
+      why: 'Low change frequency reduces how often drift occurs and makes it far harder to notice, because the copy is right for months and wrong quietly afterwards. It also misses a second question this example raises: whether the name on an order is a copy at all, or the name as it was at the moment of purchase, which is a different fact.',
       credit: 'partial',
     },
   ]}
@@ -440,6 +440,6 @@ recomputing aggregates over a large event history practical rather than prohibit
     { label: 'CQRS, its costs, and its independence from event sourcing', sourceId: 'martin-fowler' },
     { label: 'Compacted logs as durable, replayable state', sourceId: 'kafka-docs' },
     { label: 'Refresh intervals as the consistency window of a derived index', sourceId: 'elasticsearch-docs' },
-    { label: 'Next: reasoning without certainty', href: '/levels/4' },
+    { label: 'Next: data that is not a row identified by a key', href: '/lessons/when-the-shape-is-not-a-row' },
   ]}
 />

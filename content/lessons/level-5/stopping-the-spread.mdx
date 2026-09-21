@@ -323,10 +323,10 @@ moment it is needed.
         'Classify dependencies as required or optional. Breakers with fallbacks for optional; tight timeouts and budgeted retries for required.',
     },
     {
-      mistake: 'We will add capacity when overloaded.',
-      why: 'Capacity arrives in minutes and overload arrives in seconds. During a cascade, more capacity often means more concurrent pressure on the saturated dependency, which prolongs it.',
+      mistake: 'We shed load by returning a generic server error.',
+      why: 'A generic error looks transient to every client, library and proxy in the path, so they retry it immediately. Shedding meant to lower the load produces a burst of retries that raises it, and the service is now rejecting its own echo.',
       instead:
-        'Shed first to restore goodput, then add capacity. Autoscaling handles trends; shedding and headroom handle spikes.',
+        'Reject with an explicit overload status and a retry-after hint, make sure your own clients honour it with jittered backoff, and count sheds separately from failures so the dashboard shows what the system chose to do.',
     },
     {
       mistake: 'We tested the happy path thoroughly.',

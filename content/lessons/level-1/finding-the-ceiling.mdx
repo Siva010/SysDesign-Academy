@@ -56,9 +56,28 @@ looks like as you approach it.
 <Example title="What a single machine can plausibly do">
 
 The honest answer to &ldquo;how many requests per second can one server handle&rdquo; is
-&ldquo;measure it&rdquo;, because it depends entirely on what a request does. But the range is
-worth internalising, because intuition is usually off by an order of magnitude in the
-pessimistic direction.
+&ldquo;measure it&rdquo;, because it depends entirely on what a request does. But you can derive a
+first estimate in a minute, and the derivation is worth more than a remembered figure, because it
+tells you which resource you are estimating. Intuition is usually wrong by an order of magnitude,
+and in the pessimistic direction.
+
+Take a service like the one in the problem: each request does 2 ms of CPU work — parse,
+authorise, serialise — and makes two indexed database queries.
+
+- **CPU.** A 16-core machine has 16,000 ms of CPU to spend each second. At 2 ms per request that
+  is 8,000 requests per second at 100%, or about 5,000 at a 60–70% target that leaves room for
+  bursts.
+- **The database.** 5,000 requests is 10,000 indexed lookups per second. Whether one database
+  sustains that from memory is a question with an answer — measure it once — and for simple
+  indexed reads on current hardware it usually does, provided the working set fits in memory.
+- **Concurrency.** If a request spends 20 ms in total, mostly waiting on the database, Little's
+  law says 5,000 per second needs about 100 requests in flight. That is a pool size rather than a
+  hardware limit, and the default pool is usually far smaller.
+
+So one application server and one database plausibly carry around 5,000 requests per second: ten
+times the 500 the team expected in year one, and more than twice what they expected in two years.
+The number is not a promise. It is a hypothesis precise enough to test, and it predicts that the
+first ceiling you hit will be a pool rather than a processor.
 
 <Claim label="recommendation">
 Rather than memorising figures that go stale, derive your own once and keep it. Take one
@@ -374,7 +393,7 @@ room assumed.
       credit: 'none',
     },
   ]}
-  stronger="A stronger answer checks the number with Little's law rather than eyeballing it: with a pool of 20 and a database call of about 5 ms, one instance sustains roughly 4,000 calls per second, so a queue of 140 means arrivals are far above that. It also asks the question behind the question, because a pool this small is usually sized deliberately to protect the database. Raising it may move the bottleneck onto the database rather than remove it, so the right next step is finding out why it was set to 20."
+  stronger="A stronger answer checks the numbers with Little's law, and the check finds the actual bug. With 140 requests waiting and a median wait of 760 ms, each instance's pool is draining only about 180 requests per second, so each of its 20 connections is held for roughly 110 ms per use. The database reports fast queries and is 78% idle, so most of that 110 ms is not query time: connections are being held across other work, such as an outbound call or application logic inside an open transaction. Raising the pool would push more concurrent load at the database without touching the cause, and a pool this small is usually sized deliberately to protect the database. The next step is finding what the connection is held for."
 />
 
 ## Going deeper

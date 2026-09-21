@@ -148,7 +148,7 @@ a rollback procedure that has never been run is a plan rather than a capability.
   columns={[
     { title: 'Operators', nodes: [{ id: 'human', label: 'Change', note: 'deploy, config, scale' }] },
     { title: 'Control plane', nodes: [{ id: 'cp', label: 'Config service', note: 'small, complex, changes often' }] },
-    { title: 'Distribution', nodes: [{ id: 'poll', label: 'Poll + validate', note: 'jittered', tone: 'accent' }] },
+    { title: 'Distribution', nodes: [{ id: 'poll', label: 'Poll + validate', note: 'jittered', tone: 'accent' }, { id: 'reject', label: 'Rejected config', note: 'logged, not applied', tone: 'muted' }] },
     { title: 'Data plane', nodes: [{ id: 'cache', label: 'Local cached config', note: 'last known good', tone: 'accent' }, { id: 'serve', label: 'Serving instances', note: 'large, simple, changes rarely' }] },
     { title: 'Users', nodes: [{ id: 'user', label: 'Traffic' }] },
   ]}
@@ -156,6 +156,7 @@ a rollback procedure that has never been run is a plan rather than a capability.
     { from: 'human', to: 'cp' },
     { from: 'cp', to: 'poll' },
     { from: 'poll', to: 'cache', label: 'only if sane' },
+    { from: 'poll', to: 'reject', label: 'empty or implausible', tone: 'danger' },
     { from: 'cache', to: 'serve' },
     { from: 'user', to: 'serve' },
   ]}
@@ -174,7 +175,7 @@ a rollback procedure that has never been run is a plan rather than a capability.
     },
     {
       label: 'Refuse configurations that look wrong',
-      show: ['human', 'cp', 'poll', 'cache', 'serve', 'user'],
+      show: ['human', 'cp', 'poll', 'reject', 'cache', 'serve', 'user'],
       because:
         'A validation step between fetch and apply rejects a config that removes most of the current state, and treats a failed fetch as no news rather than as an empty answer. This is the single line that separates the 14:02 outage from a logged warning.',
     },

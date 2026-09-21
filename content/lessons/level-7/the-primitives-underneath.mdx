@@ -145,9 +145,10 @@ product; matching is the easy part. Expect a consistency window and a reindex pr
 
 *Signature:* "find things near me", at scale.
 
-Approaches: divide space into cells and index by cell id, so proximity becomes a key lookup over
-a small set of neighbouring cells. The parameter is cell size, which trades false positives
-against the number of cells to query.
+Approaches: a spatial tree when the write rate is ordinary, as Level 3 showed; or divide space
+into cells and index by cell id, so proximity becomes a key lookup over a small set of
+neighbouring cells, which is what a high write rate needs. The parameter is cell size, which
+trades false positives against the number of cells to query.
 
 ### time-series-ingest
 

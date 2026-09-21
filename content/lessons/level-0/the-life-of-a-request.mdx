@@ -93,6 +93,19 @@ Now count the round trips before the application sees anything: DNS (assume it i
 zero), TCP (one), TLS (one), request/response (one). That is three round trips at roughly
 76 ms each, or about 230 ms — before your 40 ms of server work.
 
+That accounts for about 270 ms of the 2.5 seconds. The rest is spent in places your server
+never sees. Suppose the measured round trip is 130 ms, which is well above the floor and
+ordinary for a long path. The same three trips now cost nearly 400 ms. Then the page turns out
+not to be one request. The HTML names a stylesheet and a script. The script, once it runs,
+asks your API for the dashboard's data. The data names images on another host, which needs its
+own lookup and its own two handshakes. Each link in that chain waits for the one before it, so
+five or six more round trips arrive in sequence: most of another second. Moving the larger files
+over a mobile link, and the browser's parsing, script execution and rendering on a mid-range
+phone, take the rest.
+
+None of it appears in your logs, because none of it happened on your server. That is the
+2.46 seconds.
+
 <Claim label="fact" source="rfc8446">
 TLS 1.3 reduces the full handshake to one round trip, and offers a zero-round-trip resumption
 mode for repeat connections. The specification also states that 0-RTT data does not carry
@@ -352,7 +365,7 @@ another service, the connection strategy is part of the design, not an implement
       id: 'a',
       text: 'Server processing that is not being logged correctly',
       implies: 'You suspect the measurement rather than the network.',
-      why: 'Worth checking, and occasionally right — but the arithmetic already explains the gap without it. Three round trips of connection setup plus seven request/response cycles at roughly 80 ms each accounts for well over a second on their own.',
+      why: 'Worth checking, and occasionally right — but the arithmetic already explains most of the gap without it. Two round trips of connection setup plus seven request/response cycles, at the 80 ms physical floor, is already 720 ms, and real round trips on this path are longer than the floor.',
       credit: 'partial',
     },
     {
@@ -420,7 +433,7 @@ another service, the connection strategy is part of the design, not an implement
       sourceId: 'hpbn',
     },
     {
-      label: 'Next: how a name becomes an address',
+      label: 'How a name becomes an address',
       href: '/concepts/dns',
       note: 'The naming layer, and why its caching behaviour shapes your failover strategy.',
     },

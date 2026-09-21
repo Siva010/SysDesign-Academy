@@ -34,8 +34,9 @@ reach for.
 ## Intuition
 
 Two transactions each read some state, each decide something based on it, each write. The
-classic <C id="lost-update">lost update</C> happens when they write the *same* thing — and
-version checks or conditional updates catch that, because there is a collision to detect.
+classic <C id="lost-update">lost update</C> happens when they write the *same* thing, and Level 1
+closed it with a version check or a conditional update — both work because there is a collision
+to detect.
 
 Write skew is subtler: they write *different* things, so nothing collides. The invariant that
 was violated — &ldquo;at least one doctor on call&rdquo; — is not a property of any single row.
@@ -99,14 +100,24 @@ general. Two ways to get it:
   read and write sets, and abort transactions whose commit would break serializability.
   Excellent under low contention; abort rates rise as contention does.
 
-<Disagreement
-  about="what a default transaction protects you from"
-  positions={[
-    { source: 'postgres-docs', says: 'defaults to Read Committed; each statement sees a fresh snapshot, so lost updates and write skew are both possible' },
-    { source: 'mysql-docs', says: 'InnoDB defaults to Repeatable Read, a different level with different permitted anomalies' },
-  ]}
-  takeaway="There is no portable answer to 'is my transaction safe'. Name the invariant you are protecting, then either raise the isolation level explicitly, take an explicit lock, or restructure so the invariant lives in a single row where a constraint can enforce it."
-/>
+Level 1 showed that two engines ship different defaults. The names of the levels are less
+reliable still.
+
+<Claim label="fact" source="ddia">
+Snapshot isolation is sold under different names: several databases call it repeatable read, and
+at least one widely used database calls it serializable. Because the names are not used
+consistently, the name on a setting does not tell you which anomalies it prevents.
+</Claim>
+
+<Claim label="fact" source="postgres-docs">
+In PostgreSQL, Repeatable Read is implemented as snapshot isolation. Only the Serializable level
+adds the dependency tracking that prevents write skew.
+</Claim>
+
+So there is no portable answer to &ldquo;is my transaction safe&rdquo;. Name the invariant you are
+protecting, then either raise the isolation level to one that genuinely prevents the anomaly, take
+an explicit lock, or restructure so the invariant lives in a single row where a constraint can
+enforce it.
 
 <Deeper title="Materialising the conflict">
 
@@ -190,9 +201,9 @@ cheap and a cross-partition one is not.
     {
       scale: 'Across partitions or services',
       behaviour:
-        'No single component sees both transactions, so no local mechanism can adjudicate.',
+        'No single engine sees both transactions, so no isolation level applies across them.',
       firstToBreak:
-        'The assumption that a transaction can cover the operation. This is where sagas and idempotency replace atomicity.',
+        'Every guarantee in this lesson at once. What replaces them is the subject of the lesson on transactions across machines.',
     },
   ]}
 />
@@ -220,12 +231,13 @@ cheap and a cross-partition one is not.
         'Set a statement and idle-in-transaction timeout. Never hold a transaction across an external call or user think-time. Alert on the oldest open transaction.',
     },
     {
-      what: 'Deadlock under two-phase locking',
+      what: 'Snapshot isolation mistaken for serializable',
       symptom:
-        'Intermittent transaction failures under load, often correlated with a specific pair of operations.',
-      cause: 'Two transactions acquire the same locks in opposite orders.',
+        'An invariant is violated on a database configured at a level everyone believed was the strong one.',
+      cause:
+        'The level was chosen by its name. On that engine the name meant snapshot isolation, which permits write skew.',
       mitigation:
-        'Acquire locks in a consistent global order. Keep transactions short. Retry the victim, because the database resolves deadlocks by killing one.',
+        'Read what the level prevents on your engine, and test each invariant with two transactions run concurrently rather than trusting the setting.',
     },
     {
       what: 'High abort rate under serializable isolation',
@@ -304,10 +316,10 @@ hoped for, and concurrency will eventually test the hope.
 <Mistakes
   items={[
     {
-      mistake: 'It is in a transaction, so it is safe.',
-      why: 'A transaction gives atomicity and durability unconditionally, and isolation only to the degree the level specifies. At the common defaults, another transaction can commit between your read and your write.',
+      mistake: 'We moved to repeatable read, so the anomaly is fixed.',
+      why: 'On several engines repeatable read is snapshot isolation. It may stop the lost update, depending on the engine, and it never stops write skew, which is the anomaly that survives the fixes people usually reach for.',
       instead:
-        'Name the invariant and the mechanism enforcing it. "Serializable, and we retry on serialization failure" is an answer. "It is in a transaction" is not.',
+        'Name the invariant and the mechanism enforcing it. "Serializable, and we retry on serialization failure" is an answer. "We raised the isolation level" is not, until you know what the level prevents.',
     },
     {
       mistake: 'We use ACID databases, so we do not have these problems.',

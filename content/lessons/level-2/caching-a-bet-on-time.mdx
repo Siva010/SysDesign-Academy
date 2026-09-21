@@ -101,10 +101,10 @@ with a concurrent read, or miss a derived key that nobody remembered depends on 
 data.
 
 <Callout kind="info" title="The first question is not 'where do we cache'">
-It is "why is this read expensive?" A query that is slow because it lacks an index should get
-the index. Caching it instead means you have added staleness, a stampede risk and a new
-dependency in order to avoid writing one line of DDL — and the first miss still pays the full
-cost.
+It is "why is this read expensive?" Level 1 already made the case for the index: a query that
+is slow because nothing is organised for it should be organised, not remembered. A cache earns
+its place when the work is still expensive after that — a join across six tables, a rendered
+page, a call to a third party — and the answer is wanted far more often than it changes.
 </Callout>
 
 <Deeper title="Why invalidation is genuinely hard">
@@ -392,7 +392,7 @@ coalescing and load shedding are the mitigations that make a cold cache survivab
     },
     { label: 'Designing for the cache being empty', sourceId: 'aws-builders-library' },
     {
-      label: 'Next: the stampede, and what a hot key does to all of this',
+      label: 'The stampede, and what a hot key does to all of this',
       href: '/concepts/cache-stampede',
     },
   ]}

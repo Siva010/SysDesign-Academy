@@ -292,7 +292,7 @@ requests" means for your service.
   items={[
     {
       mistake: 'CPU is only at 60%, so we have plenty of headroom.',
-      why: 'Utilisation of one resource says nothing about the others, and 60% is already inside the region where queueing delay becomes material for bursty traffic.',
+      why: 'Utilisation of one resource says nothing about the others — a pool can be full while CPU idles — and for bursty traffic 60% is closer to the knee than it sounds.',
       instead:
         'Check every bounded resource, especially pools. Then look at saturation signals — queue depth and wait time — rather than utilisation alone.',
     },
@@ -412,7 +412,7 @@ requests" means for your service.
       href: '/concepts/littles-law',
     },
     {
-      label: 'Next: backpressure, which is what you do when the queue is the problem',
+      label: 'Backpressure, which is what you do when the queue is the problem',
       href: '/concepts/backpressure',
     },
   ]}

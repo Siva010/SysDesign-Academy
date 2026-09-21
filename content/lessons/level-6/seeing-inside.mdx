@@ -232,13 +232,13 @@ what you need.
         'Tail sampling: keep all errors and slow requests, plus a baseline sample of normal ones for comparison.',
     },
     {
-      what: 'Alerting on causes rather than symptoms',
+      what: 'Logging becomes the outage',
       symptom:
-        'Dozens of nightly alerts, most requiring no action. Real incidents are missed among the noise.',
+        'During an incident, request latency climbs across the service and the log pipeline falls hours behind, just when the logs are needed.',
       cause:
-        'An alert per possible cause — CPU, memory, queue depth, disk — rather than on user-visible impact.',
+        'Every failing request logs a stack trace, so log volume multiplies with the error rate. Logging written synchronously blocks request threads on a saturated disk or shipper, and the shipper drops or delays what matters.',
       mitigation:
-        'Page on symptoms and on error-budget burn rate. Keep cause metrics on dashboards for diagnosis, not on pagers.',
+        'Log through a bounded asynchronous buffer that drops rather than blocks, and counts what it dropped. Rate-limit identical errors so one failure logs once with a count, not ten thousand times.',
     },
   ]}
 />
@@ -319,10 +319,10 @@ distinct label combination is a separately stored series regardless of how often
         'Structure the logs, propagate a correlation ID, and add traces once the call graph is deeper than you can hold in your head.',
     },
     {
-      mistake: 'We alert on CPU, memory and disk.',
-      why: 'Those are causes. A service can be failing with all three healthy, and all three can be elevated with users perfectly happy. Alerting on causes produces noise, and noise produces ignored alerts.',
+      mistake: 'We propagate the trace ID in a request header, so every request is traced.',
+      why: 'Every request that travels over HTTP is. Work handed to a queue, a scheduled job or a batch run carries no headers, so the trace ends at the first asynchronous hop — which is where the silent backlogs and duplicate deliveries from Level 4 live.',
       instead:
-        'Page on user-visible symptoms and error-budget burn rate. Keep resource metrics on dashboards for diagnosis once you are already looking.',
+        'Carry the trace context in message metadata and in job records, and restore it when the work is picked up. Treat a trace that ends at a queue as a gap in the instrumentation, not the end of the request.',
     },
     {
       mistake: 'We will add a user ID label to the metrics so we can debug per user.',
@@ -406,7 +406,7 @@ distinct label combination is a separately stored series regardless of how often
   options={[
     {
       id: 'a',
-      text: 'The daily deploy empties every instance local cache at once, so a fleet-wide cold start coincides with the morning traffic ramp.',
+      text: 'The daily deploy empties every instance’s local cache at once, so a fleet-wide cold start coincides with the morning traffic ramp.',
       implies: 'You connected an unchanged median and a falling hit rate to a scheduled event rather than to load.',
       why: 'An unchanged p50 with a ruined p99 means most requests are fine and a minority are doing far more work, which is the shape of a cache miss path rather than of an overloaded system. The hit rate confirms it and the deploy schedule explains why it is the same twenty minutes every weekday. Load alone would have moved the median too.',
       credit: 'full',

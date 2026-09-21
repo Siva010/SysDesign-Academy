@@ -130,15 +130,17 @@ you discover which internal client nobody documented.
   caption="The call site looks identical at every stage. Everything behind it changes."
   columns={[
     { title: 'Caller', nodes: [{ id: 'order', label: 'Order code' }] },
-    { title: 'Boundary', nodes: [{ id: 'inproc', label: 'In-process call', note: 'nanoseconds' }, { id: 'net', label: 'Network call', note: 'milliseconds, can fail', tone: 'accent' }] },
+    { title: 'Boundary', nodes: [{ id: 'inproc', label: 'In-process call', note: 'nanoseconds' }, { id: 'net', label: 'Call per item', note: '12 round trips' }, { id: 'batch', label: 'Batched call', note: 'one trip, timeout, fallback', tone: 'accent' }] },
     { title: 'Callee', nodes: [{ id: 'pricing', label: 'Pricing' }] },
     { title: 'Its data', nodes: [{ id: 'db', label: 'Pricing store' }] },
   ]}
   edges={[
     { from: 'order', to: 'inproc' },
     { from: 'inproc', to: 'pricing' },
-    { from: 'order', to: 'net' },
+    { from: 'order', to: 'net', label: '× 12', tone: 'danger' },
     { from: 'net', to: 'pricing' },
+    { from: 'order', to: 'batch', label: '× 1' },
+    { from: 'batch', to: 'pricing' },
     { from: 'pricing', to: 'db' },
   ]}
   stages={[
@@ -156,7 +158,7 @@ you discover which internal client nobody documented.
     },
     {
       label: 'Shape the interface for the caller',
-      show: ['order', 'net', 'pricing', 'db'],
+      show: ['order', 'batch', 'pricing', 'db'],
       because:
         'The interface takes the whole list and returns the whole list, so the caller asks once. Timeouts, retries and a fallback belong here too, because a remote call needs an answer for "it did not reply", and a local call never did.',
     },
@@ -183,7 +185,7 @@ you discover which internal client nobody documented.
       behaviour:
         'One user action crosses many boundaries. Latency is the sum of a chain, and availability is the product of the chain.',
       firstToBreak:
-        'Availability arithmetic. Ten dependencies at 99.9% give 99% if all are required, which is nine hours a year of outages you did not cause.',
+        'Availability arithmetic. Ten dependencies at 99.9% give 99% if all are required, which is about three and a half days a year of outages you did not cause.',
     },
     {
       scale: 'Hundreds',
@@ -397,6 +399,6 @@ old code reading data written by new code.
     { label: 'Service boundaries as an organisational decision with technical costs', sourceId: 'building-microservices' },
     { label: 'Interface granularity and its coupling consequences', sourceId: 'fundamentals-arch' },
     { label: 'Backward and forward compatibility across independent deploys', sourceId: 'ddia' },
-    { label: 'Next: where one machine stops', href: '/lessons/finding-the-ceiling' },
+    { label: 'Next: where data lives, and how you find it again', href: '/lessons/finding-things-again' },
   ]}
 />

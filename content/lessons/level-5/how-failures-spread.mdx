@@ -137,16 +137,19 @@ one second means the last hop can still be working three seconds after the clien
 <Arch
   caption="The failure travels upward through the response to it, not through the dependency itself."
   columns={[
-    { title: 'Users', nodes: [{ id: 'user', label: 'Clients', note: 'retry on timeout' }] },
-    { title: 'Edge', nodes: [{ id: 'lb', label: 'Load balancer', note: 'removes instances' }] },
-    { title: 'Service', nodes: [{ id: 'app', label: 'Your service', note: 'workers all waiting', tone: 'accent' }] },
-    { title: 'Dependencies', nodes: [{ id: 'slow', label: 'Slow dependency', note: 'optional!' }, { id: 'db', label: 'Database', note: 'healthy' }] },
+    { title: 'Users', nodes: [{ id: 'user', label: 'Clients' }, { id: 'retries', label: 'Retries', note: '× 3 per layer' }] },
+    { title: 'Edge', nodes: [{ id: 'lb', label: 'Load balancer' }, { id: 'gone', label: 'Instances removed', note: 'health checks failed', tone: 'muted' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'Your service' }, { id: 'pool', label: 'Shared worker pool', note: 'every worker waiting', tone: 'accent' }] },
+    { title: 'Dependencies', nodes: [{ id: 'slow', label: 'Recommendations', note: 'optional, now 4 s' }, { id: 'db', label: 'Database', note: 'healthy' }] },
   ]}
   edges={[
-    { from: 'user', to: 'lb', label: 'retries', tone: 'danger' },
+    { from: 'user', to: 'lb' },
+    { from: 'retries', to: 'lb', label: 'more load', tone: 'danger' },
     { from: 'lb', to: 'app' },
-    { from: 'app', to: 'slow', label: '4s each', tone: 'danger' },
-    { from: 'app', to: 'db', label: 'starved' },
+    { from: 'lb', to: 'gone', dashed: true },
+    { from: 'app', to: 'pool' },
+    { from: 'pool', to: 'slow', label: '4 s each', tone: 'danger' },
+    { from: 'pool', to: 'db', label: 'starved' },
   ]}
   stages={[
     {
@@ -157,13 +160,13 @@ one second means the last hop can still be working three seconds after the clien
     },
     {
       label: 'One dependency slows',
-      show: ['user', 'lb', 'app', 'slow', 'db'],
+      show: ['user', 'lb', 'app', 'pool', 'slow', 'db'],
       because:
         'Workers are held waiting. Requests that never touch the slow dependency queue behind those that do, so a partial failure becomes a total one inside your own service.',
     },
     {
       label: 'The response makes it worse',
-      show: ['user', 'lb', 'app', 'slow', 'db'],
+      show: ['user', 'retries', 'lb', 'gone', 'app', 'pool', 'slow', 'db'],
       because:
         'Clients retry, multiplying load. Health checks fail, so instances are removed and the same traffic lands on fewer machines. Each mitigation adds load at the worst moment.',
     },
@@ -404,8 +407,8 @@ failure survivable by its callers.
     { label: 'Timeouts, retries and backoff with jitter', sourceId: 'aws-builders-library' },
     { label: 'Stability patterns and failure propagation', sourceId: 'release-it' },
     {
-      label: 'Next: the defences that actually stop the spread',
-      href: '/lessons/stopping-the-spread',
+      label: 'Next: when the cache is the thing that fails',
+      href: '/lessons/when-the-cache-is-the-problem',
     },
   ]}
 />

@@ -2,7 +2,7 @@
 id: the-environment-is-code
 title: The Environment Is Code, Except What Must Not Be
 level: 6
-module: l6-change
+module: l6-adversaries
 order: 2
 summary: A machine nobody can rebuild is one nobody can safely change. Declaring the environment fixes that, and creates one thing that must live elsewhere.
 difficulty: core
@@ -373,7 +373,7 @@ change behaviour without a deploy, and recover without heroics treated as design
       id: 'a',
       text: 'Nothing about the encryption — it never addressed this threat. The application is authorised to decrypt, so a compromised application reads plaintext.',
       implies: 'You are matching the control to the threat it covers.',
-      why: 'Encryption at rest defends against someone obtaining the storage: a stolen disk, a misplaced backup, a volume attached to the wrong machine. An attacker using the application own credentials goes through the decryption layer exactly as legitimate traffic does. The control worked as designed and this was never in its scope.',
+      why: 'Encryption at rest defends against someone obtaining the storage: a stolen disk, a misplaced backup, a volume attached to the wrong machine. An attacker using the application’s own credentials goes through the decryption layer exactly as legitimate traffic does. The control worked as designed and this was never in its scope.',
       credit: 'full',
     },
     {

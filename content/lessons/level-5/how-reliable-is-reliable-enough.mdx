@@ -3,11 +3,11 @@ id: how-reliable-is-reliable-enough
 title: How Reliable Is Reliable Enough
 level: 5
 module: l5-targets
-order: 1
+order: 2
 summary: An unmeasured reliability target is a wish; one set at 100% is a refusal to ship. Error budgets turn both into a number people can argue about.
 difficulty: core
 minutes: 26
-prerequisites: [percentiles, availability]
+prerequisites: [words-that-are-not-synonyms, percentiles]
 concepts: [sli, slo, sla, error-budget, availability-math, redundancy, percentiles, tail-latency, alerting]
 unlocks: [load-shedding, graceful-degradation, incident-response, capacity-planning]
 failures: [health-check-collapse]
@@ -17,9 +17,10 @@ status: reviewed
 
 ## The problem
 
-&ldquo;The system should be highly available.&rdquo;
+Suppose the previous lesson has done its work, and the requirement now names a property:
+&ldquo;the system should be highly available.&rdquo;
 
-Nobody disagrees, and nobody can act on it. Six months later two arguments are running in
+Nobody disagrees, and still nobody can act on it. Six months later two arguments are running in
 parallel: one team says reliability is unacceptable and must be fixed before any new features;
 another says the system has been fine and the work is a waste. Both are pointing at the same
 dashboard.

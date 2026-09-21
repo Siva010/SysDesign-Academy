@@ -415,39 +415,39 @@ design.
 />
 
 <CompleteCheck
-  concepts={['outbox', 'dual-write', 'idempotency', 'atomicity']}
-  prompt="An order service writes the order to its database and must notify four downstream services. A crash between the two steps currently loses the notification. What belongs in the gap?"
+  concepts={['requirement-clarification', 'back-of-envelope', 'bottleneck']}
+  prompt="Eight minutes in, you have clarified, estimated, named the primitives and drawn a deliberately small design. One move is missing before the pressure rounds, and it is the one the transcript calls the strongest available. What goes in the gap?"
   pipeline={[
-    { label: 'Order API', note: 'accepts request' },
-    { label: 'Database', note: 'one transaction' },
-    { label: 'Outbox table', note: 'same transaction', gap: true },
-    { label: 'Publisher', note: 'reads unpublished' },
-    { label: 'Message bus', note: 'four consumers' },
+    { label: 'Clarify', note: 'questions that change the design' },
+    { label: 'Estimate', note: 'per second, conclusion drawn' },
+    { label: 'Minimal design', note: 'said to be minimal' },
+    { label: 'Critique it yourself', note: 'and offer a choice', gap: true },
+    { label: 'Pressure rounds', note: 'where it is assessed' },
   ]}
   options={[
     {
       id: 'a',
-      text: 'A table in the same database, written in the same transaction as the order, holding the message to be published. A separate process reads unpublished rows and sends them.',
-      implies: 'You are making the two writes one atomic local write rather than coordinating two systems.',
-      why: 'The order and the intent to notify now commit or fail together, because they are one transaction in one database. Publication becomes at-least-once, which consumers already have to handle, rather than lost messages, which they cannot. It needs no coordinator, no prepared transactions, and no second system to be available at write time.',
+      text: 'Name the two weakest points of your own design, and ask the interviewer which one they would like you to go into.',
+      implies: 'You are reviewing your design the way a reviewer would, before anyone asks.',
+      why: 'Finding your own weaknesses first shows that you evaluate designs rather than defend them, and offering the choice hands the interviewer the steering wheel for the part of the interview they came to assess. It also turns the pressure rounds from correction into evolution: the weaknesses were yours to name, so fixing them reads as planned.',
       credit: 'full',
     },
     {
       id: 'b',
-      text: 'A retry wrapper around the publish call, with exponential backoff and a dead-letter destination.',
-      implies: 'You are making the publish more likely to succeed.',
-      why: 'It narrows the window and cannot close it. If the process dies after the commit and before the publish, there is no retry state anywhere, because the only record of the intent was in memory. Retries help when the caller survives, and the failure being fixed here is the one where it does not.',
-      credit: 'partial',
+      text: 'Add a cache, a queue and a second region now, so the design looks production-ready before the questions start.',
+      implies: 'You are pre-empting criticism with components.',
+      why: 'Each component arrives without a constraint that required it, which is the recalled-architecture pattern the lesson warns against, and it spends the minutes that belong to the pressure rounds. When the interviewer asks why the queue is there, the only honest answer is that it looked expected.',
+      credit: 'none',
     },
     {
       id: 'c',
-      text: 'A distributed transaction spanning the database and the message bus, so both commit together.',
-      implies: 'You are reaching for atomicity across two systems.',
-      why: 'It would be correct if the bus participated, and it costs blocking on coordinator failure with locks held, plus availability that is now the product of both systems. For this shape, one database and one message, the outbox achieves the same guarantee with a single local transaction.',
-      credit: 'none',
+      text: 'Go deeper into the data model: write out the schema and the indexes before moving on.',
+      implies: 'You are making the design more complete.',
+      why: 'Useful if the interviewer asks for it, and one of the two phases people most often over-spend on. At minute eight it delays the part of the interview that differentiates candidates, and it chooses the next topic for the interviewer instead of letting them choose.',
+      credit: 'partial',
     },
   ]}
-  stronger="A stronger answer names the two costs it accepts. The publisher is at-least-once, so consumers must be idempotent, which is usually free if they key on the order id. And the outbox table needs a retention policy or it becomes the fastest-growing table in the database within a year. It also states the general rule the gap illustrates: whenever two systems must agree, look first for a way to make one local write carry both facts."
+  stronger="A stronger answer attaches a threshold to each weakness rather than naming it loosely: 'polling for due work stops being acceptable once the interval has to fall below about a second, and the claim has no answer yet for a dispatcher that dies holding work.' A weakness with a number is a plan for the next ten minutes; a weakness without one is an apology."
 />
 
 ## Going deeper

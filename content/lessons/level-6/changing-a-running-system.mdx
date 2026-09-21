@@ -23,8 +23,10 @@ You rename a database column from `email` to `email_address`, update the code, a
 The deploy is a rolling one, so for four minutes the old version and the new version are both
 running. The old version writes to `email`, which no longer exists. Half your requests fail.
 
-You roll back. Now the new version's writes to `email_address` are invisible to the old code,
-and some of the data written during those four minutes is effectively lost.
+You roll back the code, and now every request fails, because the old code is looking for a
+column the migration renamed. So you reverse the migration too, in production, mid-incident — and
+the new-version instances still running start failing in their turn. Neither direction is safe,
+because each step assumed the other version was already gone.
 
 Nothing here was a bug in either version. Each was correct in isolation. The failure is that
 **a deploy is not an instant** — and any change that is not valid at every moment of the

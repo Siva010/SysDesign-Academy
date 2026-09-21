@@ -380,32 +380,32 @@ naming a database's consistency mode.
 />
 
 <Check
-  concepts={['session-guarantees', 'eventual-consistency']}
-  prompt="Users report that comments they post sometimes vanish on refresh and reappear a moment later. What is the cheapest correct fix?"
+  concepts={['causal-consistency', 'eventual-consistency']}
+  prompt="Alice posts a question. Bob reads it and replies. Carol, reading from a different replica, sees Bob's reply under a question that is not there. Every write succeeded. Which guarantee is missing?"
   options={[
     {
       id: 'a',
-      text: 'Make all reads linearizable',
-      implies: 'You are reaching for the strongest guarantee.',
-      why: 'It fixes the symptom and charges coordination on every read in the product, including the vast majority that have nothing to do with the user\'s own recent write. It also makes reads unavailable during a partition.',
-      credit: 'partial',
-    },
-    {
-      id: 'b',
-      text: 'Read-your-writes: route this user\'s reads to a replica that has caught up to their write position',
-      implies: 'You matched the guarantee to the specific anomaly rather than to the general category.',
-      why: 'The complaint is entirely about the user\'s own action. Other users seeing the comment a second late is invisible. Tracking the write position and requiring a replica to have reached it fixes the visible class of anomaly without any coordination on the common path.',
+      text: 'Causal consistency: Bob’s reply depends on Alice’s question, so nobody should see the reply without it',
+      implies: 'You traced the dependency between two writes by two different users.',
+      why: 'Bob wrote after reading Alice, so his reply is causally after her question even though they are different users. Carol’s replica received the reply first. Read-your-writes cannot help, because Carol wrote nothing; this is the one guarantee that follows a dependency across users, and it is also the strongest one that survives a partition.',
       credit: 'full',
     },
     {
-      id: 'c',
-      text: 'Add a short delay before refreshing so replication catches up',
-      implies: 'You are working around the lag with a timing assumption.',
-      why: 'It works when lag is small and fails when lag is large — which is under load, which is exactly when more users are affected. Any fixed delay is a guess about a bound that is not guaranteed.',
+      id: 'b',
+      text: 'Read-your-writes',
+      implies: 'You are reaching for the session guarantee you know best.',
+      why: 'Read-your-writes promises a user their own writes. Carol wrote nothing here, and Alice and Bob would each see their own posts correctly. The anomaly is about the order between two other people’s writes, which no per-user guarantee covers.',
       credit: 'none',
     },
+    {
+      id: 'c',
+      text: 'Linearizability',
+      implies: 'You are choosing the guarantee that certainly prevents it.',
+      why: 'It would prevent this, and it would charge a coordination round trip on every read and write in the product to do so, and refuse to answer on the minority side of a partition. It is the expensive answer to a problem a weaker guarantee solves.',
+      credit: 'partial',
+    },
   ]}
-  stronger="A stronger answer names the implementation detail that makes it robust: carry the write position in a token the client holds rather than pinning by connection, so the guarantee survives reconnection and load balancer reassignment. It also notes that monotonic reads should come with it, or the user can still see the comment disappear by being routed to a staler replica."
+  stronger="A stronger answer names the mechanism: the reply carries a dependency on the question, and a replica that has not yet applied the question holds the reply back rather than showing it. That costs a little delay on the reply and no coordination on the common path. It also notes that the dependencies must be tracked by the system, because Bob's client knew he had read the question and the replicas otherwise do not."
 />
 
 <DebugCheck

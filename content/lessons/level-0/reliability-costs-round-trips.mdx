@@ -111,16 +111,8 @@ so at 1,000 per second you accumulate tens of thousands of sockets in various st
 teardown.
 
 With connection reuse you pay the handshake once and amortise it over thousands of requests.
-
-<Claim label="fact" source="rfc9112">
-HTTP/1.1 makes persistent connections the default: a connection is reused for subsequent
-requests unless a party signals otherwise.
-</Claim>
-
-<Claim label="fact" source="rfc9113">
-HTTP/2 goes further, multiplexing concurrent requests over a single connection, so concurrency
-no longer requires opening several connections in parallel.
-</Claim>
+The first lesson met the protocol side of this: HTTP/1.1 keeps a connection open by default, and
+HTTP/2 carries many requests over one. Those features exist because of the arithmetic above.
 
 This is why <C id="connection-pooling">connection pooling</C> appears in every serious
 service, and why a misconfigured pool is one of the most common causes of mysterious latency.
@@ -182,17 +174,17 @@ service, and why a misconfigured pool is one of the most common causes of myster
         'Sockets in teardown state, then ephemeral port exhaustion on the client side.',
     },
     {
-      scale: '10,000 concurrent connections',
+      scale: 'A lossy path, 1–2% of packets dropped',
       behaviour:
-        'Kernel buffers and TLS session state become a real memory line. Handshake CPU is significant.',
-      firstToBreak: 'File descriptor limits, then memory, long before request-handling CPU.',
+        'Retransmissions stall ordered streams, and congestion control slows each connection as though the network were busy. Latency varies wildly while bandwidth looks ample.',
+      firstToBreak: 'Anything multiplexed over one TCP connection, whose streams all stall together.',
     },
     {
-      scale: '1,000,000 concurrent connections',
+      scale: 'A slow dependency behind a pool',
       behaviour:
-        'A single origin cannot hold them. Connections must be terminated near users and multiplexed onward.',
+        'Each call holds its connection longer, so the number of connections needed rises with latency although traffic has not changed.',
       firstToBreak:
-        'The connection tier itself. This is the reason edge termination exists as a product.',
+        'The pool, as a queue nobody is measuring, and then every request waiting in it.',
     },
   ]}
 />
@@ -396,7 +388,7 @@ typical page loads. The general principle transfers to service-to-service calls.
     },
     { label: 'Latency, bandwidth and connection behaviour on real networks', sourceId: 'hpbn' },
     {
-      label: "Next: Little's law, and why concurrency is the number you actually need",
+      label: "Little's law, and why concurrency is the number you actually need",
       href: '/concepts/littles-law',
     },
   ]}

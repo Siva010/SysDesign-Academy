@@ -131,13 +131,14 @@ capacity available to absorb it did.
   columns={[
     { title: 'Readers', nodes: [{ id: 'client', label: 'Clients' }] },
     { title: 'Edge', nodes: [{ id: 'cdn', label: 'CDN', note: 'public content', tone: 'accent' }] },
-    { title: 'Service', nodes: [{ id: 'app', label: 'App instances', note: 'local cache' }] },
+    { title: 'Service', nodes: [{ id: 'app', label: 'App instances' }, { id: 'local', label: 'In-process copy', note: 'per instance, short TTL', tone: 'accent' }] },
     { title: 'Shared', nodes: [{ id: 'hot', label: 'Hot cache node', note: 'the bottleneck' }, { id: 'cold', label: '19 idle nodes', tone: 'muted' }] },
     { title: 'Origin', nodes: [{ id: 'db', label: 'Database' }] },
   ]}
   edges={[
     { from: 'client', to: 'cdn' },
     { from: 'cdn', to: 'app', label: 'miss' },
+    { from: 'app', to: 'local', label: 'hot key' },
     { from: 'app', to: 'hot', label: 'all one key', tone: 'danger' },
     { from: 'app', to: 'cold' },
     { from: 'hot', to: 'db' },
@@ -151,13 +152,13 @@ capacity available to absorb it did.
     },
     {
       label: 'Local cache',
-      show: ['client', 'app', 'hot', 'cold', 'db'],
+      show: ['client', 'app', 'local', 'hot', 'cold', 'db'],
       because:
         'A small in-process cache on each application instance divides hot-key load by the instance count. It costs a little staleness and a little memory, and it is usually the cheapest fix available.',
     },
     {
       label: 'Push it to the edge',
-      show: ['client', 'cdn', 'app', 'hot', 'cold', 'db'],
+      show: ['client', 'cdn', 'app', 'local', 'hot', 'cold', 'db'],
       because:
         'If the content is public and identical for everyone, the edge absorbs it entirely and the request never reaches your infrastructure. This is the only answer that scales to millions per second.',
     },
@@ -182,7 +183,7 @@ capacity available to absorb it did.
     {
       scale: 'Heavy skew: top key gets 10% of all traffic',
       behaviour:
-        'One node carries 10% of total load while others carry a twentieth of that. Cluster utilisation looks fine in aggregate.',
+        'The node holding it carries its own share plus the hot key, about 15% of total load, while each of the other nineteen carries under 5%. Cluster utilisation looks fine in aggregate.',
       firstToBreak:
         'The node holding the hot key. Aggregate dashboards show a healthy cluster throughout.',
     },

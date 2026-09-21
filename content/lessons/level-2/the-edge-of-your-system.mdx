@@ -30,10 +30,11 @@ the front layer is a single configuration that every team edits and nobody tests
 by hand during incidents. And when it breaks, every service is down at once, including the ones
 that have not changed in a year.
 
-Separately: a user complains that their shopping cart empties at random. It empties whenever their
-next request lands on a different machine from the last one — so the team pins each user to one
-machine. The carts stop emptying. Now deploys log everyone out, one machine runs at 90% while the
-others idle, and adding capacity does not relieve it.
+Separately, the problem from the previous lesson comes back in a new form. Carts empty when a
+user's next request lands on a different machine, and the fix that ships is not the shared store.
+It is a setting in the front layer that pins each user to one machine: one line, deployed in an
+afternoon. The carts stop emptying. Then deploys log everyone out, one machine runs at 90% while
+the others idle, and adding capacity does not relieve it.
 
 Both stories are the same mistake. Something was pushed into the layer where it is hardest to fix.
 
@@ -77,8 +78,10 @@ page rate, and 40 of those are for bytes that are identical for every user on ea
 You have removed 91% of your traffic by changing no application code, and the 40 that vanished
 were served from a machine near the user, so the page also got faster.
 
-**Add caching of the HTML shell for 60 seconds.** Roughly 2 requests reach you per page view during
-a traffic spike, and the spike no longer scales with popularity.
+**Add caching of the HTML shell for 60 seconds.** Three requests reach you per page view, and all
+three are personalised: the part of the page that genuinely differs per user. That is the floor.
+The edge cannot absorb those three, and during a traffic spike they are what your capacity plan
+is actually for.
 
 Then consider the day something goes wrong. A flood of traffic aimed at a static asset is absorbed
 at the edge and never reaches your origin. The same flood aimed at the personalised endpoint
@@ -292,7 +295,7 @@ any bandwidth saving.
 
 <Claim label="convention" source="cloudflare-blog">
 Published engineering writing on edge networks describes absorbing volumetric attack traffic
-before it reaches an origin as a primary function of the edge tier, which makes cacheability a
+before it reaches an origin as a primary function of the edge tier, which makes cacheability an
 availability property as well as a performance one.
 </Claim>
 
@@ -351,32 +354,32 @@ capacity, rather than as a latency optimisation alone.
 ## Check yourself
 
 <Check
-  concepts={['sticky-sessions', 'statelessness']}
-  prompt="Carts empty when a user's request lands on a different server. Two fixes are proposed: sticky sessions, or a shared session store. What is the difference that matters?"
+  concepts={['api-gateway', 'sticky-sessions']}
+  prompt="A team proposes moving three things into the API gateway: terminating TLS, rejecting requests that carry no valid credentials, and checking that the caller owns the order they are asking for. Which belong there?"
   options={[
     {
       id: 'a',
-      text: 'Stickiness makes routing a correctness requirement; a shared store leaves the tier stateless',
-      implies: 'You are distinguishing a workaround from a fix.',
-      why: 'Both make the symptom disappear. But stickiness means the system is only correct while routing cooperates — so deploys, instance failures, autoscaling and rebalancing all become user-visible faults, and none of them can be resolved without giving up the stickiness. The shared store removes the dependency, after which stickiness is optional and can be kept purely for cache warmth.',
+      text: 'The first two. Whether this caller owns this order needs the order data, which belongs to the service that owns it.',
+      implies: 'You applied the edge test: the same for every request, and cheaper the earlier it happens.',
+      why: 'Terminating TLS and turning away anonymous traffic are identical for every request and save the whole chain when done early, which is exactly the work the edge exists for. Whether this caller may see order 8471 depends on who owns order 8471, a fact only the order service has. Putting that check in the gateway couples the gateway to every service’s data model and puts the highest-consequence decision in the layer with the least testing.',
       credit: 'full',
     },
     {
       id: 'b',
-      text: 'Stickiness is faster because the session is in local memory',
-      implies: 'You are comparing them on latency.',
-      why: 'True and largely irrelevant at this scale: a session lookup from a shared cache is well under a millisecond, against a request budget of hundreds. Choosing the option that constrains your routing forever to save a fraction of a millisecond is a bad trade, and it is worth being able to say so with the numbers.',
-      credit: 'partial',
+      text: 'All three, because one place for security is simpler to audit',
+      implies: 'You are centralising for the sake of review.',
+      why: 'One place is genuinely easier to audit, and that is the argument for authenticating at the edge. But the ownership check cannot be made without loading the object, so the gateway would have to call the order service or read its data. Every team would then edit the one component whose failure is total, which is the monolith this lesson opened with.',
+      credit: 'none',
     },
     {
       id: 'c',
-      text: 'A shared store adds a dependency that can fail, so stickiness is safer',
-      implies: 'You are counting dependencies rather than failure modes.',
-      why: 'The shared store is a real dependency and needs redundancy. But stickiness does not remove the failure mode, it relocates it: the session now depends on one specific instance staying alive and staying reachable, which is a far less reliable component than a replicated store, and its failure cannot be repaired by retrying.',
-      credit: 'none',
+      text: 'Only TLS. Each service should check credentials itself so the services stay independent.',
+      implies: 'You are protecting service autonomy.',
+      why: 'Independence is a real value, and a service may check again as defence in depth. But forty implementations of credential checking produce forty subtly different behaviours, found by attackers rather than by tests. Rejecting anonymous traffic once, early, is the uniform and cheaper-when-early work that belongs at the edge.',
+      credit: 'partial',
     },
   ]}
-  stronger="A stronger answer notes the third option — put the session in a signed token held by the client — which removes the server-side store entirely, at the cost of not being able to revoke it before expiry and of carrying its bytes on every request. That trade is the same one that governs every stateless-versus-stateful choice, and naming it shows the pattern rather than the instance."
+  stronger="A stronger answer states the test it used — is this the same for every request, and is it cheaper the earlier it happens — and follows the identity through. The gateway passes an authenticated caller to the service, and the service scopes every query by it, so a request the gateway let through can still only reach that caller's own data. It also names the one routing setting that must never be allowed to become a correctness rule: stickiness, which the previous lesson made unnecessary by moving sessions to a shared store."
 />
 
 <Check
@@ -416,6 +419,6 @@ capacity, rather than as a latency optimisation alone.
     { label: 'Varying responses and cache keys', sourceId: 'rfc9110' },
     { label: 'Why proximity dominates perceived latency', sourceId: 'hpbn' },
     { label: 'The edge as an absorption layer, not only a cache', sourceId: 'cloudflare-blog' },
-    { label: 'Next: when a small fraction of traffic is most of the traffic', href: '/lessons/when-load-is-not-even' },
+    { label: 'Next: caching, and the price you pay for it', href: '/lessons/caching-a-bet-on-time' },
   ]}
 />

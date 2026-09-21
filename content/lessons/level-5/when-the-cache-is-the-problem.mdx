@@ -35,6 +35,10 @@ accordingly.
 
 ## Intuition
 
+Level 2 put a number on this: the cold-cache overload factor, the full request rate divided by what
+the origin can serve. This lesson is about the many ordinary ways the hit rate falls short of full
+without the cache ever going down.
+
 Adding a cache feels like adding speed. It also does something less visible: **it changes what the
 origin is sized for.**
 
@@ -141,13 +145,14 @@ without anything in your system changing. The signature is distinctive and worth
     { title: 'Instances', nodes: [{ id: 'app', label: 'App instances', note: 'local cache, cold on deploy' }] },
     { title: 'Coalescing', nodes: [{ id: 'single', label: 'Single-flight', note: 'one miss per key', tone: 'accent' }] },
     { title: 'Shared', nodes: [{ id: 'cache', label: 'Shared cache', note: 'shared eviction pressure' }] },
-    { title: 'Origin', nodes: [{ id: 'db', label: 'Database', note: 'sized for 5% of traffic', tone: 'accent' }] },
+    { title: 'Origin', nodes: [{ id: 'db', label: 'Database', note: 'sized for 5% of traffic', tone: 'accent' }, { id: 'shed', label: 'Shed or degrade', note: 'the zero-hit-rate plan' }] },
   ]}
   edges={[
     { from: 'user', to: 'app' },
     { from: 'app', to: 'single', label: 'on miss' },
     { from: 'single', to: 'cache' },
     { from: 'cache', to: 'db', label: 'miss' },
+    { from: 'single', to: 'shed', label: 'over budget', tone: 'danger' },
   ]}
   stages={[
     {
@@ -164,7 +169,7 @@ without anything in your system changing. The signature is distinctive and worth
     },
     {
       label: 'Assume the cache is gone',
-      show: ['user', 'app', 'single', 'cache', 'db'],
+      show: ['user', 'app', 'single', 'cache', 'db', 'shed'],
       because:
         'The design must have an answer for a zero percent hit rate: shed load, serve degraded responses, or provision the origin for it. Choosing none of those is choosing the outage, and choosing it in advance rather than during one is the whole point.',
     },
@@ -196,7 +201,7 @@ without anything in your system changing. The signature is distinctive and worth
     {
       scale: 'Shared multi-tenant cache',
       behaviour:
-        'Hit rate becomes a function of other teams behaviour, and changes without any deploy of your own.',
+        'Hit rate becomes a function of other teams’ behaviour, and changes without any deploy of your own.',
       firstToBreak:
         'Your working set, evicted by someone else. The investigation starts in the wrong system because nothing in yours changed.',
     },

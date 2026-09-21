@@ -349,10 +349,10 @@ system it audits. An audit trail that a compromised administrator can edit is no
         'Specify the dimension — per API key, per account, per IP — where it is enforced, and how counters are shared across the fleet.',
     },
     {
-      mistake: 'Encryption at rest means the data is protected.',
-      why: 'It protects against stolen disks and mis-provisioned storage. It does nothing against a compromised application, which reads through the decryption layer like any legitimate caller.',
+      mistake: 'We use OAuth for login.',
+      why: 'OAuth is delegation: it lets an application act on a user’s behalf. An access token proves that someone authorised access, not who is presenting it or which application it was issued to, so treating a bare access token as proof of identity lets a token obtained by one application be used to sign in to another.',
       instead:
-        'State the threat each control addresses. Encryption at rest covers physical and provisioning threats; application compromise is covered by least privilege, isolation and audit.',
+        'Authenticate with OpenID Connect, which adds an identity token on top of OAuth, and validate it — signature, issuer, expiry, and that its audience is your application. Use OAuth access tokens for what they are for: calling an API on the user’s behalf.',
     },
   ]}
 />
@@ -425,8 +425,8 @@ system it audits. An audit trail that a compromised administrator can edit is no
     { label: 'JWT structure and the absence of a revocation mechanism', sourceId: 'rfc7519' },
     { label: 'Absorbing volumetric traffic at the edge', sourceId: 'cloudflare-blog' },
     {
-      label: 'Next: what all of this costs, and whether it is worth it',
-      href: '/lessons/what-it-costs',
+      label: 'Next: the environment as code, and the secrets that must stay out of it',
+      href: '/lessons/the-environment-is-code',
     },
   ]}
 />

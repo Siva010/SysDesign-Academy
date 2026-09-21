@@ -106,10 +106,11 @@ rather than a technical detail.
 large regions, run many independent cells, each serving a subset of users, each a complete
 stack. A failure — including a bad deploy, if deployment is per-cell — affects one cell.
 
-<Callout kind="warn" title="Replication is not backup, and backup is not restore">
-Replication copies your DELETE faithfully to every region. Backups protect against logical
-corruption, which replication accelerates. And a backup you have never restored is a belief:
-you do not know how long it takes, whether it is complete, or whether the procedure works.
+<Callout kind="warn" title="A second region is not a backup">
+Level 3 made the point about replicas, and it scales up unchanged: a second region copies your
+DELETE as faithfully as your data, just further away. The protection against a bad write is still
+a backup outside the replication stream, and it is only a protection once a restore from it has
+been timed.
 </Callout>
 
 <Deeper title="Blast radius is the more useful frame">
@@ -328,10 +329,10 @@ has not been executed recently should be assumed not to work.
         'State which failure class each investment covers. Multi-region covers regional loss; progressive rollout covers change; tested backups cover corruption. They are not substitutes.',
     },
     {
-      mistake: 'We have backups.',
-      why: 'Having backups and being able to restore are different claims. Untested restores commonly turn out to be incomplete, far slower than assumed, or dependent on a procedure that no longer works.',
+      mistake: 'The standby region can be smaller, since it only runs during a failover.',
+      why: 'A failover sends it everything at once: the whole of the primary’s traffic, plus every client reconnecting and every queued retry arriving together, against cold caches. A standby sized at half the primary turns a regional outage into an overload in the region you were counting on.',
       instead:
-        'Restore on a schedule and record how long it took. That measured number is your real RTO for data loss.',
+        'Size the standby for full load plus the reconnect surge, or decide in advance what will be shed during a failover and build that shedding in. Either is a plan; a smaller standby with no plan is a second outage.',
     },
     {
       mistake: 'Active-active gives us zero downtime.',

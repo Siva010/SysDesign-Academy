@@ -18,11 +18,12 @@ status: reviewed
 
 A team spends six weeks optimising an API endpoint. They cut server processing from 90
 milliseconds to 12. The p50 page load, measured from users in Australia against servers in
-Ireland, improves from 1.9 seconds to 1.8.
+Ireland, improves from 1.7 seconds to 1.6.
 
 The work was real. The impact was not, because server time was never the dominant term. About
-340 milliseconds of every request was the round trip to Ireland and back, repeated for each of
-four sequential dependencies, and no amount of application optimisation touches that.
+250 milliseconds of every exchange was the round trip to Ireland and back, paid again for the
+page request and for each of the three API calls that followed it, and no amount of application
+optimisation touches that.
 
 Before you optimise anything, you need to know which parts of the budget are negotiable.
 
@@ -65,7 +66,7 @@ Total, roughly 1.7 seconds. Server processing is 5% of it.
 
 The three sequential API calls are the largest single term, and they are architecture: if they
 can be made parallel, 750 ms becomes 250 ms. Terminating TLS at an edge location near Sydney
-turns two of the three handshake round trips into short ones. Between them, those two changes
+turns both handshake round trips into short ones. Between them, those two changes
 save around a second — an order of magnitude more than the six-week optimisation.
 
 <Claim label="inference">
@@ -356,7 +357,7 @@ already small.
       id: 'b',
       text: 'Closer to 200 ms, because the slowest of 50 usually lands in the tail',
       implies: 'You applied the fanout amplification argument to the median rather than only to the tail.',
-      why: 'With 50 parallel calls, tail events stop being rare from the request’s point of view. The median request contains something close to a tail call, so the aggregate p50 drifts toward the component p99. This is why every dependency dashboard can look healthy while user latency is poor.',
+      why: 'The request finishes when its slowest call does, so its median is the latency that all 50 calls beat half the time. That is each dependency’s 98.6th percentile, because 0.986 to the power of 50 is about 0.5. The aggregate p50 therefore sits just below the component p99, a long way from its p50. This is why every dependency dashboard can look healthy while user latency is poor.',
       credit: 'full',
     },
     {

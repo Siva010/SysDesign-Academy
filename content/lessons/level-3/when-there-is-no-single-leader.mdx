@@ -411,7 +411,7 @@ later.
       id: 'a',
       text: 'It depends on the data type, and for a document with no merge rule the honest answer is to preserve both versions and involve the user',
       implies: 'You are treating merge as a property of the data rather than of the store.',
-      why: 'A counter merges by summing increments, a set by union, a cart by union with removals applied last — those merge automatically. An opaque document has no such rule, and any automatic choice discards someone work. Preserving both and surfacing the conflict is the only resolution that never loses data, and it is what file synchronisation systems do for exactly this reason.',
+      why: 'A counter merges by summing increments, a set by union, a cart by union with removals applied last — those merge automatically. An opaque document has no such rule, and any automatic choice discards someone’s work. Preserving both and surfacing the conflict is the only resolution that never loses data, and it is what file synchronisation systems do for exactly this reason.',
       credit: 'full',
     },
     {
@@ -444,6 +444,6 @@ later.
       sourceId: 'cassandra-docs',
       note: 'The resurrection failure is documented behaviour, not a bug, and it has an operational rule attached.',
     },
-    { label: 'Next: how machines reach agreement despite crashes and partitions', href: '/lessons/agreeing-anyway' },
+    { label: 'Next: when one machine can no longer hold the data', href: '/lessons/splitting-the-data' },
   ]}
 />

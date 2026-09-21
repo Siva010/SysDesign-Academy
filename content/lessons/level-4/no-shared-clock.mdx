@@ -17,8 +17,8 @@ status: reviewed
 
 ## The problem
 
-Two data centres. A user updates their profile picture in one, then — a second later, on their
-phone, routed to the other — changes it back.
+Two data centres. A user updates their profile picture in one, then — 400 milliseconds later, on
+their phone, routed to the other — changes it back.
 
 Both writes carry a timestamp from the machine that handled them. The second machine's clock is
 600 ms behind. When the two writes meet during replication, conflict resolution keeps the one
@@ -31,7 +31,9 @@ Meanwhile a monitoring system marks a node dead because it has not responded in 
 The node is fine. Its garbage collector paused for six.
 
 These are the two facts that make distributed systems hard, and no amount of engineering
-removes them.
+removes them. Level 3 met both as symptoms — a last-write-wins merge keeping the older value, and
+an old leader coming back after a failover still believing it was in charge. This level is about
+why neither can be fixed at the source, and what is built on top instead.
 
 ## Intuition
 
@@ -143,7 +145,7 @@ Most systems cannot bound it, which is why most systems use logical clocks or co
 <Arch
   caption="The same two writes, ordered three ways, with three different outcomes."
   columns={[
-    { title: 'Writers', nodes: [{ id: 'a', label: 'Node A', note: 'clock +200ms' }, { id: 'b', label: 'Node B', note: 'clock −400ms' }] },
+    { title: 'Writers', nodes: [{ id: 'a', label: 'Node A', note: 'clock correct' }, { id: 'b', label: 'Node B', note: 'clock 200 ms behind' }] },
     { title: 'Ordering', nodes: [{ id: 'wall', label: 'Wall clock', note: 'silently wrong' }, { id: 'logical', label: 'Logical clock', note: 'causal', tone: 'accent' }, { id: 'consensus', label: 'Consensus', note: 'one true order' }] },
     { title: 'Outcome', nodes: [{ id: 'lost', label: 'Write discarded' }, { id: 'conflict', label: 'Conflict surfaced' }, { id: 'ordered', label: 'Total order' }] },
   ]}
@@ -377,32 +379,32 @@ agreed order.
 />
 
 <Check
-  concepts={['failure-detector', 'network-partition']}
-  prompt="Your failure detector uses a 3-second timeout. A node pauses for 8 seconds during garbage collection. What is the danger, and what actually prevents it?"
+  concepts={['vector-clock', 'happens-before']}
+  prompt="Three replicas track versions with vector clocks. Replica A holds a value for a key stamped [A:3, B:1, C:0]. Replica B holds a value for the same key stamped [A:2, B:2, C:0]. Which is newer?"
   options={[
     {
       id: 'a',
-      text: 'The node is declared dead and restarted, which is safe',
-      implies: 'You are assuming the detector can act on the node.',
-      why: 'The detector cannot restart a node it cannot reach. The node resumes on its own, still believing whatever it believed 8 seconds ago — including, potentially, that it is the leader.',
-      credit: 'none',
-    },
-    {
-      id: 'b',
-      text: 'A new leader is elected while the old one is still alive; a lease with fencing tokens is what stops the old leader acting',
-      implies: 'You identified the split-brain window and the mechanism that closes it.',
-      why: 'Timeouts alone cannot prevent this, because the paused node has no way to know time passed. A lease means its authority expires by wall-clock time; a fencing token means the storage layer rejects writes carrying a stale token even if the node tries.',
+      text: 'Neither. Each has seen an update the other has not, so they are concurrent and both must be kept or merged.',
+      implies: 'You compared the vectors counter by counter rather than as a single number.',
+      why: 'One version descends from another only if every one of its counters is at least as large. The first is ahead on A’s counter (3 against 2) and behind on B’s (1 against 2), so neither dominates: someone wrote on A and someone wrote on B, each without having seen the other. Choosing one silently would discard a real write, which is exactly what vector clocks exist to prevent.',
       credit: 'full',
     },
     {
+      id: 'b',
+      text: 'The first, because its counters add up to more',
+      implies: 'You are collapsing the vector into one number.',
+      why: 'A sum throws away the per-replica information, which is the same thing a Lamport clock loses. Here the sums are equal anyway, and even if one were larger it would say nothing about whether either write had seen the other.',
+      credit: 'none',
+    },
+    {
       id: 'c',
-      text: 'Increase the timeout to 10 seconds so this cannot happen',
-      implies: 'You are tuning the detector rather than making the failure safe.',
-      why: 'It reduces the frequency and does not remove the possibility — a 12-second pause is still possible — while making every genuine failure take 10 seconds to detect. You have traded availability for a partial reduction in a risk you have not eliminated.',
+      text: 'Whichever carries the later wall-clock timestamp',
+      implies: 'You are falling back to time.',
+      why: 'Acceptable as a deliberate resolution policy once concurrency has been detected, for data that genuinely is last-write-wins. As a way of deciding which write is newer, it reintroduces the clock skew the vector was carrying precisely in order to avoid.',
       credit: 'partial',
     },
   ]}
-  stronger="A stronger answer states the general principle: safety must not depend on timing assumptions. Timeouts affect how quickly you detect failure, which is a liveness property; correctness must come from mechanisms that remain valid regardless of how long a pause lasted, which is what fencing tokens and quorum intersection provide."
+  stronger="A stronger answer says what happens next: the store keeps both versions as siblings and hands them to the application, whose merge rule depends on the data — union a set, add up the increments, or show both to the user. It also names the cost that makes production systems prune these vectors: one counter per writing replica, carried on every version."
 />
 
 ## Going deeper
