@@ -8,7 +8,7 @@ signatures: [scheduling]
 concepts: [queue, queue-depth, head-of-line-blocking, littles-law, back-of-envelope, admission-control, backpressure, load-shedding, rate-limiting, tenant-isolation, blast-radius, capacity-headroom, autoscaling, horizontal-scaling, lease, fencing-token, heartbeat, failure-detector, leader-election, idempotency, idempotency-key, at-least-once, effectively-once, retry, exponential-backoff, timeout, dead-letter-queue, poison-message, thundering-herd, batching, cache-generic, hit-rate, graceful-degradation, tail-latency, latency, throughput, cost, observability, bulkhead, feature-flag]
 patterns: [bulkhead, token-bucket, circuit-breaker, idempotency-key]
 prerequisites: [doing-it-later, when-load-is-not-even]
-sources: [ostep, sre-book, aws-builders-library, tail-at-scale, ddia, netflix-tech]
+sources: [ostep, brendan-gregg, sre-book, aws-builders-library, tail-at-scale, ddia, netflix-tech]
 status: reviewed
 ---
 
@@ -65,10 +65,14 @@ chain, and the question of why the tests take ninety minutes.
 - **40% of the day's jobs** arrive in two two-hour windows, mid-morning and mid-afternoon.
 - Peak arrival is therefore about **10,000 jobs in two hours**, or 1.4 per second, against a
   daily mean of 0.6.
+- **Mean duration about 20 minutes**, because a fifth of the jobs are long integration suites. The
+  median describes most jobs; the mean describes most of the machine time.
+- **Little's law at the peak:** 1.4 jobs a second × 1,200 seconds ≈ **1,700 jobs running at once**,
+  on 2,000 machines. That is about 85% utilisation during the two windows, and far less overnight.
 
 The spread matters more than the totals, and the utilisation number matters more than either.
 
-<Claim label="fact" source="ostep">
+<Claim label="fact" source="brendan-gregg">
 In a queueing system with random arrivals, mean waiting time rises as utilisation approaches
 capacity, and does so hyperbolically rather than linearly: waiting time is proportional to
 &rho; / (1 &minus; &rho;) for utilisation &rho;. The consequence is that the final few percent of
@@ -87,15 +91,19 @@ Put numbers on that, because it settles an argument that otherwise runs on opini
 
 <Claim label="inference">
 The fleet cannot be both highly utilised and responsive; the relationship is hyperbolic, so there is
-no engineering that removes the trade. Running at 95% rather than 80% saves roughly 16% of the
-machines and costs each three-minute job about 45 additional minutes of waiting. With 5,000
+no engineering that removes the trade. In the single-queue model, running at 95% rather than 80%
+saves roughly 16% of the machines and costs each three-minute job about 45 additional minutes of
+waiting. With 5,000
 engineers that is the most expensive cost saving available, and the scheduler's job is to make the
 exchange rate visible rather than to pretend it does not exist.
 </Claim>
 
-These are idealised figures &mdash; real arrivals are burstier than the model and durations are far
-from exponential, which makes the true curve worse rather than better. Use them as the shape of the
-argument, not as a prediction.
+These are the figures for one queue in front of one server, and a fleet is not that. A pool of
+2,000 interchangeable machines absorbs randomness far better, and its knee sits much closer to
+100%. The single-server curve is still the right intuition here because this pool is not
+interchangeable: machine classes, per-tenant shares and reserved slices divide it into many smaller
+queues, and a thirtyfold duration spread makes each of them behave worse than the model. Use the
+table for the shape of the argument, and measure your own queues for the numbers.
 
 ## Data model
 
@@ -426,8 +434,8 @@ or whether first-in-first-out would have been fine.
 </Claim>
 
 <Claim label="inference">
-The wait-time multipliers in the estimate come from an idealised model with random arrivals and
-exponential service times. Real build fleets have burstier arrivals and heavier-tailed durations,
-which makes waiting worse than the table suggests, not better. Use the shape of the curve for the
-argument and measure your own fleet for the numbers.
+The wait-time multipliers in the estimate come from an idealised single-queue model with random
+arrivals and exponential service times. A large pool of identical machines does better than the
+table; the divisions a real fleet needs, and its heavy-tailed durations, push it back toward the
+table. Use the shape of the curve for the argument and measure your own fleet for the numbers.
 </Claim>

@@ -64,6 +64,12 @@ version**, so any step can be rolled back by reverting one deploy.
       because:
         'The new version writes both and reads the new; the old version continues on the old form. Both remain correct, which is what makes rollback real.',
     },
+    {
+      label: 'Contract',
+      show: ['new', 'newcol'],
+      because:
+        'Once no running version reads the old form, it is removed. This is the only irreversible step, which is why it comes last and waits for evidence that nothing still reads it rather than for a date.',
+    },
   ]}
 />
 

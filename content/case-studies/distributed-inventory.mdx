@@ -349,8 +349,8 @@ Ten gigabytes of stock rows is nothing, and the ledger is the only thing that gr
 it by time and tier it out; this is the one place where a retention policy genuinely matters.
 
 The operational cost is the **read path**, and it is dominated by cache hit rate. At 500,000 reads
-per second, the difference between 95% and 99% hit rate is 20,000 versus 5,000 database reads per
-second, which is the difference between a modest cluster and a large one. Serving bands rather than
+per second, the difference between 95% and 99% hit rate is 25,000 versus 5,000 database reads per
+second, which is the difference between a large cluster and a modest one. Serving bands rather than
 counts is worth more here than any amount of hardware, because it changes the invalidation rate
 rather than the capacity.
 

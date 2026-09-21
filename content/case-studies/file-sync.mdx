@@ -374,7 +374,7 @@ measures whether the components are healthy. This one measures whether the promi
     },
     {
       what: 'Hash existence oracle',
-      symptom: 'An attacker determines whether a specific document exists in another user account.',
+      symptom: 'An attacker determines whether a specific document exists in another user’s account.',
       cause: 'Cross-user deduplication reveals block existence through whether the server requests the bytes.',
       mitigation: 'Deduplicate within a trust boundary, or always transfer and deduplicate server-side.',
     },

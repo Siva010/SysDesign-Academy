@@ -25,7 +25,7 @@ intersections, scoring, faceting.
 
 **Autocomplete** runs on every keystroke. A user typing eight characters generates eight requests,
 each of which must return before they type the next one. That is roughly **eight times the traffic
-at a fifth of the latency budget**, for a result that matters less.
+at a quarter of the latency budget**, for a result that matters less.
 
 Underneath both: matching is the easy part, ranking is the product, and freshness is what you pay.
 
@@ -323,7 +323,7 @@ system stops working at once.
   items={[
     {
       what: 'Analysis mismatch',
-      symptom: 'Searching a product exact title returns nothing, while a partial phrase works.',
+      symptom: 'Searching for a product’s exact title returns nothing, while a partial phrase works.',
       cause: 'The query was analysed differently from the documents — a stemmer, synonym set or tokeniser applied to one side only.',
       mitigation: 'One analysis definition applied to both paths, with a test that indexes a document and searches for its own field values.',
     },
@@ -391,9 +391,9 @@ system stops working at once.
 4. **Headroom for a second index copy**, needed permanently rather than occasionally.
 
 A cheaper design drops typo tolerance and synonyms, both of which increase index size and query
-work. What that sacrifices is the recall of exactly the queries users type badly, which is most of
-them — so it lowers cost by lowering the zero-result rate's own denominator. Measure before
-trading it away.
+work. What that sacrifices is recall on exactly the queries users type badly, which is a large
+share of them, so the saving arrives as a rising zero-result rate. Measure that rate before and
+after, and trade it away only if the number stays acceptable.
 
 ## What we did NOT build
 

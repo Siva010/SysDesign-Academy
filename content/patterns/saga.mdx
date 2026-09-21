@@ -27,13 +27,18 @@ takes seconds and involves a third party you do not control.
 ## Pattern
 
 Give up atomicity. Replace it with a sequence of local transactions, each with a defined
-**compensating action** that undoes it.
+**compensating action** that undoes it — and order the steps so the hardest one to undo comes
+last.
 
-    Reserve inventory   →  compensate: release reservation
-    Charge card         →  compensate: refund
-    Create shipment     →  compensate: cancel shipment
+    Reserve inventory      →  compensate: release reservation
+    Authorise the card     →  compensate: void the authorisation
+    Create shipment        →  compensate: cancel shipment
+    Capture the payment    →  last, because its compensation is a refund
 
-If step three fails, run the compensations for steps two and one, in reverse order.
+If step three fails, run the compensations for steps two and one, in reverse order: void the
+authorisation, release the reservation. No money has moved, so nobody is refunded. Splitting the
+charge into a hold and a capture is what makes that possible, and it is the same move as ordering
+by reversibility, applied inside a single step.
 
 Two ways to drive it:
 
@@ -51,13 +56,14 @@ Every step and every compensation must be idempotent, because retries are guaran
   caption="Local transactions forward, compensations backward."
   columns={[
     { title: 'Driver', nodes: [{ id: 'orch', label: 'Orchestrator', note: 'or events', tone: 'accent' }] },
-    { title: 'Steps', nodes: [{ id: 's1', label: 'Reserve stock' }, { id: 's2', label: 'Charge card' }, { id: 's3', label: 'Create shipment' }] },
+    { title: 'Steps', nodes: [{ id: 's1', label: 'Reserve stock' }, { id: 's2', label: 'Authorise card', note: 'a hold, not a charge' }, { id: 's3', label: 'Create shipment' }, { id: 's4', label: 'Capture payment', note: 'last: hardest to undo' }] },
     { title: 'On failure', nodes: [{ id: 'comp', label: 'Compensations', note: 'reverse order' }, { id: 'dlq', label: 'Manual review' }] },
   ]}
   edges={[
     { from: 'orch', to: 's1' },
     { from: 'orch', to: 's2' },
     { from: 'orch', to: 's3' },
+    { from: 'orch', to: 's4' },
     { from: 's3', to: 'comp', label: 'failed', tone: 'danger' },
     { from: 'comp', to: 'dlq', label: 'compensation failed', tone: 'danger' },
   ]}

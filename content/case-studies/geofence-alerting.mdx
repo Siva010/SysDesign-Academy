@@ -423,10 +423,11 @@ unbounded latency rather than removing it.
 </Claim>
 
 <Claim label="fact" source="sre-book">
-Alerting should be driven by symptoms a user would notice rather than by internal causes. For this
-system the symptom is consumer lag: alerts stop arriving long before any error rate moves, which is
-why Round 9's stall is invisible to error-based monitoring.
+Alerting should be driven by symptoms a user would notice rather than by internal causes.
 </Claim>
+
+For this system the symptom is consumer lag: alerts stop arriving long before any error rate moves,
+which is why the silent stall under What breaks is invisible to error-based monitoring.
 
 <Claim label="speculation">
 Device counts, the fraction moving, reporting intervals and the 100,000 regions are illustrative

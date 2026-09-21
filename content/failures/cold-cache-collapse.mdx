@@ -79,8 +79,9 @@ the cache to refill, which is what allows you to serve more.
 ## How to prevent it
 
 **Request coalescing.** When many concurrent requests miss the same key, one goes to the origin
-and the others wait for its result. This does nothing for a fully cold cache, where every key is
-different, but it is essential for the single-hot-key expiry case.
+and the others wait for its result. It helps less than it sounds for a fully cold cache, where
+most concurrent misses are for different keys, and it is essential for the single-hot-key expiry
+case.
 
 **Load shedding at the entry point.** If the origin can serve 8,000 per second, admit
 approximately that many and reject the rest quickly. The system stays partially available instead

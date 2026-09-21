@@ -10,19 +10,20 @@ status: reviewed
 
 ## What you see
 
-**Tuesday** — A support ticket. A customer deleted a saved address five weeks ago. It is back in
+**Tuesday** — A support ticket. A customer deleted a saved address three weeks ago. It is back in
 their account.
 
 Support looks for the write that recreated it. There is none. The application audit log has the
-deletion, five weeks ago, and nothing since. The customer is certain they did not re-add it, and
+deletion, three weeks ago, and nothing since. The customer is certain they did not re-add it, and
 the evidence agrees with them.
 
-**Wednesday** — Four more tickets. All restored records. All deletions from a three-day window in
-the previous month. All in one keyspace.
+**Wednesday** — Four more tickets. All restored records. All deletions from the same four-day
+window, three weeks ago. All in one keyspace.
 
 **Wednesday afternoon** — Somebody checks the cluster's history. Three weeks ago a node was
 removed for a hardware fault and rejoined fourteen days later, after the part arrived. The
-tombstone grace period on that keyspace is ten days.
+tombstone grace period on that keyspace is ten days — so every deletion made in the first four
+days of its absence had its marker purged everywhere else before it came back.
 
 Nobody made a mistake at the keyboard. Every component behaved exactly as documented. The data is
 back because of an interaction between two settings and one maintenance decision, and there is no

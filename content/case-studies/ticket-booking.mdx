@@ -76,7 +76,7 @@ here is a storage problem.
 |---|---|---|
 | Event | event id | Small, heavily read, perfectly cacheable |
 | Seat | event id | Contention concentrates here by construction |
-| Hold | seat id | Short-lived, with an expiry |
+| Hold | on the seat row | A hold id and an expiry, kept on the seat so the claim stays one conditional update |
 | Order | order id | Immutable once complete |
 
 Seat state is a small state machine, and being explicit about it is most of the design:

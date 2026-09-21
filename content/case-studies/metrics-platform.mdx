@@ -243,8 +243,8 @@ trillion points, and no query engine reads that interactively.
 
 **Rollups.** Precompute one-minute, five-minute and one-hour aggregates. A query picks the
 coarsest resolution whose step still satisfies what was asked for. A thirty-day graph 1,000 pixels
-wide cannot show more than 1,000 points, so serving it from raw samples reads 500 times more data
-than can possibly be displayed.
+wide cannot show more than 1,000 points, so serving it from raw samples reads about 260 times more
+data than can possibly be displayed.
 
 Two costs, and the second is the one people get wrong.
 
@@ -255,10 +255,12 @@ rebuildable from raw data, and the rebuild must be tested rather than theoretica
 Rolling up a mean is a weighted mean. Rolling up a maximum is a maximum. Rolling up a **p99 is not
 any function of the p99s** you started with.
 
-Take two one-minute buckets, each with 100 requests. In the first, 99 take 10 ms and one takes
-1,000 ms, so p99 is roughly 10 ms. In the second, identical. Average the p99s and you get 10 ms.
-But the combined 200 requests contain **two** at 1,000 ms, so the true p99 of the merged bucket is
-1,000 ms — a hundredfold error, and it always errs toward saying the system is healthy.
+Take ten servers with equal traffic. Nine are healthy, with a p99 of 10 ms. One is struggling: a
+fifth of its requests take 1,000 ms, so its p99 is 1,000 ms. Average the ten p99s and you get
+109 ms. But across all the traffic, 2% of requests take 1,000 ms, so the true p99 is 1,000 ms —
+nine times what the averaged figure claims. Rolling one-minute buckets into hours has the same
+problem. The averaged number has no defined meaning, and because trouble tends to concentrate in a
+few places, it usually errs toward saying the system is healthy.
 
 The fix is structural: store histograms as bucket counts and roll them up by **adding the
 buckets**, computing the quantile at query time. A platform that stores precomputed quantiles has

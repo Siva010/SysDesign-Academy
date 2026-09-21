@@ -56,8 +56,10 @@ advice, which is not an engineering artefact.
 
 <Estimator preset="traffic" />
 
-- **20,000 orders per second** at peak; roughly 1.5 billion a year.
-- An order id at 16 bytes, indexed, is a few hundred gigabytes a year with its index. Unremarkable.
+- **20,000 orders per second** at peak. Averaging perhaps a quarter of that, around 150 billion a
+  year.
+- An order id at 16 bytes is a few terabytes a year once indexed, which is unremarkable next to the
+  orders themselves.
 - **5% of orders produce an invoice**: about **1,000 invoices per second** at peak.
 - Those invoices are spread over **200 legal entities** and several document series each.
 
@@ -75,8 +77,9 @@ That single observation is the whole design, and it is worth being explicit abou
 <Claim label="inference">
 The gapless requirement is impossible at 20,000 per second and trivial at 50. The engineering task
 is therefore not to make a distributed gapless counter &mdash; which is a genuinely hard problem,
-and one nobody here needs solved. It is to establish that the constrained path carries a
-thousandth of the traffic, and then to keep it that way.
+and one nobody here needs solved. It is to establish that the constrained path carries a twentieth
+of the traffic, and no single sequence more than a quarter of a per cent of it, and then to keep it
+that way.
 </Claim>
 
 A candidate who starts inventing distributed sequence protocols has skipped the arithmetic and is
@@ -332,7 +335,7 @@ been issuing correctly for a period.
     {
       what: 'Wrong period at the boundary',
       symptom: 'Invoices issued around new year carry the wrong year, or a sequence restarts a day early.',
-      cause: 'The period was resolved from the server clock in UTC rather than from the entity jurisdiction timezone.',
+      cause: 'The period was resolved from the server clock in UTC rather than from the timezone of the entity’s jurisdiction.',
       mitigation: 'Resolve the period from entity configuration, store the resolved period on the invoice, and test the boundary in both directions.',
     },
   ]}

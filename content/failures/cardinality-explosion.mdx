@@ -24,9 +24,10 @@ run out of: samples per second is normal, ingest CPU is at 40%, storage write th
 unchanged, disk has months of headroom. Every capacity dashboard is green.
 
 **13:10** — Somebody graphs active series count. It was 52 million this morning. It is now
-1.4 billion, and the line has not flattened.
+just over 500 million, and the line has not flattened.
 
-**13:25** — The checkout deploy added a label to one metric. The label value is the request id.
+**13:25** — The checkout deploy added a label to one metric, its request latency histogram. The
+label value is the request id.
 
 One line of code. Ninety minutes. Every team's observability degraded, and at no point was any
 component of the ingest path overloaded.
@@ -43,10 +44,12 @@ The reason nothing in the ingest path notices is worth being precise about, beca
 makes the incident so hard to find:
 
 - **Sample volume barely moves.** A request-id label means each new series receives exactly one
-  sample and never another. At 4,000 requests per second, that is 4,000 extra samples per second
-  against a baseline of five million. An increase of eight hundredths of one percent.
-- **Series creation rate goes up four hundredfold.** Normal churn is perhaps ten new series a
-  second across the whole fleet — a deploy here, an autoscale there. It is now 4,010.
+  sample and never another. On a histogram every request creates about 22 of them — one per
+  bucket, plus a sum and a count — so 4,000 requests a second add 88,000 samples a second against
+  a baseline of five million. An increase of under two per cent.
+- **Series creation rate goes up nearly nine thousandfold.** Normal churn is perhaps ten new
+  series a second across the whole fleet — a deploy here, an autoscale there. It is now over
+  88,000, which is roughly 470 million new series in the ninety minutes before anyone looked.
 
 <Claim label="inference">
 The overloaded resource is the index, and the load on it is not measured in samples. It is
@@ -56,7 +59,7 @@ watches sample throughput, and sample throughput is the one thing this incident 
 
 The index is a map from label values to the series carrying them, and it must be searchable by
 arbitrary combinations. At 52 million series and roughly 200 bytes of labels each it is about
-10 GB — small, memory-resident, fast. At 1.4 billion it is 280 GB, and it no longer fits.
+10 GB — small, memory-resident, fast. At 500 million it is 100 GB, and it no longer fits.
 
 From that moment, **every query slows, including queries that touch none of the affected
 metrics**, because every label lookup that used to be a memory access is now a disk read. A team
@@ -65,14 +68,14 @@ entirely different series, watches their tooling degrade for reasons invisible f
 are standing.
 
 Then the part that turns a ninety-minute mistake into a multi-week problem: **the series already
-exist.** Removing the label stops new ones being created and repairs nothing. The 1.4 billion
-index entries persist until retention expires them, which for a thirteen-month retention means the
+exist.** Removing the label stops new ones being created and repairs nothing. The hundreds of
+millions of new index entries persist until retention expires them, which for a thirteen-month retention means the
 platform is degraded until somebody deletes them deliberately.
 
 ## Why the obvious fixes make it worse
 
 **Restarting the storage nodes.** They must rebuild the in-memory index on start, and the index is
-now twenty-eight times larger. A ninety-second startup becomes forty minutes, during which that
+now ten times larger. A ninety-second startup becomes fifteen minutes, during which that
 node serves nothing. Restarting them in sequence extends the outage; restarting them together
 removes the platform entirely.
 
@@ -87,7 +90,7 @@ will conclude the diagnosis was wrong.
 
 **Deleting the offending series.** The right destination, and on a time-series store the deletion
 path is expensive: it creates markers that compaction must later process, which consumes exactly
-the I/O the platform currently has none of. Deleting a billion series during the incident can be
+the I/O the platform currently has none of. Deleting half a billion series during the incident can be
 slower than waiting.
 
 ## What actually works

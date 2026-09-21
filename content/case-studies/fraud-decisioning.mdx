@@ -307,7 +307,7 @@ answer possible.
     {
       what: 'Tail misses that nobody notices',
       symptom: 'Median latency looks excellent. A steady trickle of transactions is decided by the fallback rather than the model.',
-      cause: 'The budget was measured at the median or the 99th percentile, so tens of thousands of daily requests fell outside it silently.',
+      cause: 'The budget was measured at the median or the 99th percentile, so millions of requests a day fell outside it silently.',
       mitigation: 'Measure and alert at the percentile in the requirement, and count fallback invocations as a first-class metric rather than an error.',
     },
     {
@@ -415,9 +415,11 @@ logical operation, which is what allows a retried authorisation to reach the sam
 
 <Claim label="fact" source="sre-book">
 Service levels should be expressed at the percentile that reflects user experience, and error
-budgets make the cost of missing them explicit. At this volume the difference between the 99th and
-99.9th percentile is four million requests a day.
+budgets make the cost of missing them explicit.
 </Claim>
+
+At this volume the choice of percentile is not academic: a target at the 99th leaves 500
+transactions a second, over 40 million a day, outside it, and even the 99.9th leaves four million.
 
 <Claim label="speculation">
 The transaction rate, card count, profile size and 100 ms budget are illustrative and vary by

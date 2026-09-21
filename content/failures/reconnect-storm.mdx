@@ -41,14 +41,15 @@ Two facts, and everything follows from them.
 token validation, a session-registry write, a subscription restore. Sending a message afterwards
 costs a few bytes and a syscall. The ratio is easily a thousand to one.
 
-**Steady state hides that completely.** At half a percent daily churn, 2.4 million connections
-generate a few thousand handshakes a second, and the gateway tier runs at 5% utilisation. Every
+**Steady state hides that completely.** Phones change networks, sleep and wake all day, so a few
+thousand of the 2.4 million reconnect in any given second, and the gateway tier runs at 5%
+utilisation. Every
 dashboard says the tier is enormously over-provisioned, because for the workload it normally does,
 it is.
 
 A correlated disconnect converts the cheap operation into the expensive one for everybody at once.
 The tier was sized for the connections it *holds*, and it is now being asked to do the thing it
-almost never does, at a rate three hundred times its normal peak.
+almost never does, at nearly a hundred times its normal rate.
 
 Then it compounds, in two ways that matter more than the initial spike.
 

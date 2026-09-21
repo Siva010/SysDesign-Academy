@@ -116,8 +116,8 @@ rather than a rewrite, and means editing a post does not require touching millio
   columns={[
     { title: 'Author', nodes: [{ id: 'author', label: 'Author' }] },
     { title: 'Write path', nodes: [{ id: 'api', label: 'Post service', tone: 'accent' }, { id: 'posts', label: 'Posts store' }] },
-    { title: 'Distribution', nodes: [{ id: 'queue', label: 'Fanout queue' }, { id: 'worker', label: 'Fanout workers' }] },
-    { title: 'Feeds', nodes: [{ id: 'feeds', label: 'Feed store', note: 'capped lists' }] },
+    { title: 'Distribution', nodes: [{ id: 'follows', label: 'Follower lists', note: 'by followee' }, { id: 'queue', label: 'Fanout queue' }, { id: 'worker', label: 'Fanout workers' }] },
+    { title: 'Feeds', nodes: [{ id: 'feeds', label: 'Feed store', note: 'capped lists' }, { id: 'large', label: 'Large-account posts', note: 'merged at read' }] },
     { title: 'Reader', nodes: [{ id: 'reader', label: 'Feed API', note: 'one read' }] },
   ]}
   edges={[
@@ -125,22 +125,31 @@ rather than a rewrite, and means editing a post does not require touching millio
     { from: 'api', to: 'posts', label: 'synchronous' },
     { from: 'posts', to: 'queue', label: 'async' },
     { from: 'queue', to: 'worker' },
+    { from: 'worker', to: 'follows', label: 'who receives it' },
     { from: 'worker', to: 'feeds', label: 'N writes' },
     { from: 'reader', to: 'feeds', label: 'sequential' },
+    { from: 'reader', to: 'large', label: 'merge' },
+    { from: 'reader', to: 'follows', dashed: true },
     { from: 'reader', to: 'posts', label: 'hydrate', dashed: true },
   ]}
   stages={[
     {
       label: 'Fanout on read',
-      show: ['author', 'api', 'posts', 'reader'],
+      show: ['author', 'api', 'posts', 'follows', 'reader'],
       because:
-        'The simplest correct design: store the post, and assemble each feed at read time by querying every followee. Correct, and a scatter-gather across hundreds of partitions on the most frequent operation in the product.',
+        'The simplest correct design: store the post, and assemble each feed at read time by looking up who the reader follows and querying each of them. Correct, and a scatter-gather across hundreds of partitions on the most frequent operation in the product.',
     },
     {
       label: 'Fanout on write',
-      show: ['author', 'api', 'posts', 'queue', 'worker', 'feeds', 'reader'],
+      show: ['author', 'api', 'posts', 'follows', 'queue', 'worker', 'feeds', 'reader'],
       because:
-        'Move the work to write time. Feed reads become one sequential read of a prepared list, which is what the 50:1 read/write ratio calls for.',
+        'Move the work to write time. Workers look up the author’s followers and append a reference to each feed, so a feed read becomes one sequential read of a prepared list, which is what the 50:1 read/write ratio calls for.',
+    },
+    {
+      label: 'Hybrid',
+      show: ['author', 'api', 'posts', 'follows', 'queue', 'worker', 'feeds', 'large', 'reader'],
+      because:
+        'Accounts above a follower threshold are not fanned out. Their recent posts are read at request time and merged with the prepared list — a handful of extra reads, because nobody follows many enormous accounts. Round 1 explains why this is the design rather than a refinement.',
     },
   ]}
 />
