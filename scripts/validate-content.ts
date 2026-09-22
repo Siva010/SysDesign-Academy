@@ -19,6 +19,7 @@ import {
   loadAllFailures,
   loadAllLessons,
   loadAllPatterns,
+  orderedLessons,
 } from '../src/lib/content-node';
 
 const errors: string[] = [];
@@ -174,6 +175,70 @@ for (const lesson of lessons) {
   }
 }
 
+/* ---------------------------------------------------------------- reading order
+
+   The site derives one reading order - level, then module order, then lesson order - and each
+   lesson's footer links to its neighbours in it. Lesson bodies make their own claims about that
+   order, in "Next:" links and in prerequisites, and nothing keeps the two in step: moving a
+   lesson leaves its old neighbour's "Next:" link pointing at it and its prerequisites pointing
+   forward. A full read-through found 29 wrong "Next:" links, and every one of them was silent. */
+
+const sequence = orderedLessons(Object.fromEntries(MODULES.map((m) => [m.id, m.order])));
+const position = new Map(sequence.map((l, i) => [l.id, i]));
+
+/* A "Next:" link must name the lesson the footer will show next. At the end of a level it may
+   name that level's page instead, which is where a reader moving on would land anyway. */
+const NEXT_LINK = /label:\s*(['"])Next:(?:(?!\1)[^\n])*\1\s*,\s*href:\s*(['"])([^'"\n]+)\2/g;
+
+for (const [i, lesson] of sequence.entries()) {
+  const where = `lesson "${lesson.id}"`;
+  const next = sequence[i + 1];
+  const allowed = new Set<string>();
+  if (next) allowed.add(`/lessons/${next.id}`);
+  if (next && next.level !== lesson.level) allowed.add(`/levels/${next.level}`);
+
+  const labels = (lesson.body.match(/label:\s*['"]Next:/g) ?? []).length;
+  const links = [...lesson.body.matchAll(NEXT_LINK)];
+  if (links.length !== labels) {
+    err(`${where} has a "Next:" label this check cannot read; write it as { label: 'Next: ...', href: '...' }`);
+  }
+  for (const link of links) {
+    const href = link[3]!.replace(/\/$/, '');
+    if (!allowed.has(href)) {
+      err(
+        `${where} has a "Next:" link to ${href}, but ${next ? `the lesson after it is "${next.id}"` : 'it is the last lesson'}`,
+      );
+    }
+  }
+}
+
+/* A prerequisite has to be something the reader has already met. For a lesson that means one
+   earlier in the order; for a concept, one taught by an earlier lesson. */
+{
+  const firstTaught = new Map<string, number>();
+  for (const [i, l] of sequence.entries()) {
+    for (const c of l.concepts) if (!firstTaught.has(c)) firstTaught.set(c, i);
+  }
+  for (const [i, lesson] of sequence.entries()) {
+    const where = `lesson "${lesson.id}"`;
+    for (const p of lesson.prerequisites) {
+      const lessonAt = position.get(p);
+      if (lessonAt !== undefined) {
+        if (lessonAt >= i) err(`${where} requires lesson "${p}", which comes ${lessonAt - i} lesson(s) later`);
+        continue;
+      }
+      const conceptAt = firstTaught.get(p);
+      if (conceptAt !== undefined && conceptAt >= i) {
+        err(
+          conceptAt === i
+            ? `${where} requires concept "${p}", which it is itself the first lesson to teach`
+            : `${where} requires concept "${p}", first taught ${conceptAt - i} lesson(s) later in "${sequence[conceptAt]!.id}"`,
+        );
+      }
+    }
+  }
+}
+
 /* ---------------------------------------------------------------- patterns, cases, failures */
 
 const patterns = loadAllPatterns();
@@ -243,6 +308,39 @@ for (const doc of [...lessons, ...patterns, ...caseStudies, ...failures]) {
     err(
       `${doc.filePath} has a nested double quote inside an MDX attribute, which fails to compile: ${nestedQuote[0].slice(0, 60)}`,
     );
+  }
+}
+
+/* A staged diagram promises that each step changes the picture. A stage showing exactly the
+   nodes of the one before it does nothing when clicked, which reads as a broken control rather
+   than as a diagram that has nothing more to say. */
+const ARCH_BLOCK = /<Arch\b[\s\S]*?\n\/>/g;
+const STAGE = /label:\s*(['"])((?:(?!\1)[^\n])*)\1\s*,\s*show:\s*\[([^\]]*)\]/g;
+
+for (const doc of [...lessons, ...patterns, ...caseStudies, ...failures]) {
+  for (const arch of doc.body.matchAll(ARCH_BLOCK)) {
+    const stagesAt = arch[0].indexOf('stages={');
+    if (stagesAt < 0) continue;
+    const stagesSource = arch[0].slice(stagesAt);
+    const stages = [...stagesSource.matchAll(STAGE)].map((s) => ({
+      label: s[2]!,
+      show: s[3]!
+        .split(',')
+        .map((id) => id.trim().replace(/^['"]|['"]$/g, ''))
+        .filter(Boolean)
+        .sort()
+        .join(','),
+    }));
+    if (stages.length !== (stagesSource.match(/\bshow:/g) ?? []).length) {
+      err(`${doc.filePath} has a diagram stage this check cannot read; write it as { label: '...', show: [...] }`);
+    }
+    for (let i = 1; i < stages.length; i++) {
+      if (stages[i]!.show === stages[i - 1]!.show) {
+        err(
+          `${doc.filePath} diagram stage "${stages[i]!.label}" shows the same nodes as "${stages[i - 1]!.label}", so clicking it changes nothing`,
+        );
+      }
+    }
   }
 }
 
