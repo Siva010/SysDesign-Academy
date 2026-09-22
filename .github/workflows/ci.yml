@@ -1,0 +1,49 @@
+# Runs every check the repository has, on every push and pull request.
+#
+# Cloudflare deploys main on its own, in parallel with this, so a red run here does not stop a
+# deploy. It is the record that a commit was checked, and the place a pull request is checked
+# before it reaches main.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same file Cloudflare reads, so both build on one Node version.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # Cheapest first, so the usual failure is reported in seconds rather than after a build.
+      - name: Content invariants
+        run: npm run validate:content
+
+      - name: Types
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Static export
+        run: npm run build

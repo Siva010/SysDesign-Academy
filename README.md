@@ -19,8 +19,9 @@ Other commands:
 npm run build             # static export to out/
 npm run preview           # serve out/ exactly as a static host will
 npm run typecheck         # tsc --noEmit
+npm run lint              # ESLint with Next's rules; any warning fails it
 npm test                  # unit tests for the pass schedule and stored progress
-npm run validate:content  # content invariants; fails the build on a broken reference
+npm run validate:content  # content invariants, reading order included; fails on a broken reference
 npm run coverage          # where the curriculum is thin: signatures, levels, sources
 npm run untaught          # concepts with no lesson yet, grouped by level
 npm run icons             # regenerate favicons and the social card from src/app/icon.svg
@@ -63,6 +64,11 @@ Dashboard settings:
 
 Putting the content validator ahead of the build is the point of having written it: a dangling
 concept reference or a missing lesson section fails the deploy rather than reaching production.
+
+`.github/workflows/ci.yml` runs every check above - content, types, lint, tests, build - on each
+push and pull request. It runs alongside the Cloudflare build rather than in front of it, so it
+records whether a commit passed but does not stop a deploy; only the build command above can do
+that.
 
 Wrangler is pinned as a devDependency so the deploy uses a known version rather than whatever
 `npx` resolves that morning.
