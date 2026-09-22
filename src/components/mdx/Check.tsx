@@ -18,12 +18,12 @@ export function Check({
   prompt,
   options,
   stronger,
-  concepts = [],
-  context = 'lesson',
 }: {
   prompt: string;
   options: ChoiceOption[];
   stronger: string;
+  /* Still written on checks in the content. Nothing reads them since progress became a record
+     of lessons read rather than of scores per concept; the same holds for every check below. */
   concepts?: string[];
   context?: 'lesson' | 'exercise' | 'case-study';
 }) {
@@ -95,7 +95,6 @@ export function OpenCheck({
   prompt,
   rubric,
   stronger,
-  concepts = [],
 }: {
   prompt: string;
   rubric: { point: string; weight: number; hint: string }[];
@@ -121,10 +120,6 @@ export function OpenCheck({
 
   const commit = () => {
     setRevealed(true);
-  };
-
-  const finish = () => {
-    const credit = ratio >= 0.75 ? 'full' : ratio >= 0.4 ? 'partial' : 'none';
   };
 
   return (
@@ -181,9 +176,6 @@ export function OpenCheck({
               <div className="progress-fill" style={{ width: `${Math.round(ratio * 100)}%` }} />
             </div>
             <span className="tiny tnum faint">{Math.round(ratio * 100)}% covered</span>
-            <button type="button" className="btn btn-sm" onClick={finish}>
-              Record this
-            </button>
           </div>
           <p className="small" style={{ marginTop: '0.75rem', marginBottom: 0 }}>
             <strong>A stronger answer adds:</strong> {stronger}
@@ -205,7 +197,6 @@ export function EstimateCheck({
   tolerance = 0.5,
   derivation,
   stronger,
-  concepts = [],
 }: {
   prompt: string;
   unit: string;

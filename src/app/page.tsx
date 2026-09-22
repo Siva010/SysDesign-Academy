@@ -2,7 +2,6 @@ import Link from 'next/link';
 import { LEVELS } from '@/content/curriculum';
 import { CONCEPTS } from '@/content/concepts';
 import { DECISIONS } from '@/content/decisions';
-import { LEVEL_CONCEPTS } from '@/content/level-concepts';
 import {
   lessonIndex,
   loadAllCaseStudies,

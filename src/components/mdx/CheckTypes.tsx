@@ -88,7 +88,6 @@ export function BottleneckCheck({
   resources,
   options,
   stronger,
-  concepts = [],
 }: {
   prompt: string;
   resources: { component: string; measured: string; capacity: string; note?: string }[];
@@ -155,7 +154,6 @@ export function DebugCheck({
   observations,
   options,
   stronger,
-  concepts = [],
 }: {
   symptom: string;
   /** Revealed one at a time, in order. Put the most diagnostic ones last. */
@@ -231,7 +229,6 @@ export function CompleteCheck({
   pipeline,
   options,
   stronger,
-  concepts = [],
 }: {
   prompt: string;
   /** In order. Exactly one entry should be the gap. */
@@ -291,7 +288,6 @@ export function TransferCheck({
   prompt,
   options,
   stronger,
-  concepts = [],
 }: {
   /** The unfamiliar system, described in product terms with no technical vocabulary. */
   system: string;
